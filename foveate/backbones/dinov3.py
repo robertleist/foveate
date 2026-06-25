@@ -45,9 +45,25 @@ class DINOv3Backbone:
 
         self.model_id = model_id
         self.image_size = int(image_size)
-        self.device = torch.device(
-            device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
-        )
+        
+        if device is not None:
+            self.device = torch.device(device)
+        elif torch.cuda.is_available():
+            # Find an available GPU by checking memory usage
+            best_device = "cpu"
+            best_free_memory = -1
+            for gpu_id in range(torch.cuda.device_count()):
+                try:
+                    free_memory = torch.cuda.mem_get_info(gpu_id)[0]
+                    if free_memory > best_free_memory:
+                        best_free_memory = free_memory
+                        best_device = f"cuda:{gpu_id}"
+                except RuntimeError:
+                    continue
+            self.device = torch.device(best_device)
+        else:
+            self.device = torch.device("cpu")
+        
         self.dtype = dtype
 
         self.model = AutoModel.from_pretrained(model_id).to(self.device, dtype).eval()
