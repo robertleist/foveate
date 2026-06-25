@@ -15,6 +15,20 @@ prompted concept (CLS / prototype similarity), and refines each instance's borde
 
 ## Install
 
+**With uv (recommended):**
+
+```bash
+uv sync --extra dino --extra exp --extra dev
+```
+
+Or install into an existing environment:
+
+```bash
+uv pip install -e ".[dino,exp,dev]"
+```
+
+**With pip:**
+
 ```bash
 pip install -e ".[dino,exp,dev]"
 ```
