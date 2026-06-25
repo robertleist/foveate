@@ -34,6 +34,23 @@ from foveate import Config, discover_instances
 
 
 # ---------------------------------------------------------------------------
+# Progress / logging
+# ---------------------------------------------------------------------------
+def _progress(iterable, desc: str, total: int | None):
+    """Wrap ``iterable`` in a tqdm bar (per-image progress + cost postfix).
+
+    tqdm is an ``exp`` extra, not a core dependency, so fall back to the bare iterable
+    (with a one-line start log) when it's not installed.
+    """
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        print(f"[run] {desc}: processing{f' {total}' if total else ''} images...")
+        return iterable
+    return tqdm(iterable, desc=desc, total=total, unit="img", dynamic_ncols=True, leave=True)
+
+
+# ---------------------------------------------------------------------------
 # Backbone construction
 # ---------------------------------------------------------------------------
 def build_backbone(spec: dict[str, Any]):
@@ -137,11 +154,17 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
     output_dir = Path(config.get("output_dir", "runs/latest"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    backbone_kind = (config.get("backbone") or {}).get("type", "dino")
+    print(f"[run] '{config.get('run_name', 'run')}': backbone={backbone_kind} "
+          f"data={data_cfg.name} targets={targets} "
+          f"intra_pool={len(intra_ds)} inter_pool={len(inter_ds) if inter_ds else 0} "
+          f"-> {output_dir}")
+
     result: dict[str, Any] = {}
     if "intra" in targets:
         items = iter_intra_items(intra_ds, max_exemplars=max_exemplars, limit=limit)
         result.update(_evaluate(backbone, items, foveate_cfg, output_dir / "intra", "intra",
-                                visualize=visualize, cascade_trace=cascade_trace))
+                                visualize=visualize, cascade_trace=cascade_trace, total=limit))
     if "inter" in targets:
         if inter_ds is None:
             print("[run] inter eval requested but interval_images == 0; skipping.")
@@ -149,7 +172,7 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
             support = build_support_index(intra_ds)
             items = iter_inter_items(inter_ds, support, max_exemplars=max_exemplars, limit=limit)
             result.update(_evaluate(backbone, items, foveate_cfg, output_dir / "inter", "inter",
-                                    visualize=visualize, cascade_trace=cascade_trace))
+                                    visualize=visualize, cascade_trace=cascade_trace, total=limit))
 
     (output_dir / "metrics.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps(result, indent=2))
@@ -170,13 +193,15 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _evaluate(backbone, items, cfg: Config, output_dir: Path, prefix: str,
-              visualize: Any = False, cascade_trace: Any = False) -> dict[str, Any]:
+              visualize: Any = False, cascade_trace: Any = False,
+              total: int | None = None) -> dict[str, Any]:
     """Discover over ``items``, save per-image masks, and return ``{prefix}_<metric>`` results."""
     output_dir.mkdir(parents=True, exist_ok=True)
     predictions: list[evallib.ImagePrediction] = []
     gts: list[np.ndarray] = []
     recoveries: list[float] = []
     total_embeds, total_time, n_items = 0, 0.0, 0
+    total_pred = 0
 
     def _budget(flag: Any) -> float:
         return float("inf") if flag in (True, "all") else int(flag or 0)
@@ -186,7 +211,8 @@ def _evaluate(backbone, items, cfg: Config, output_dir: Path, prefix: str,
     viz_dir = output_dir / "viz"
     trace_dir = output_dir / "viz" / "cascade"
 
-    for item in items:
+    bar = _progress(items, desc=prefix, total=total)
+    for item in bar:
         trace: list | None = [] if n_items < trace_budget else None
         pred, stats, elapsed = _discover_one(backbone, item, cfg, trace=trace)
         predictions.append(pred)
@@ -195,6 +221,7 @@ def _evaluate(backbone, items, cfg: Config, output_dir: Path, prefix: str,
             recoveries.append(evallib.exemplar_recovery_iou(pred, item.exemplar_masks))
         total_embeds += stats.n_embeds
         total_time += elapsed
+        total_pred += pred.masks.shape[0]
         n_items += 1
         np.savez_compressed(
             output_dir / f"{item.image_id}.npz",
@@ -206,6 +233,15 @@ def _evaluate(backbone, items, cfg: Config, output_dir: Path, prefix: str,
         if trace is not None:
             from experiments.visualize import save_cascade_trace
             save_cascade_trace(item, trace, trace_dir)
+        # Live cost readout on the bar: predictions/image, embeds/image, sec/image.
+        if hasattr(bar, "set_postfix"):
+            bar.set_postfix(pred=f"{total_pred / n_items:.1f}",
+                            embeds=f"{total_embeds / n_items:.0f}",
+                            s_img=f"{total_time / n_items:.2f}", refresh=False)
+
+    if n_items == 0:
+        print(f"[run] {prefix}: no eligible images (no prompt/target pair); skipping.")
+        return {}
 
     metrics = evallib.evaluate(predictions, gts)
     out = {f"{prefix}_{k}": v for k, v in metrics.to_dict().items()}
@@ -215,6 +251,9 @@ def _evaluate(backbone, items, cfg: Config, output_dir: Path, prefix: str,
     out[f"{prefix}_mean_embeds"] = total_embeds / max(n_items, 1)
     out[f"{prefix}_mean_runtime_s"] = total_time / max(n_items, 1)
     out[f"{prefix}_n_images"] = n_items
+    print(f"[run] {prefix}: {n_items} imgs | AP={metrics.ap:.3f} AP50={metrics.ap50:.3f} "
+          f"PQ={metrics.pq:.3f} mIoU={metrics.mean_iou:.3f} "
+          f"count_err={metrics.count_error:.2f} | {total_embeds / max(n_items, 1):.0f} embeds/img")
     return out
 
 

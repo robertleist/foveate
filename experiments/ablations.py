@@ -56,9 +56,10 @@ def expand_sweep(base: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def run_sweep(base: dict[str, Any]) -> list[dict[str, Any]]:
+    configs = expand_sweep(base)
     results = []
-    for cfg in expand_sweep(base):
-        print(f"\n=== {cfg['run_name']} ===")
+    for i, cfg in enumerate(configs, 1):
+        print(f"\n=== [{i}/{len(configs)}] {cfg['run_name']} ===")
         results.append({"run_name": cfg["run_name"], **run_experiment(cfg)})
     return results
 
