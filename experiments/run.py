@@ -47,6 +47,18 @@ def build_backbone(spec: dict[str, Any]):
 # ---------------------------------------------------------------------------
 # MLflow (optional)
 # ---------------------------------------------------------------------------
+def _load_dotenv(dotenv_path: str | None = None) -> None:
+    """Load a .env file if python-dotenv is available; silently skip otherwise."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    from pathlib import Path as _Path
+    path = _Path(dotenv_path) if dotenv_path else _Path(".env")
+    if path.exists():
+        load_dotenv(path, override=False)  # env already set takes precedence
+
+
 @contextmanager
 def _mlflow_run(mlflow_cfg: dict[str, Any], run_name: str | None):
     cfg = dict(mlflow_cfg or {})
@@ -59,8 +71,21 @@ def _mlflow_run(mlflow_cfg: dict[str, Any], run_name: str | None):
         print("[run] mlflow not installed; skipping tracking.")
         yield None
         return
-    if cfg.get("tracking_uri"):
-        mlflow.set_tracking_uri(cfg["tracking_uri"])
+
+    _load_dotenv(cfg.get("dotenv"))
+
+    # YAML tracking_uri takes precedence over MLFLOW_TRACKING_URI env var
+    tracking_uri = cfg.get("tracking_uri") or None
+    if tracking_uri:
+        mlflow.set_tracking_uri(tracking_uri)
+
+    # YAML username/password take precedence over env vars
+    import os
+    if cfg.get("username"):
+        os.environ.setdefault("MLFLOW_TRACKING_USERNAME", cfg["username"])
+    if cfg.get("password"):
+        os.environ.setdefault("MLFLOW_TRACKING_PASSWORD", cfg["password"])
+
     mlflow.set_experiment(cfg.get("experiment_name", "foveate"))
     with mlflow.start_run(run_name=run_name):
         yield mlflow
