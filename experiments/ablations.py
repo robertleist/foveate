@@ -33,11 +33,14 @@ def _set_dotted(config: dict[str, Any], key: str, value: Any) -> None:
 
 def expand_sweep(base: dict[str, Any]) -> list[dict[str, Any]]:
     """Return one config per point in the cartesian product of the ``sweep:`` block."""
+    base = copy.deepcopy(base)          # never mutate the caller's dict
     sweep = base.pop("sweep", {}) or {}
     if not sweep:
         return [base]
     keys = list(sweep)
-    grids = [sweep[k] for k in keys]
+    grids = [sweep[k] if isinstance(sweep[k], list) else [sweep[k]] for k in keys]
+    base_name = base.get("run_name", "ablation")
+    base_outdir = base.get("output_dir", "runs/ablation")
     configs = []
     for combo in itertools.product(*grids):
         cfg = copy.deepcopy(base)
@@ -45,9 +48,9 @@ def expand_sweep(base: dict[str, Any]) -> list[dict[str, Any]]:
         for k, v in zip(keys, combo):
             _set_dotted(cfg, k, v)
             suffix.append(f"{k.split('.')[-1]}={v}")
-        base_name = base.get("run_name", "ablation")
-        cfg["run_name"] = f"{base_name}__" + "_".join(suffix)
-        cfg["output_dir"] = f"{base.get('output_dir', 'runs/ablation')}/{'_'.join(suffix)}"
+        tag = "_".join(suffix)
+        cfg["run_name"] = f"{base_name}__{tag}"
+        cfg["output_dir"] = f"{base_outdir}/{tag}"
         configs.append(cfg)
     return configs
 

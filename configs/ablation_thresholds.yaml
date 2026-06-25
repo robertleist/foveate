@@ -22,6 +22,7 @@ data:
     n_categories: 2
 
 foveate:
+  standardize: false        # MockBackbone features are colour-based; z-scoring destroys the signal
   gate_threshold: 0.4
   min_crop: 24
   cascade_min_instance_area: 4
