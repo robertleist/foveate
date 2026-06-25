@@ -39,4 +39,9 @@ eval:
 mlflow:
   enabled: true
   experiment_name: foveate-coco
-  tracking_uri: null              # null -> ./mlruns
+  # Server connection — all optional; env vars from .env are used as fallback.
+  # YAML values take precedence over the environment.
+  tracking_uri: null              # overrides MLFLOW_TRACKING_URI; null -> ./mlruns
+  username: null                  # overrides MLFLOW_TRACKING_USERNAME
+  password: null                  # overrides MLFLOW_TRACKING_PASSWORD
+  dotenv: null                    # explicit .env path; null -> looks for ./.env

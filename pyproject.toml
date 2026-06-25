@@ -22,7 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dino = ["transformers>=4.56", "huggingface-hub"]                 # default backbone
-exp = ["pycocotools", "matplotlib", "pyyaml", "pandas", "mlflow", "tqdm", "pillow"]  # experiments
+exp = ["pycocotools", "matplotlib", "pyyaml", "pandas", "mlflow", "tqdm", "pillow", "python-dotenv"]  # experiments
 dev = ["pytest", "ruff"]
 
 [[tool.uv.index]]
