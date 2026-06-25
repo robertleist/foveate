@@ -17,12 +17,16 @@ dependencies = [
     "scipy",
     "scikit-image",
     "scikit-learn",
+    "torchvision>=0.27.1",
 ]
 
 [project.optional-dependencies]
 dino = ["transformers>=4.56", "huggingface-hub"]                 # default backbone
 exp = ["pycocotools", "matplotlib", "pyyaml", "pandas", "mlflow", "tqdm", "pillow"]  # experiments
 dev = ["pytest", "ruff"]
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu132"
 
 [tool.hatch.build.targets.wheel]
 # The installable core is `foveate`; `data` and `experiments` are the research harness.
