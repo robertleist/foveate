@@ -136,6 +136,9 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
     Evaluates the ``intra`` (same-image) and/or ``inter`` (cross-image) protocols selected by
     ``eval.targets`` and returns their metrics with ``intra_`` / ``inter_`` prefixes.
     """
+    if config.get("sweep"):
+        print("[run] warning: this config has a 'sweep:' block but run_experiment runs a single "
+              "config — use experiments.ablations.run_sweep (or the run.py CLI) to expand it.")
     backbone = build_backbone(config.get("backbone", {}))
     data_cfg = DataConfig.from_dict(config["data"])
     foveate_cfg = Config.from_dict(config.get("foveate", {}))
@@ -304,6 +307,17 @@ def main(argv: list[str] | None = None) -> None:
     with open(args.config, encoding="utf-8") as f:
         config = yaml.safe_load(f)
     config = _apply_overrides(config, args.overrides)
+
+    # A `sweep:` block expands to a grid of runs. Dispatch here so the single runner does the
+    # right thing too — otherwise the block is silently ignored and only the base config runs.
+    if config.get("sweep"):
+        from experiments.ablations import run_sweep
+
+        n = len(config["sweep"])
+        print(f"[run] '{args.config}' has a sweep block ({n} swept key(s)); expanding the grid.")
+        run_sweep(config)
+        return
+
     run_experiment(config)
 
 
