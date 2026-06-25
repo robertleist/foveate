@@ -1,6 +1,7 @@
 # Experiment outputs / tracking
 runs/
 mlruns/
+papers/
 *.npz
 
 # Byte-compiled / optimized / DLL files
