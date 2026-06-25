@@ -24,21 +24,21 @@ class DataConfig:
     categories: List[Union[int, str]] = field(default_factory=list)  # ids or names; empty = all
     min_instances: int = 1                      # drop images with fewer instances in the chosen categories
 
-    # --- image selection (disjoint train / inter-validation pools) ---
-    # One seeded shuffle of the qualifying pool is sliced into a training set and
-    # a *disjoint* inter-validation set, so novel images never leak into training.
-    train_images: Optional[int] = None          # images used for training (None = all remaining)
-    interval_images: int = 0                     # novel images held out for inter-validation
+    # --- image selection (disjoint intra / inter-image pools) ---
+    # One seeded shuffle of the qualifying pool is sliced into the intra pool (same-image
+    # discovery) and a *disjoint* inter pool of novel images (cross-image discovery).
+    train_images: Optional[int] = None          # intra-image pool size (None = all remaining)
+    interval_images: int = 0                     # disjoint novel images for cross-image (inter) eval
     max_images: Optional[int] = None             # deprecated alias for train_images
     selection: str = "random"                    # random | first | densest
 
-    # --- PU instance split ---
-    known_ratio: float = 0.2                     # fraction of instances labelled (train AND inter-val images)
-    intra_val_ratio: float = 0.3                 # fraction of known instances in TRAIN images held out (no grad) -> intra-val
-    stratify_by_class: bool = True
-    val_only: bool = False                       # internal: used for the inter-validation pool
+    # --- known/unknown instance split ---
+    # Per image: a `known_ratio` fraction of instances are `known` (exemplar prompts); the rest
+    # are `unknown` (the GT to discover). Same scheme for both image pools.
+    known_ratio: float = 0.2                     # fraction of instances that are known/prompts
+    stratify_by_class: bool = True               # guarantee >= 1 known per present class
 
-    seed: int = 42                               # drives both selection and the PU split
+    seed: int = 42                               # drives both selection and the split
 
     # --- preprocessing ---
     target_size: Optional[Tuple[int, int]] = None

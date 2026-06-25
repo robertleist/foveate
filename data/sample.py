@@ -9,11 +9,11 @@ import torch
 
 @dataclass
 class InstanceSample:
-    """One image with its ground-truth instance masks and a PU instance split.
+    """One image with its ground-truth instance masks and a known/unknown split.
 
     Mask-based (no flow fields): instances carry binary ``[H, W]`` masks and ``semantic_masks``
-    is a per-class stack. The ``train`` partition supplies exemplar prompts; ``val`` /
-    ``unlabelled`` are scored against the discovered instances.
+    is a per-class stack. The ``known`` instances are the exemplar prompts; the ``unknown``
+    instances are the GT the method must discover (the intra-image evaluation targets).
     """
 
     image: torch.Tensor  # [channels, H, W] float32 in [0, 1]
@@ -21,45 +21,39 @@ class InstanceSample:
 
     instances: List[GTInstance] = field(default_factory=list)  # all instances, indexed by position
 
-    train_idx: List[int] = field(default_factory=list)  # indices into instances → labelled/exemplars
-    val_idx: List[int] = field(default_factory=list)  # indices into instances → mAP_seen
-    unlabelled_idx: List[int] = field(default_factory=list)  # indices into instances → mAP comparison
+    known_idx: List[int] = field(default_factory=list)    # indices into instances → exemplar prompts
+    unknown_idx: List[int] = field(default_factory=list)  # indices into instances → GT to discover
 
     # --- Partition accessors ---
     @property
-    def train_instances(self) -> List[GTInstance]:
-        return [self.instances[i] for i in self.train_idx]
-
-    @property
-    def val_instances(self) -> List[GTInstance]:
-        return [self.instances[i] for i in self.val_idx]
-
-    @property
-    def unlabelled_instances(self) -> List[GTInstance]:
-        return [self.instances[i] for i in self.unlabelled_idx]
-
-    @property
     def known_instances(self) -> List[GTInstance]:
-        return self.train_instances + self.val_instances
+        return [self.instances[i] for i in self.known_idx]
+
+    @property
+    def unknown_instances(self) -> List[GTInstance]:
+        return [self.instances[i] for i in self.unknown_idx]
+
+    def instances_of_class(self, class_id: int) -> List[GTInstance]:
+        return [inst for inst in self.instances if inst.class_id == class_id]
 
     # --- Objectness masks ---
     @cached_property
-    def train_objectness(self) -> torch.Tensor:
+    def known_objectness(self) -> torch.Tensor:
         objectness = torch.zeros(self.image.shape[1:], dtype=torch.bool)
-        for inst in self.train_instances:
+        for inst in self.known_instances:
             objectness[inst.mask] = True
         return objectness
 
     @cached_property
-    def val_objectness(self) -> torch.Tensor:
+    def unknown_objectness(self) -> torch.Tensor:
         objectness = torch.zeros(self.image.shape[1:], dtype=torch.bool)
-        for inst in self.val_instances:
+        for inst in self.unknown_instances:
             objectness[inst.mask] = True
         return objectness
 
 
 @dataclass
 class GTInstance:
-    instance_id: int      # COCO annotation ID (or synthetic), for PU split lookup
+    instance_id: int      # COCO annotation ID (or synthetic), for split lookup
     class_id: int         # 1-indexed remapped ground truth class
     mask: torch.Tensor    # [H, W] bool

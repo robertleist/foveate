@@ -64,15 +64,17 @@ class InstanceDataset(Dataset):
     # ------------------------------------------------------------------
     @classmethod
     def build(cls, cfg: DataConfig) -> Tuple["InstanceDataset", Optional["InstanceDataset"]]:
-        """Build the (train, inter-validation) dataset pair from a :class:`DataConfig`.
+        """Build the ``(intra, inter)`` dataset pair from a :class:`DataConfig`.
 
         A single seeded shuffle of the qualifying image pool is sliced into:
-          - the first ``train_images`` → the **training** set (instances split into
-            train / intra-val / unlabelled by ``known_ratio`` and ``intra_val_ratio``);
-          - the next ``interval_images`` → a *disjoint* **inter-validation** set of novel images.
+          - the first ``train_images`` → the **intra** pool (same-image discovery: prompt with
+            an image's ``known`` instances, discover its ``unknown`` instances);
+          - the next ``interval_images`` → a *disjoint* **inter** pool of novel images (used for
+            cross-image discovery: prompt with intra-pool exemplars, discover in these).
 
-        The two image pools are disjoint by construction. Returns ``(train, interval)`` where
-        ``interval`` is ``None`` when ``interval_images == 0``.
+        Both pools use the same per-image ``known``/``unknown`` split (``known_ratio``). The two
+        image pools are disjoint by construction. Returns ``(intra, inter)`` where ``inter`` is
+        ``None`` when ``interval_images == 0``.
         """
         from data.registry import build_source
         from data.splitter import compute_pu_split, select_images
@@ -108,7 +110,7 @@ class InstanceDataset(Dataset):
                 f"min_instances={cfg.min_instances})."
             )
 
-        train_pool = ordered[:n_train]
+        intra_pool = ordered[:n_train]
         inter_pool = ordered[n_train:n_train + n_inter]
 
         common = dict(
@@ -118,39 +120,25 @@ class InstanceDataset(Dataset):
             target_size=cfg.target_size,
         )
 
-        train_dataset = cls(
-            image_ids=[m.image_id for m in train_pool],
-            pu_split=compute_pu_split(
-                train_pool,
-                known_ratio=cfg.known_ratio,
-                intra_val_ratio=cfg.intra_val_ratio,
-                stratify_by_class=cfg.stratify_by_class,
-                seed=cfg.seed,
-                val_only=False,
-            ),
-            **common,
-        )
-
-        interval_dataset = None
-        if n_inter > 0:
-            interval_dataset = cls(
-                image_ids=[m.image_id for m in inter_pool],
+        def make(pool):
+            return cls(
+                image_ids=[m.image_id for m in pool],
                 pu_split=compute_pu_split(
-                    inter_pool,
+                    pool,
                     known_ratio=cfg.known_ratio,
-                    intra_val_ratio=cfg.intra_val_ratio,
                     stratify_by_class=cfg.stratify_by_class,
                     seed=cfg.seed,
-                    val_only=True,
                 ),
                 **common,
             )
 
-        return train_dataset, interval_dataset
+        intra_dataset = make(intra_pool)
+        inter_dataset = make(inter_pool) if n_inter > 0 else None
+        return intra_dataset, inter_dataset
 
     @classmethod
     def from_config(cls, cfg: DataConfig) -> "InstanceDataset":
-        """Build just the training dataset from a :class:`DataConfig`."""
+        """Build just the intra-image dataset from a :class:`DataConfig`."""
         return cls.build(cfg)[0]
 
     @classmethod
@@ -201,7 +189,7 @@ class InstanceDataset(Dataset):
         image = self.source.load_image(image_id, grayscale=self.grayscale)
         instances = self._load_instances(image_id)
         semantic_masks = self._build_semantic_masks(image.shape[1:], instances)
-        train_idx, val_idx, unlabelled_idx = self._partition_instances(image_id, instances)
+        known_idx, unknown_idx = self._partition_instances(image_id, instances)
 
         if self.target_size is not None:
             image, semantic_masks, instances = self._resize_and_pad(
@@ -212,9 +200,8 @@ class InstanceDataset(Dataset):
             image=image,
             semantic_masks=semantic_masks,
             instances=instances,
-            train_idx=train_idx,
-            val_idx=val_idx,
-            unlabelled_idx=unlabelled_idx,
+            known_idx=known_idx,
+            unknown_idx=unknown_idx,
         )
 
     # ------------------------------------------------------------------
@@ -245,27 +232,30 @@ class InstanceDataset(Dataset):
         self,
         image_id: str,
         instances: List[GTInstance],
-    ) -> Tuple[List[int], List[int], List[int]]:
-        """Resolve list indices for train / val / unlabelled from the PU split."""
+    ) -> Tuple[List[int], List[int]]:
+        """Resolve list indices for known / unknown from the split.
+
+        Any instance not named in the split (or all of them, when no split exists) defaults to
+        ``unknown`` — so it counts as a discovery target rather than a free prompt.
+        """
         split = self.pu_split.get(str(image_id))
         if split is None:
-            return [], [], list(range(len(instances)))
+            return [], list(range(len(instances)))
 
         id_to_idx = {inst.instance_id: i for i, inst in enumerate(instances)}
 
         def resolve(ann_ids: List[int]) -> List[int]:
             return [id_to_idx[aid] for aid in ann_ids if aid in id_to_idx]
 
-        train_idx = resolve(split.get("train", []))
-        val_idx = resolve(split.get("intra_val", []))
-        unlabelled_idx = resolve(split.get("unlabelled", []))
+        known_idx = resolve(split.get("known", []))
+        unknown_idx = resolve(split.get("unknown", []))
 
-        assigned = set(train_idx) | set(val_idx) | set(unlabelled_idx)
+        assigned = set(known_idx) | set(unknown_idx)
         for i in range(len(instances)):
             if i not in assigned:
-                unlabelled_idx.append(i)
+                unknown_idx.append(i)
 
-        return train_idx, val_idx, unlabelled_idx
+        return known_idx, unknown_idx
 
     # ------------------------------------------------------------------
     # Internal helpers

@@ -1,12 +1,15 @@
-"""In-memory image selection and positive-unlabelled (PU) instance splitting.
+"""In-memory image selection and known/unknown instance splitting.
 
-These are pure functions of ``(image metadata, ratios, seed)`` — cheap enough to
-run at dataset-construction time, so the split never needs to be materialised to
-a file. Given the same seed and a stably-ordered image list they are fully
-reproducible.
+These are pure functions of ``(image metadata, ratio, seed)`` — cheap enough to run at
+dataset-construction time, so the split never needs to be materialised to a file. Given the
+same seed and a stably-ordered image list they are fully reproducible.
 
-A PU split is ``{image_id: {"train": [...], "intra_val": [...], "unlabelled": [...]}}``
-where the lists hold annotation IDs.
+Per image, instances are partitioned into two sets:
+
+* ``known``   — the labelled instances. They double as the **exemplar prompts**.
+* ``unknown`` — everything else. These are the GT instances the method must *discover*.
+
+A split is ``{image_id: {"known": [...], "unknown": [...]}}`` where the lists hold annotation IDs.
 """
 
 from __future__ import annotations
@@ -54,11 +57,15 @@ def select_images(
 def partition_instances(
     image: ImageMeta,
     known_ratio: float,
-    intra_val_ratio: float,
     stratify_by_class: bool,
     rng: random.Random,
-) -> Tuple[List[int], List[int], List[int]]:
-    """Return ``(train_ann_ids, intra_val_ann_ids, unlabelled_ann_ids)``."""
+) -> Tuple[List[int], List[int]]:
+    """Return ``(known_ann_ids, unknown_ann_ids)`` for one image.
+
+    ``known`` are the exemplar prompts (a ``known_ratio`` fraction, with a per-class floor of
+    one when ``stratify_by_class`` so every present class can be prompted); ``unknown`` are the
+    remaining instances the method must rediscover.
+    """
     if stratify_by_class:
         by_class = image.annotations_by_class()
         guaranteed = []
@@ -76,66 +83,17 @@ def partition_instances(
         extra_needed = target_known - len(guaranteed)
         rng.shuffle(remaining)
         extra = remaining[: max(0, extra_needed)]
-        unlabelled_anns = remaining[max(0, extra_needed):]
+        unknown_anns = remaining[max(0, extra_needed):]
         known_ids = [a.ann_id for a in guaranteed + extra]
-        unlabelled_ids = [a.ann_id for a in unlabelled_anns]
+        unknown_ids = [a.ann_id for a in unknown_anns]
     else:
         all_anns = list(image.annotations)
         rng.shuffle(all_anns)
         n_known = max(1, math.ceil(image.instance_count * known_ratio))
         known_ids = [a.ann_id for a in all_anns[:n_known]]
-        unlabelled_ids = [a.ann_id for a in all_anns[n_known:]]
+        unknown_ids = [a.ann_id for a in all_anns[n_known:]]
 
-    train_ids, intra_val_ids = _split_known(known_ids, image, intra_val_ratio, rng)
-    return train_ids, intra_val_ids, unlabelled_ids
-
-
-def partition_val_only(
-    image: ImageMeta,
-    known_ratio: float,
-    stratify_by_class: bool,
-    rng: random.Random,
-) -> Tuple[List[int], List[int], List[int]]:
-    """Known/unlabelled split as normal, but route all known instances to val.
-
-    Simulates the same PU labelling density as the training splits so an
-    inter-val set is comparable, but nothing is used for gradient updates.
-    """
-    train_ids, intra_val_ids, unlabelled_ids = partition_instances(
-        image,
-        known_ratio=known_ratio,
-        intra_val_ratio=0.0,
-        stratify_by_class=stratify_by_class,
-        rng=rng,
-    )
-    return [], train_ids + intra_val_ids, unlabelled_ids
-
-
-def _split_known(
-    known_ids: List[int],
-    image: ImageMeta,
-    intra_val_ratio: float,
-    rng: random.Random,
-) -> Tuple[List[int], List[int]]:
-    """Split known IDs into train / intra_val. Per-class singletons go to train."""
-    id_to_class = {a.ann_id: a.category_id for a in image.annotations}
-    by_class: Dict[int, List[int]] = {}
-    for ann_id in known_ids:
-        by_class.setdefault(id_to_class[ann_id], []).append(ann_id)
-
-    train_ids: List[int] = []
-    intra_val_ids: List[int] = []
-    for ids in by_class.values():
-        if len(ids) == 1:
-            train_ids.append(ids[0])
-        else:
-            shuffled = list(ids)
-            rng.shuffle(shuffled)
-            n_val = max(1, math.floor(len(shuffled) * intra_val_ratio))
-            intra_val_ids.extend(shuffled[:n_val])
-            train_ids.extend(shuffled[n_val:])
-
-    return train_ids, intra_val_ids
+    return known_ids, unknown_ids
 
 
 # ---------------------------------------------------------------------------
@@ -148,38 +106,22 @@ PUSplit = Dict[str, Dict[str, List[int]]]
 def compute_pu_split(
     images: List[ImageMeta],
     known_ratio: float,
-    intra_val_ratio: float,
     stratify_by_class: bool,
     seed: int,
-    val_only: bool = False,
 ) -> PUSplit:
-    """Compute the full per-image PU split for a list of (category-filtered) images."""
+    """Compute the per-image known/unknown split for a list of (category-filtered) images."""
     rng = random.Random(seed)
     split: PUSplit = {}
     for image in images:
-        if val_only:
-            _, intra_val_ids, unlabelled_ids = partition_val_only(
-                image, known_ratio, stratify_by_class, rng
-            )
-            split[str(image.image_id)] = {
-                "train": [],
-                "intra_val": intra_val_ids,
-                "unlabelled": unlabelled_ids,
-            }
-        else:
-            train_ids, intra_val_ids, unlabelled_ids = partition_instances(
-                image, known_ratio, intra_val_ratio, stratify_by_class, rng
-            )
-            split[str(image.image_id)] = {
-                "train": train_ids,
-                "intra_val": intra_val_ids,
-                "unlabelled": unlabelled_ids,
-            }
+        known_ids, unknown_ids = partition_instances(
+            image, known_ratio, stratify_by_class, rng
+        )
+        split[str(image.image_id)] = {"known": known_ids, "unknown": unknown_ids}
     return split
 
 
 # ---------------------------------------------------------------------------
-# Diagnostics (used by prepare.py summary)
+# Diagnostics
 # ---------------------------------------------------------------------------
 
 def detect_collisions(inst_splits: List[PUSplit]) -> Tuple[int, int]:
@@ -196,8 +138,7 @@ def detect_collisions(inst_splits: List[PUSplit]) -> Tuple[int, int]:
         known_sets: List[FrozenSet[int]] = []
         for split in inst_splits:
             entry = split.get(image_id, {})
-            known = frozenset(entry.get("train", []) + entry.get("intra_val", []))
-            known_sets.append(known)
+            known_sets.append(frozenset(entry.get("known", [])))
         if len(set(known_sets)) == len(known_sets):
             n_distinct += 1
         else:

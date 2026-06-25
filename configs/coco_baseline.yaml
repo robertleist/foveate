@@ -15,8 +15,9 @@ data:
   images_dir: train2017
   categories: [person]
   min_instances: 2
-  train_images: 20
-  known_ratio: 0.3
+  train_images: 20        # intra pool (same-image discovery)
+  interval_images: 10     # disjoint novel images for cross-image (inter) eval
+  known_ratio: 0.3        # fraction of instances that are known/prompts; rest are discovery GT
   seed: 42
 
 foveate:               # any foveate.Config field
@@ -32,8 +33,8 @@ foveate:               # any foveate.Config field
   max_total_embeds: 512
 
 eval:
+  targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (set debias: true)
   max_exemplars: 3
-  exemplar_source: auto           # auto | train | val | known
   limit: null
 
 mlflow:

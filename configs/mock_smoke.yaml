@@ -13,11 +13,12 @@ data:
   name: synthetic
   categories: []          # all colour categories
   min_instances: 2
-  train_images: 6
+  train_images: 6         # intra pool (same-image discovery)
+  interval_images: 3      # disjoint novel images for cross-image (inter) eval
   known_ratio: 0.5
   seed: 0
   options:
-    n_images: 6
+    n_images: 9
     image_size: 128
     n_instances: 4
     n_categories: 2
@@ -30,8 +31,8 @@ foveate:
   prototype_reduction: all
 
 eval:
+  targets: [intra, inter]   # intra = same-image discovery; inter = cross-image
   max_exemplars: 2
-  exemplar_source: auto
   limit: null
 
 mlflow:

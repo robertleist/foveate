@@ -30,8 +30,9 @@ data:
   root: /data/pannuke             # point at the directory containing images.npy + masks.npy
   categories: [Neoplastic]        # or [] for all five classes; names are case-insensitive
   min_instances: 2
-  train_images: 50
-  known_ratio: 0.3
+  train_images: 50                # intra pool (same-image discovery)
+  interval_images: 20             # disjoint novel images for cross-image (inter) eval
+  known_ratio: 0.3                # fraction of instances that are known/prompts; rest are GT
   seed: 42
   # Uncomment to combine all three folds from separate subdirectories:
   # options:
@@ -51,8 +52,8 @@ foveate:
   max_total_embeds: 256
 
 eval:
+  targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (set debias: true)
   max_exemplars: 3
-  exemplar_source: auto
   limit: null
 
 mlflow:

@@ -65,6 +65,15 @@ no notebook/service drift. The single-pass (non-recursive) pipeline is also expo
 Mask-based datasets live in the `data` package (COCO, PanNuke, and an offline `synthetic`
 source); `experiments/` wraps discovery with metrics and MLflow tracking.
 
+**Protocol.** Per image, a `known_ratio` fraction of instances are `known` (the exemplar
+prompts); the rest are `unknown` (the GT to discover). Two evaluation targets (`eval.targets`):
+
+- **intra** (same image) — prompt with an image's `known` instances, discover its `unknown`
+  instances in that same image.
+- **inter** (cross image) — prompt with `known` instances from a disjoint *support* image and
+  discover instances of that class in a novel held-out image (`interval_images`). This is the
+  cross-image setting; set `foveate.debias: true` to correct DINOv3's positional bias.
+
 ```bash
 # Offline end-to-end smoke test (synthetic data + mock backbone, no downloads/weights):
 python -m experiments.run --config configs/mock_smoke.yaml
