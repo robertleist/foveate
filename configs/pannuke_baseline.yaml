@@ -1,0 +1,64 @@
+# Baseline foveate run on PanNuke nuclei segmentation.
+#
+# PanNuke ships as NumPy arrays per fold:
+#   https://warwick.ac.uk/fac/cross_fac/tia/data/pannuke/
+#
+# Directory layout expected under data.root:
+#   Single fold (simplest):
+#     /data/pannuke/images.npy   [N, 256, 256, 3]  uint8
+#     /data/pannuke/masks.npy    [N, 256, 256, 6]  instance maps
+#
+#   Multiple folds concatenated (set options.fold_dirs):
+#     /data/pannuke/fold1/images.npy  + masks.npy
+#     /data/pannuke/fold2/images.npy  + masks.npy
+#     /data/pannuke/fold3/images.npy  + masks.npy
+#
+# Categories (case-insensitive): Neoplastic, Inflammatory, Connective, Dead, Epithelial
+# Leave categories empty to use all five classes.
+#
+#   python -m experiments.run --config configs/pannuke_baseline.yaml
+run_name: pannuke_baseline
+output_dir: runs/pannuke_baseline
+
+backbone:
+  type: dino
+  model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+  image_size: 256                 # PanNuke images are 256×256; no need to upscale
+
+data:
+  name: pannuke
+  root: /data/pannuke             # point at the directory containing images.npy + masks.npy
+  categories: [Neoplastic]        # or [] for all five classes; names are case-insensitive
+  min_instances: 2
+  train_images: 50
+  known_ratio: 0.3
+  seed: 42
+  # Uncomment to combine all three folds from separate subdirectories:
+  # options:
+  #   fold_dirs: [fold1, fold2, fold3]
+
+foveate:
+  standardize: true
+  gate_threshold: 0.5
+  gate_threshold_mode: otsu       # nuclei are compact; otsu works well
+  prototype_reduction: kmeans
+  prototype_budget: 32            # nuclei are small; fewer prototypes suffice
+  border_mode: proto
+  accept_mode: cls
+  debias: false
+  min_crop: 16                    # nuclei can be small (< 20 px)
+  cascade_min_instance_area: 8    # reject fragments smaller than 8 px²
+  max_total_embeds: 256
+
+eval:
+  max_exemplars: 3
+  exemplar_source: auto
+  limit: null
+
+mlflow:
+  enabled: true
+  experiment_name: foveate-pannuke
+  tracking_uri: null              # overrides MLFLOW_TRACKING_URI; null -> ./mlruns
+  username: null                  # overrides MLFLOW_TRACKING_USERNAME
+  password: null                  # overrides MLFLOW_TRACKING_PASSWORD
+  dotenv: null                    # explicit .env path; null -> looks for ./.env
