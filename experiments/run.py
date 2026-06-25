@@ -126,6 +126,11 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
     max_exemplars = eval_cfg.get("max_exemplars", 3)
     limit = eval_cfg.get("limit")
     targets = eval_cfg.get("targets", ["intra"])
+    # Per-image debug overlays (prompt | GT | prediction). int caps how many to render,
+    # True/"all" renders every image, False/0/None disables. Logged to MLflow as artifacts.
+    visualize = eval_cfg.get("visualize", False)
+    # Per-image cascade trace (contact sheet of the recursive zoom). Same budget semantics.
+    cascade_trace = eval_cfg.get("cascade_trace", False)
 
     intra_ds, inter_ds = build_datasets(data_cfg)
 
@@ -135,14 +140,16 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     if "intra" in targets:
         items = iter_intra_items(intra_ds, max_exemplars=max_exemplars, limit=limit)
-        result.update(_evaluate(backbone, items, foveate_cfg, output_dir / "intra", "intra"))
+        result.update(_evaluate(backbone, items, foveate_cfg, output_dir / "intra", "intra",
+                                visualize=visualize, cascade_trace=cascade_trace))
     if "inter" in targets:
         if inter_ds is None:
             print("[run] inter eval requested but interval_images == 0; skipping.")
         else:
             support = build_support_index(intra_ds)
             items = iter_inter_items(inter_ds, support, max_exemplars=max_exemplars, limit=limit)
-            result.update(_evaluate(backbone, items, foveate_cfg, output_dir / "inter", "inter"))
+            result.update(_evaluate(backbone, items, foveate_cfg, output_dir / "inter", "inter",
+                                    visualize=visualize, cascade_trace=cascade_trace))
 
     (output_dir / "metrics.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps(result, indent=2))
@@ -162,7 +169,8 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _evaluate(backbone, items, cfg: Config, output_dir: Path, prefix: str) -> dict[str, Any]:
+def _evaluate(backbone, items, cfg: Config, output_dir: Path, prefix: str,
+              visualize: Any = False, cascade_trace: Any = False) -> dict[str, Any]:
     """Discover over ``items``, save per-image masks, and return ``{prefix}_<metric>`` results."""
     output_dir.mkdir(parents=True, exist_ok=True)
     predictions: list[evallib.ImagePrediction] = []
@@ -170,8 +178,17 @@ def _evaluate(backbone, items, cfg: Config, output_dir: Path, prefix: str) -> di
     recoveries: list[float] = []
     total_embeds, total_time, n_items = 0, 0.0, 0
 
+    def _budget(flag: Any) -> float:
+        return float("inf") if flag in (True, "all") else int(flag or 0)
+
+    viz_budget = _budget(visualize)
+    trace_budget = _budget(cascade_trace)
+    viz_dir = output_dir / "viz"
+    trace_dir = output_dir / "viz" / "cascade"
+
     for item in items:
-        pred, stats, elapsed = _discover_one(backbone, item, cfg)
+        trace: list | None = [] if n_items < trace_budget else None
+        pred, stats, elapsed = _discover_one(backbone, item, cfg, trace=trace)
         predictions.append(pred)
         gts.append(item.gt_masks)
         if item.exemplar_image is None:           # recovery only meaningful for same-image prompts
@@ -183,6 +200,12 @@ def _evaluate(backbone, items, cfg: Config, output_dir: Path, prefix: str) -> di
             output_dir / f"{item.image_id}.npz",
             masks=pred.masks, scores=pred.scores, gt=item.gt_masks, class_id=item.class_id,
         )
+        if n_items <= viz_budget:
+            from experiments.visualize import save_item_overlay
+            save_item_overlay(item, pred, viz_dir)
+        if trace is not None:
+            from experiments.visualize import save_cascade_trace
+            save_cascade_trace(item, trace, trace_dir)
 
     metrics = evallib.evaluate(predictions, gts)
     out = {f"{prefix}_{k}": v for k, v in metrics.to_dict().items()}
@@ -195,11 +218,17 @@ def _evaluate(backbone, items, cfg: Config, output_dir: Path, prefix: str) -> di
     return out
 
 
-def _discover_one(backbone, item: EvalItem, cfg: Config):
+def _discover_one(backbone, item: EvalItem, cfg: Config, trace: list | None = None):
+    # When `trace` is a list, collect a lightweight observer event per region (drop the heavy
+    # `feat` tensor; keep the grids/boxes the cascade visualization needs).
+    observer = None
+    if trace is not None:
+        def observer(info: dict) -> None:
+            trace.append({k: v for k, v in info.items() if k != "feat"})
     t0 = time.perf_counter()
     instances, stats = discover_instances(
         backbone, item.image, item.exemplar_masks, config=cfg,
-        exemplar_image=item.exemplar_image,
+        exemplar_image=item.exemplar_image, observer=observer,
     )
     elapsed = time.perf_counter() - t0
     h, w = item.image.shape[:2]

@@ -36,6 +36,11 @@ eval:
   targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (set debias: true)
   max_exemplars: 3
   limit: null
+  visualize: 20                   # render prompt|GT|prediction overlays for the first N images
+                                  #   (int caps count, true/"all" = every image, false = off);
+                                  #   saved to <output_dir>/{intra,inter}/viz and logged to MLflow
+  cascade_trace: 5                # contact sheet of the recursive zoom (gate/components/children)
+                                  #   per region, for the first N images; same budget semantics
 
 mlflow:
   enabled: true

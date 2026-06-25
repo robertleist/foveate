@@ -34,6 +34,8 @@ eval:
   targets: [intra, inter]   # intra = same-image discovery; inter = cross-image
   max_exemplars: 2
   limit: null
+  visualize: all            # int caps count, true/"all" renders every image, false disables
+  cascade_trace: 2          # contact sheet of the recursive zoom (same budget semantics)
 
 mlflow:
   enabled: false          # flip to true to log to ./mlruns
