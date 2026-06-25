@@ -1,3 +1,8 @@
+# Experiment outputs / tracking
+runs/
+mlruns/
+*.npz
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

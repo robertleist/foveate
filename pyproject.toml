@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "foveate"
+version = "0.1.0"
+description = "Training-free, recursive, prototype-guided instance discovery from frozen DINOv3 features."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Robert Leist" }]
+dependencies = [
+    "torch",
+    "numpy",
+    "opencv-python-headless",
+    "scipy",
+    "scikit-image",
+    "scikit-learn",
+]
+
+[project.optional-dependencies]
+dino = ["transformers>=4.56", "huggingface-hub"]                 # default backbone
+exp = ["pycocotools", "matplotlib", "pyyaml", "pandas", "mlflow", "tqdm", "pillow"]  # experiments
+dev = ["pytest", "ruff"]
+
+[tool.hatch.build.targets.wheel]
+# The installable core is `foveate`; `data` and `experiments` are the research harness.
+packages = ["foveate", "data", "experiments"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    "ignore::UserWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

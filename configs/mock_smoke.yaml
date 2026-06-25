@@ -1,0 +1,38 @@
+# Offline smoke test: synthetic coloured-square dataset + weightless mock backbone.
+# Runs end-to-end with no downloads and no DINOv3 weights:
+#   python -m experiments.run --config configs/mock_smoke.yaml
+run_name: mock_smoke
+output_dir: runs/mock_smoke
+
+backbone:
+  type: mock
+  image_size: 224
+  patch_size: 14
+
+data:
+  name: synthetic
+  categories: []          # all colour categories
+  min_instances: 2
+  train_images: 6
+  known_ratio: 0.5
+  seed: 0
+  options:
+    n_images: 6
+    image_size: 128
+    n_instances: 4
+    n_categories: 2
+
+foveate:
+  gate_threshold: 0.4
+  min_crop: 24
+  cascade_min_instance_area: 4
+  prototype_reduction: all
+
+eval:
+  max_exemplars: 2
+  exemplar_source: auto
+  limit: null
+
+mlflow:
+  enabled: false          # flip to true to log to ./mlruns
+  experiment_name: foveate-smoke
