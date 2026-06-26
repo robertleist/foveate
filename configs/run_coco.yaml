@@ -1,0 +1,58 @@
+# Baseline foveate run on a COCO subset (coral or any category).
+# Requires the [dino] extra and a downloaded COCO dataset; DINOv3 weights are HF-gated.
+run_name: coco_baseline
+output_dir: runs/coco_baseline
+
+backbone:
+  type: dino
+  model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+  image_size: 768
+
+data:
+  name: coco
+  root: /data/robert/coco
+  annotation_file: annotations/instances_train2017.json
+  images_dir: train2017
+  categories: [person]
+  min_instances: 2
+  train_images: 20        # intra pool (same-image discovery)
+  interval_images: 10     # disjoint novel images for cross-image (inter) eval
+  known_ratio: 0.3        # fraction of instances that are known/prompts; rest are discovery GT
+  seed: 42
+
+foveate:               # any foveate.Config field
+  standardize: true
+  gate_threshold: 0.5
+  gate_threshold_mode: static     # static | otsu | gmm2 | percentile
+  prototype_reduction: kmeans     # all | mean | cluster | kmeans
+  prototype_budget: 64
+  border_mode: proto              # proto | otsu | static
+  accept_mode: cls                # cls | proto | both
+  debias: false                   # enable for cross-image matching
+  min_crop: 64
+  max_total_embeds: 512
+
+eval:
+  targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (set debias: true)
+  max_exemplars: 3
+  limit: null
+  visualize: 20                   # render prompt|GT|prediction overlays for the first N images
+                                  #   (int caps count, true/"all" = every image, false = off);
+                                  #   saved to <output_dir>/{intra,inter}/viz and logged to MLflow
+  cascade_trace: 5                # contact sheet of the recursive zoom (gate/components/children)
+                                  #   per region, for the first N images; same budget semantics
+
+mlflow:
+  enabled: true
+  experiment_name: foveate-coco
+  # Server connection — all optional; env vars from .env are used as fallback.
+  # YAML values take precedence over the environment.
+  tracking_uri: null              # overrides MLFLOW_TRACKING_URI; null -> ./mlruns
+  username: null                  # overrides MLFLOW_TRACKING_USERNAME
+  password: null                  # overrides MLFLOW_TRACKING_PASSWORD
+  dotenv: null                    # explicit .env path; null -> looks for ./.env
+
+sweep:
+  foveate.gate_threshold_mode: [otsu, gmm2]
+  foveate.prototype_reduction: [all, mean, cluster, kmeans]
+  foveate.prototype_budget: [-1, 64, 512]

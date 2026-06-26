@@ -714,6 +714,7 @@ source = { editable = "." }
 dependencies = [
     { name = "numpy" },
     { name = "opencv-python-headless" },
+    { name = "pyyaml" },
     { name = "scikit-image" },
     { name = "scikit-learn" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -737,6 +738,7 @@ exp = [
     { name = "pandas" },
     { name = "pillow" },
     { name = "pycocotools" },
+    { name = "python-dotenv" },
     { name = "pyyaml" },
     { name = "tqdm" },
 ]
@@ -752,6 +754,8 @@ requires-dist = [
     { name = "pillow", marker = "extra == 'exp'" },
     { name = "pycocotools", marker = "extra == 'exp'" },
     { name = "pytest", marker = "extra == 'dev'" },
+    { name = "python-dotenv", marker = "extra == 'exp'" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "pyyaml", marker = "extra == 'exp'" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "scikit-image" },
