@@ -22,15 +22,23 @@ data:
 
 foveate:               # any foveate.Config field
   standardize: true
+  foreground_extractor: insid3    # insid3 (default) | bank — "where is the class" on a crop
+  # --- INSID3 foreground extractor (WHERE) ---
+  insid3_tau: 0.6                 # fine-grained clustering similarity threshold
+  insid3_aggregate_threshold: 0.2 # alpha: min combined score to merge a cluster into the object
+  insid3_crop_reference: true     # crop ref image+mask to each exemplar bbox (scale-match crops)
+  # --- leaf classification (WHAT): accept a converged crop when its CLS is, on average,
+  #     cosine-similar enough to the exemplar CLS bank ---
+  cls_threshold: 0.2
+  # --- recursion / cost ---
+  min_crop: 64
+  max_total_embeds: 512
+  debias: false                   # project out DINOv3 positional bias; enable for cross-image
+  # --- bank extractor only (used when foreground_extractor: bank) ---
   gate_threshold: 0.5
   gate_threshold_mode: static     # static | otsu | gmm2 | percentile
   prototype_reduction: kmeans     # all | mean | cluster | kmeans
   prototype_budget: 64
-  border_mode: proto              # proto | otsu | static
-  accept_mode: cls                # cls | proto | both
-  debias: false                   # enable for cross-image matching
-  min_crop: 64
-  max_total_embeds: 512
 
 eval:
   targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (set debias: true)

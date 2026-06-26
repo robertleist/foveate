@@ -25,10 +25,15 @@ data:
 
 foveate:
   standardize: false        # MockBackbone features are colour-based; z-scoring destroys the signal
-  gate_threshold: 0.4
+  foreground_extractor: insid3   # insid3 (default) | bank
+  insid3_tau: 0.6
+  insid3_aggregate_threshold: 0.2
+  insid3_crop_reference: true
+  cls_threshold: 0.0        # mock CLS is coarse; don't filter leaves on it in the smoke test
   min_crop: 24
   cascade_min_instance_area: 4
-  prototype_reduction: all
+  gate_threshold: 0.4       # bank extractor only
+  prototype_reduction: all  # bank extractor only
 
 eval:
   targets: [intra, inter]   # intra = same-image discovery; inter = cross-image
