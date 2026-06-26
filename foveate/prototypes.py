@@ -26,12 +26,17 @@ from foveate.debias import project_out
 @dataclass
 class Bank:
     prototypes: torch.Tensor               # (K, D) L2-normalized
-    cls: torch.Tensor                      # (D,) averaged, L2-normalized exemplar CLS
+    cls_bank: torch.Tensor                 # (S, D) per-exemplar CLS stack, L2-normalized
     proto: torch.Tensor                    # (D,) single mean prototype (border refine / accept)
     provenance: list[int] = field(default_factory=list)  # exemplar index per prototype
 
     def __len__(self) -> int:
         return int(self.prototypes.shape[0])
+
+    @property
+    def cls(self) -> torch.Tensor:
+        """Back-compat: the L2-normalized mean of the per-exemplar CLS stack ``(D,)``."""
+        return featlib.l2_normalize(self.cls_bank.mean(dim=0), dim=0)
 
 
 def _mask_bbox(mask: np.ndarray, pad_frac: float) -> tuple[int, int, int, int]:
@@ -94,9 +99,9 @@ def build_bank(
         cls_list.append(cls)
 
     protos, provenance = _reduce(per_exemplar, reduction, budget, per_exemplar_min, n_prototypes)
-    bank_cls = featlib.l2_normalize(torch.stack(cls_list).mean(dim=0), dim=0)
+    cls_bank = featlib.l2_normalize(torch.stack(cls_list), dim=1)   # (S, D)
     proto = featlib.l2_normalize(torch.cat(per_exemplar, dim=0).mean(dim=0), dim=0)
-    return Bank(prototypes=protos, cls=bank_cls, proto=proto, provenance=provenance)
+    return Bank(prototypes=protos, cls_bank=cls_bank, proto=proto, provenance=provenance)
 
 
 def _reduce(per_exemplar, reduction, budget, per_exemplar_min, n_prototypes):

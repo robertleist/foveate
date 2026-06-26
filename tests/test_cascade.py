@@ -4,13 +4,31 @@ from foveate import Config, discover_instances
 
 
 def test_discovers_both_targets_not_distractor(backbone, two_squares):
+    """Default extractor (INSID3) finds the two red squares, not the blue distractor."""
     img, ex = two_squares
-    cfg = Config(gate_threshold=0.4, min_crop=24, cascade_min_instance_area=4)
+    # standardize=True (default): MockBackbone black-background patches become non-zero,
+    # so INSID3's cluster_all over the full grid stays well-defined.
+    cfg = Config(min_crop=24, cascade_min_instance_area=4)
     instances, stats = discover_instances(backbone, img, ex, config=cfg)
 
     assert len(instances) == 2
     assert stats.leaves == 2
     # Each discovered mask should sit on a red square, not the blue distractor at (20:40, 80:100).
+    for inst in instances:
+        ys, xs = np.where(inst.mask)
+        cy, cx = ys.mean(), xs.mean()
+        assert not (cy < 60 and cx > 60), "discovered the blue distractor"
+
+
+def test_bank_extractor_discovers_both_targets(backbone, two_squares):
+    """The 'bank' foreground strategy stays covered: two red squares, no distractor."""
+    img, ex = two_squares
+    cfg = Config(foreground_extractor="bank", gate_threshold=0.8,
+                 min_crop=24, cascade_min_instance_area=4)
+    instances, stats = discover_instances(backbone, img, ex, config=cfg)
+
+    assert len(instances) == 2
+    assert stats.leaves == 2
     for inst in instances:
         ys, xs = np.where(inst.mask)
         cy, cx = ys.mean(), xs.mean()

@@ -40,16 +40,23 @@ data:
 
 foveate:
   standardize: true
-  gate_threshold: 0.5
-  gate_threshold_mode: otsu       # nuclei are compact; otsu works well
-  prototype_reduction: kmeans
-  prototype_budget: 32            # nuclei are small; fewer prototypes suffice
-  border_mode: proto
-  accept_mode: cls
-  debias: false
+  foreground_extractor: insid3    # insid3 (default) | bank — "where is the class" on a crop
+  # --- INSID3 foreground extractor (WHERE) ---
+  insid3_tau: 0.6                 # fine-grained clustering similarity threshold
+  insid3_aggregate_threshold: 0.2 # alpha: min combined score to merge a cluster into the object
+  insid3_crop_reference: true     # crop ref image+mask to each exemplar bbox (scale-match crops)
+  # --- leaf classification (WHAT): mean cos(crop CLS, exemplar CLS) >= cls_threshold ---
+  cls_threshold: 0.5
+  # --- recursion / cost ---
+  debias: false                   # project out DINOv3 positional bias; enable for cross-image
   min_crop: 16                    # nuclei can be small (< 20 px)
   cascade_min_instance_area: 8    # reject fragments smaller than 8 px²
   max_total_embeds: 256
+  # --- bank extractor only (used when foreground_extractor: bank) ---
+  gate_threshold: 0.5
+  gate_threshold_mode: otsu       # static | otsu | gmm2 | percentile
+  prototype_reduction: kmeans
+  prototype_budget: 32            # nuclei are small; fewer prototypes suffice
 
 eval:
   targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (set debias: true)

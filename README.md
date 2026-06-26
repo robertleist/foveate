@@ -89,6 +89,21 @@ python -m experiments.ablations --config configs/ablation_thresholds.yaml
 Quality** (PQ/SQ/RQ), mean per-instance **IoU**, **count error**, and **exemplar-recovery IoU**.
 Params, metrics, per-image cost (embeds, runtime) and the saved masks are logged to MLflow.
 
+## Frontend
+
+A small Streamlit app visualizes the whole pipeline stage by stage on real DINOv3 features —
+the **WHERE** (INSID3 foreground extraction: clusters → forward/backward similarity → seed →
+aggregated foreground), the recursive **cascade trace**, and the **WHAT** (per-leaf CLS
+classification table).
+
+```bash
+uv run --extra frontend --extra dino streamlit run frontend/app.py
+```
+
+It needs DINOv3 weights (set `HF_TOKEN` / request hub access first). Load a built-in synthetic
+sample or upload a reference image + mask (free-draw canvas, or a mask PNG fallback), tune the
+`Config` from the sidebar, and hit **Run**.
+
 ## Layout
 
 ```

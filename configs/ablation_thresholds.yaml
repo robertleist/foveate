@@ -1,4 +1,5 @@
-# Ablation: gate-threshold strategy x prototype reduction, on the offline synthetic dataset.
+# Ablation: INSID3 clustering threshold x aggregation threshold, on the offline synthetic dataset.
+# (Swap the sweep block for `foveate.foreground_extractor: [insid3, bank]` to compare strategies.)
 #   python -m experiments.ablations --config configs/ablation_thresholds.yaml
 run_name: ablation
 output_dir: runs/ablation
@@ -23,9 +24,12 @@ data:
 
 foveate:
   standardize: false        # MockBackbone features are colour-based; z-scoring destroys the signal
-  gate_threshold: 0.4
+  foreground_extractor: insid3
+  insid3_crop_reference: true
+  cls_threshold: 0.0        # isolate the foreground-extraction ablation from leaf classification
   min_crop: 24
   cascade_min_instance_area: 4
+  gate_threshold: 0.4       # bank extractor only
 
 eval:
   max_exemplars: 2
@@ -35,5 +39,5 @@ mlflow:
   experiment_name: foveate-ablations
 
 sweep:
-  foveate.gate_threshold_mode: [static, otsu]
-  foveate.prototype_reduction: [all, kmeans]
+  foveate.insid3_tau: [0.5, 0.6, 0.7]
+  foveate.insid3_aggregate_threshold: [0.1, 0.2, 0.3]
