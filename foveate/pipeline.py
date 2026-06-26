@@ -17,8 +17,9 @@ import cv2
 import numpy as np
 import torch
 
-from foveate import clustering, features as featlib, gate as gatelib, individuation, merge
+from foveate import clustering, features as featlib, individuation, merge
 from foveate.config import Config
+from foveate.foreground import GateResult, build_extractor
 
 
 @dataclass
@@ -27,7 +28,7 @@ class InSID3Result:
     image: np.ndarray
     grid_hw: tuple[int, int]
     features: torch.Tensor
-    gate: gatelib.GateResult
+    gate: GateResult
     atom_labels: np.ndarray
     individuation: individuation.IndividuationResult
     merged_labels: np.ndarray             # (Hp, Wp) patch-level final instances
@@ -78,8 +79,11 @@ def run(
     feats = featlib.embed_image(backbone, image, standardize=params.standardize)
     hp, wp = feats.shape[:2]
 
-    # Stage 2 -- semantic gate.
-    gate = gatelib.semantic_gate(feats, positive_masks, negative_masks, params.gate_threshold)
+    # Stage 2 -- foreground extraction (INSID3 by default; bank alternative). Set the reference
+    # from this image's exemplar masks, then predict the class region on the same image.
+    extractor = build_extractor(params)
+    extractor.set_reference(backbone, image, positive_masks, negative_masks, params)
+    gate = extractor.predict(feats)
 
     # Stage 3 -- over-segmentation into atoms.
     atoms = clustering.agglomerative_oversegment(feats, gate.foreground, params.cluster_tau)

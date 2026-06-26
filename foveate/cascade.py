@@ -2,14 +2,19 @@
 
 Breadth-first, batched, connected-components fixed point. For each crop:
 
-1. **Re-embed** (batched per level) and **gate** by cosine to the exemplar bank → foreground.
+1. **Re-embed** (batched per level) and **extract the class foreground** with the configured
+   foreground extractor (INSID3 by default, the prototype bank as an alternative) → the region
+   of the crop that belongs to the exemplar concept. This answers *where* on the crop the class
+   is.
 2. **Connected components** propose tighter crops:
    - ≥ 2 components  → enqueue each (tighter child crops);
    - 1 component whose bbox does **not** fill the crop → enqueue the tighter crop (keep zooming);
    - 1 component whose bbox **fills** the crop → *converged* (no tighter crop extractable).
-3. A converged crop is **accepted as a leaf** per ``config.accept_mode`` (CLS re-identification,
-   mean-prototype similarity, or both). A converged-but-rejected large crop is a seamless clump
-   → optional watershed split; otherwise accepted as a single instance (or discarded).
+3. A converged crop is **accepted as a leaf** by a single test: the mean cosine similarity of
+   the crop's CLS token to *all* exemplar CLS clears ``config.cls_threshold`` — a majority-vote
+   that the crop contains the exemplar concept (this answers *what* is in the bbox). A
+   converged-but-rejected large crop is a seamless clump → optional watershed split; otherwise
+   accepted as a single instance (or discarded).
 
 The exemplar defines the target *scale and granularity*. Only leaves are returned.
 """
@@ -23,10 +28,9 @@ import numpy as np
 import torch
 from scipy.ndimage import generate_binary_structure, label
 
-from foveate import border, clustering, features as featlib, gate as gatelib, individuation, merge, thresholding
+from foveate import clustering, features as featlib, individuation, merge
 from foveate.config import Config
-from foveate.debias import estimate_positional_basis, project_out
-from foveate.prototypes import build_bank
+from foveate.foreground import build_extractor
 from foveate.types import Instance, Stats
 
 _CONN8 = generate_binary_structure(2, 2)   # 8-connectivity: don't over-split single instances
@@ -92,9 +96,10 @@ def discover_instances(
         A :class:`~foveate.config.Config` (or dict) holding every tunable knob.
     exemplar_image:
         If given, the exemplar lives in *this* image while ``image`` is a **different target**
-        (the in-context / cross-image setting). The bank is built from ``exemplar_image`` and
-        every target crop is gated against it. ``None`` (default) = intra-image. Cross-image
-        matching carries a DINOv3 positional bias — enable ``config.debias`` to correct it.
+        (the in-context / cross-image setting). The foreground extractor's reference is built
+        from ``exemplar_image`` and every target crop is matched against it. ``None`` (default)
+        = intra-image (reference and targets share the image). Cross-image matching carries a
+        DINOv3 positional bias — enable ``config.debias`` to correct it.
     observer:
         Optional ``callable(info: dict)`` invoked once per processed region for tracing.
     """
@@ -106,61 +111,23 @@ def discover_instances(
     leaves: list[Instance] = []
     stats = Stats()
 
-    debias_B = None
-    if cfg.debias:
-        debias_B = estimate_positional_basis(
-            backbone, subspace_dim=cfg.debias_subspace_dim, n_noise=cfg.debias_n_noise,
-            seed=cfg.debias_seed, standardize=cfg.standardize,
-        )
-
-    bank = build_bank(
-        backbone, image if same_image else exemplar_image, exemplar_masks,
-        reduction=cfg.prototype_reduction, budget=cfg.prototype_budget,
-        per_exemplar_min=cfg.prototype_per_exemplar_min, n_prototypes=cfg.n_prototypes,
-        standardize=cfg.standardize, debias_B=debias_B,
-    )
-    bank_tensor, bank_cls, proto = bank.prototypes, bank.cls, bank.proto
+    # Foreground extractor: set the reference (image + exemplar masks) once, then predict the
+    # class region on every target crop. This is the INSID3 reference-at-gating-time flow.
+    extractor = build_extractor(cfg)
+    ref_image = image if same_image else exemplar_image
+    extractor.set_reference(backbone, ref_image, exemplar_masks, negative_masks, cfg)
+    cls_bank = extractor.cls_bank                       # (S, D) L2-normalized exemplar CLS
     stats.n_embeds += 1
 
-    def gate_to_bank(feat: torch.Tensor) -> np.ndarray:
-        """Foreground grid: per-patch max cosine to the bank, thresholded (static/adaptive)."""
-        hp, wp, d = feat.shape
-        flat = project_out(feat.reshape(hp * wp, d), debias_B)
-        sims = (flat @ bank_tensor.T).max(dim=1).values.reshape(hp, wp).cpu().numpy()
-        if cfg.gate_threshold_mode == "static":
-            return sims >= cfg.gate_threshold
-        return thresholding.foreground(
-            sims, cfg.gate_threshold_mode, static=cfg.gate_threshold,
-            percentile=cfg.gate_percentile,
-        )
+    def classify(cls: torch.Tensor) -> float:
+        """Mean cosine of the crop's CLS to all exemplar CLS — the "what is in the bbox" test."""
+        gallery = cls_bank.to(cls.device, cls.dtype)
+        return float((cls @ gallery.T).mean())
 
-    def proto_score(feat: torch.Tensor, comp: np.ndarray) -> float:
-        hp, wp, d = feat.shape
-        sims = (feat.reshape(hp * wp, d) @ proto).reshape(hp, wp).cpu().numpy()
-        vals = sims[comp]
-        return float(vals.mean()) if vals.size else 0.0
+    def accept(cls_score: float) -> bool:
+        return cls_score >= cfg.cls_threshold
 
-    def accept(cls_score: float, p_score: float) -> bool:
-        cls_ok = cls_score >= cfg.cls_threshold
-        proto_ok = p_score >= cfg.accept_proto_threshold
-        if cfg.accept_mode == "cls":
-            return cls_ok
-        if cfg.accept_mode == "proto":
-            return proto_ok
-        if cfg.accept_mode == "both":
-            return cls_ok and proto_ok
-        raise ValueError(f"unknown accept_mode {cfg.accept_mode!r}")
-
-    def combined(cls_score: float, p_score: float) -> float:
-        if cfg.accept_mode == "proto":
-            return p_score
-        if cfg.accept_mode == "both":
-            return 0.5 * (cls_score + p_score)
-        return cls_score
-
-    def emit(region, comp_grid, score, feat):
-        if cfg.border_mode != "static":
-            comp_grid, _, _ = border.refine(feat, comp_grid, proto, mode=cfg.border_mode)
+    def emit(region, comp_grid, score):
         y0, y1, x0, x1 = region.box
         mask_local = cv2.resize(comp_grid.astype(np.uint8), (x1 - x0, y1 - y0),
                                 interpolation=cv2.INTER_NEAREST)
@@ -185,32 +152,20 @@ def discover_instances(
         for r, (feat, cls) in zip(frontier, embedded):
             stats.max_depth = max(stats.max_depth, r.depth)
 
-            # Root, intra-image: use the accurate in-image gate -- but only if the exemplar is
-            # large enough to land on the full-image grid (else fall back to the bank gate).
-            use_inimage_gate = (
-                r.depth == 0 and same_image
-                and featlib.stack_exemplar_patches(feat, exemplar_masks).shape[0] > 0
-            )
-            if use_inimage_gate:
-                fg = gatelib.semantic_gate(feat, exemplar_masks, negative_masks,
-                                           cfg.gate_threshold).foreground
-            else:
-                fg = gate_to_bank(feat)
+            fg = extractor.predict(feat).foreground
             labels, n = (label(fg, structure=_CONN8) if fg.any()
                          else (np.zeros_like(fg, dtype=int), 0))
 
             floor = (r.box[1] - r.box[0]) <= cfg.min_crop or (r.box[3] - r.box[2]) <= cfg.min_crop
-            decision, children, score = "empty", [], None
-            cls_score = float(cls @ bank_cls)
+            decision, children = "empty", []
+            cls_score = classify(cls)
 
             if n == 0:
                 pass
             elif r.depth >= cfg.max_depth or floor:       # forced convergence: emit components
                 decision = "leaf-cap"
                 for cid in range(1, n + 1):
-                    comp = labels == cid
-                    score = combined(cls_score, proto_score(feat, comp))
-                    emit(r, comp, score, feat)
+                    emit(r, labels == cid, cls_score)
             elif n >= 2:                                  # multiple instances → tighter crops
                 decision = "split"
                 children = [_child_box(labels == cid, r.box, cfg.pad_frac) for cid in range(1, n + 1)]
@@ -220,11 +175,9 @@ def discover_instances(
                 if _box_area(child) / max(_box_area(r.box), 1) < cfg.shrink_stop:
                     decision, children = "zoom", [child]  # strictly tighter → keep zooming
                 else:                                     # converged — no tighter crop
-                    p_score = proto_score(feat, comp)
-                    score = combined(cls_score, p_score)
                     comp_area = float(comp.sum()) / comp.size * _box_area(r.box)
-                    if accept(cls_score, p_score) or comp_area <= cfg.clump_area_factor * exemplar_area:
-                        decision = "leaf"; emit(r, comp, score, feat)
+                    if accept(cls_score) or comp_area <= cfg.clump_area_factor * exemplar_area:
+                        decision = "leaf"; emit(r, comp, cls_score)
                     elif cfg.split_mode != "none":
                         subs = _split_clump(feat, comp, cfg)
                         if len(subs) >= 2:
@@ -233,11 +186,11 @@ def discover_instances(
                         elif cfg.discard_rejected:
                             decision = "discard"; stats.discarded += 1
                         else:
-                            decision = "leaf"; emit(r, comp, score, feat)  # unsplittable → accept
+                            decision = "leaf"; emit(r, comp, cls_score)  # unsplittable → accept
                     elif cfg.discard_rejected:
                         decision = "discard"; stats.discarded += 1
                     else:
-                        decision = "leaf"; emit(r, comp, score, feat)
+                        decision = "leaf"; emit(r, comp, cls_score)
 
             if observer is not None:
                 observer(dict(level=level_idx, depth=r.depth, box=r.box, decision=decision,

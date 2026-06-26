@@ -11,6 +11,8 @@ input aspect ratio.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 
@@ -18,6 +20,16 @@ import torch
 _DEFAULT_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m"
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def _load_hf_token() -> str | None:
+    """Load HF token from .env file or environment variable."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+    return os.getenv("HF_TOKEN")
 
 
 class DINOv3Backbone:
@@ -66,7 +78,8 @@ class DINOv3Backbone:
         
         self.dtype = dtype
 
-        self.model = AutoModel.from_pretrained(model_id).to(self.device, dtype).eval()
+        hf_token = _load_hf_token()
+        self.model = AutoModel.from_pretrained(model_id, token=hf_token).to(self.device, dtype).eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
 

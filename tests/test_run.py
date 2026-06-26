@@ -11,7 +11,10 @@ def _config(tmp_path, targets):
             "train_images": 4, "interval_images": 2, "known_ratio": 0.5, "seed": 0,
             "options": {"n_images": 6, "image_size": 96, "n_instances": 3, "n_categories": 2},
         },
-        "foveate": {"standardize": False, "gate_threshold": 0.4, "min_crop": 24,
+        # standardize defaults to True: under the MockBackbone, z-scoring lifts the
+        # all-black background patches off zero, so INSID3's cluster_all (cosine) over
+        # the full target grid stays well-defined.
+        "foveate": {"gate_threshold": 0.4, "min_crop": 24,
                     "cascade_min_instance_area": 4},
         "eval": {"targets": targets, "max_exemplars": 2},
         "mlflow": {"enabled": False},

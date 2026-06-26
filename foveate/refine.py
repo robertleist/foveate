@@ -26,8 +26,8 @@ import cv2
 import numpy as np
 
 from foveate import features as featlib
-from foveate import gate as gatelib
 from foveate.config import Config
+from foveate.foreground import GateResult, build_extractor
 
 
 @dataclass
@@ -36,7 +36,7 @@ class RefineRound:
     image: np.ndarray                 # the (cropped) image embedded this round
     features: "object"                # (Hp, Wp, D) tensor
     grid_hw: tuple[int, int]
-    gate: gatelib.GateResult
+    gate: GateResult
     exemplar_masks: list[np.ndarray]  # exemplar masks in this round's coordinates
     crop_box: tuple[int, int, int, int] | None  # (y0, y1, x0, x1) producing the NEXT round
 
@@ -99,10 +99,13 @@ def iterative_refine(
     cur_image = image
     cur_exemplars = exemplar_masks
     history: list[RefineRound] = []
+    extractor = build_extractor(params)
 
     for r in range(rounds):
         feats = featlib.embed_image(backbone, cur_image, standardize=params.standardize)
-        gate = gatelib.semantic_gate(feats, cur_exemplars, None, params.gate_threshold)
+        # Intra-image each round: reference is the current crop's exemplars in the current crop.
+        extractor.set_reference(backbone, cur_image, cur_exemplars, None, params)
+        gate = extractor.predict(feats)
 
         box = None
         if r < rounds - 1:

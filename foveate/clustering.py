@@ -48,10 +48,17 @@ def agglomerative_oversegment(
     features: torch.Tensor,
     foreground: np.ndarray,
     distance_threshold: float,
+    linkage: str = "average",
 ) -> np.ndarray:
     """Cluster foreground patches into atoms; return a ``(Hp, Wp)`` int label grid.
 
     Label ``0`` is background (non-foreground); atoms are labelled ``1..K``.
+
+    ``linkage`` selects scikit-learn's agglomerative linkage. ``"average"`` (the
+    default) keeps the part-level over-segmentation behaviour; INSID3 prefers
+    ``"single"`` so feature-coherent chains stay together. ``"single"`` /
+    ``"average"`` / ``"complete"`` all combine fine with the cosine metric and the
+    connectivity graph (only ``"ward"`` would forbid a non-euclidean metric).
     """
     hp, wp, d = features.shape
     labels = np.zeros((hp, wp), dtype=np.int32)
@@ -65,14 +72,62 @@ def agglomerative_oversegment(
 
     feats = features[foreground].cpu().numpy()             # (N, D), L2-normed
 
+    # Cosine affinity is undefined for zero vectors. They arise legitimately when clustering the
+    # *whole* grid (cluster_all) — e.g. a pure-black patch under standardize=false L2-normalizes
+    # to all-zeros. Nudge any zero-norm row onto a single constant axis so it stays valid and
+    # such rows simply cluster together (a degenerate "flat" region), instead of crashing sklearn.
+    zero = np.linalg.norm(feats, axis=1) < 1e-8
+    if zero.any():
+        feats = feats.copy()
+        feats[zero] = 0.0
+        feats[zero, 0] = 1.0
+
     clusterer = AgglomerativeClustering(
         n_clusters=None,
         distance_threshold=distance_threshold,
         metric="cosine",
-        linkage="average",
+        linkage=linkage,
         connectivity=adj,
     )
     atom_ids = clusterer.fit_predict(feats)                # 0..K-1
 
     labels[coords[:, 0], coords[:, 1]] = atom_ids + 1      # reserve 0 for background
     return labels
+
+
+def cluster_all(
+    features: torch.Tensor,
+    distance_threshold: float,
+    linkage: str = "average",
+) -> np.ndarray:
+    """Cluster **every** patch in pure feature space (the official INSID3 step).
+
+    Unlike :func:`agglomerative_oversegment` (which constrains merges to spatial neighbours to
+    keep atoms contiguous), INSID3's fine-grained clustering uses **no connectivity graph** and
+    **average** linkage over a *precomputed cosine-distance* matrix ``D = 1 - X Xᵀ``. This is
+    crucial: with a spatial graph + single linkage, smooth DINOv3 features chain every adjacent
+    patch into one giant cluster, so the seed cluster (and thus the foreground) swallows the
+    whole image. Feature-space average linkage instead recovers many part-level clusters, and a
+    cluster may legitimately span spatially-disjoint instances of the same appearance (the
+    cascade separates those later via connected components).
+
+    ``distance_threshold`` is ``1 - tau``. Returns a ``(Hp, Wp)`` int grid with labels
+    ``0..K-1`` — every patch belongs to a cluster (there is no background label here).
+    """
+    hp, wp, d = features.shape
+    n = hp * wp
+    if n <= 1:
+        return np.zeros((hp, wp), dtype=np.int32)
+
+    flat = features.reshape(n, d)
+    dist = (1.0 - (flat @ flat.T).clamp(-1.0, 1.0)).cpu().numpy().astype(np.float64)
+    np.fill_diagonal(dist, 0.0)                            # guard FP noise on the diagonal
+
+    clusterer = AgglomerativeClustering(
+        n_clusters=None,
+        distance_threshold=float(distance_threshold),
+        metric="precomputed",
+        linkage=linkage,
+    )
+    labels = clusterer.fit_predict(dist)                  # 0..K-1
+    return labels.reshape(hp, wp).astype(np.int32)

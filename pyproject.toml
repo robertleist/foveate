@@ -18,11 +18,16 @@ dependencies = [
     "scikit-image",
     "scikit-learn",
     "torchvision>=0.27.1",
+    "streamlit>=1.58.0",
+    "transformers>=5.12.1",
+    "streamlit-drawable-canvas>=0.9.3",
+    "streamlit-elements>=0.1.0",
 ]
 
 [project.optional-dependencies]
 dino = ["transformers>=4.56", "huggingface-hub"]                 # default backbone
 exp = ["pycocotools", "matplotlib", "pyyaml", "pandas", "mlflow", "tqdm", "pillow", "python-dotenv"]  # experiments
+frontend = ["streamlit", "streamlit-drawable-canvas", "matplotlib", "pillow"]  # streamlit viz app
 dev = ["pytest", "ruff"]
 
 [[tool.uv.index]]
