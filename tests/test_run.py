@@ -1,10 +1,9 @@
 from experiments.run import run_experiment
 
 
-def _config(tmp_path, targets):
+def _config(targets):
     return {
         "run_name": "test",
-        "output_dir": str(tmp_path / "out"),
         "backbone": {"type": "mock", "image_size": 224, "patch_size": 14},
         "data": {
             "name": "synthetic", "categories": [], "min_instances": 2,
@@ -21,16 +20,13 @@ def _config(tmp_path, targets):
     }
 
 
-def test_run_intra(tmp_path):
-    result = run_experiment(_config(tmp_path, ["intra"]))
+def test_run_intra():
+    result = run_experiment(_config(["intra"]))
     assert "intra_ap" in result and "intra_pq" in result and "intra_mean_iou" in result
     assert result["intra_n_images"] >= 1
-    assert (tmp_path / "out" / "metrics.json").exists()
 
 
-def test_run_intra_and_inter(tmp_path):
-    result = run_experiment(_config(tmp_path, ["intra", "inter"]))
+def test_run_intra_and_inter():
+    result = run_experiment(_config(["intra", "inter"]))
     assert "intra_ap" in result and "inter_ap" in result
     assert result["inter_n_images"] >= 1
-    # Cross-image masks land in their own subdir.
-    assert (tmp_path / "out" / "inter").exists()

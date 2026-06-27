@@ -2,7 +2,6 @@
 # (Swap the sweep block for `foveate.foreground_extractor: [insid3, bank]` to compare strategies.)
 #   python -m experiments.ablations --config configs/ablation_thresholds.yaml
 run_name: ablation
-output_dir: runs/ablation
 
 backbone:
   type: mock
