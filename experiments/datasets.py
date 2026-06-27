@@ -2,8 +2,9 @@
 
 Two evaluation protocols, both yielding :class:`EvalItem`s:
 
-* **intra** (same image) — prompt with an image's ``known`` instances, discover its ``unknown``
-  instances. ``exemplar_image is None`` (exemplars and targets share the image).
+* **intra** (same image) — prompt with an image's ``known`` instances and segment *all*
+  instances of that class in the same image (prompts included, since foveate re-finds them).
+  ``exemplar_image is None`` (exemplars and targets share the image).
 * **inter** (cross image) — prompt with ``known`` instances from a *support* intra-pool image and
   discover instances of that class in a disjoint *novel* image. ``exemplar_image`` is the support
   image; this is the cross-image setting (enable ``Config.debias`` to correct DINOv3's positional
@@ -60,7 +61,12 @@ def _intra_item(sample: InstanceSample, image_id: str, max_exemplars: int) -> Ev
         return None
     target_class = Counter(inst.class_id for inst in prompts).most_common(1)[0][0]
     exemplars = [p for p in prompts if p.class_id == target_class][:max_exemplars]
-    gt = [inst.mask for inst in sample.unknown_instances if inst.class_id == target_class]
+    # GT is *all* instances of the class, prompts included: foveate segments the whole class
+    # region (it can't know which instances were handed to it as exemplars), so re-finding a
+    # prompt must count as a true positive, not a false positive. Scoring only the held-out
+    # `unknown` instances penalised every correctly-segmented prompt as an FP and capped AP at
+    # ~n_unknown/n_total even with perfect masks.
+    gt = [inst.mask for inst in sample.instances_of_class(target_class)]
     if not exemplars or not gt:
         return None
     return EvalItem(
