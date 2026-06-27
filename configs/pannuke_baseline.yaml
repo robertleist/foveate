@@ -18,7 +18,6 @@
 #
 #   python -m experiments.run --config configs/pannuke_baseline.yaml
 run_name: pannuke_baseline
-output_dir: runs/pannuke_baseline
 
 backbone:
   type: dino

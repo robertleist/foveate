@@ -40,7 +40,6 @@ def expand_sweep(base: dict[str, Any]) -> list[dict[str, Any]]:
     keys = list(sweep)
     grids = [sweep[k] if isinstance(sweep[k], list) else [sweep[k]] for k in keys]
     base_name = base.get("run_name", "ablation")
-    base_outdir = base.get("output_dir", "runs/ablation")
     configs = []
     for combo in itertools.product(*grids):
         cfg = copy.deepcopy(base)
@@ -50,7 +49,6 @@ def expand_sweep(base: dict[str, Any]) -> list[dict[str, Any]]:
             suffix.append(f"{k.split('.')[-1]}={v}")
         tag = "_".join(suffix)
         cfg["run_name"] = f"{base_name}__{tag}"
-        cfg["output_dir"] = f"{base_outdir}/{tag}"
         configs.append(cfg)
     return configs
 

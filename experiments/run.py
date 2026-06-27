@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -154,43 +155,46 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
 
     intra_ds, inter_ds = build_datasets(data_cfg)
 
-    output_dir = Path(config.get("output_dir", "runs/latest"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-
+    # Stage artifacts in a fresh per-run temp dir so MLflow is the single source of truth.
+    # A persistent output_dir was reused across runs without being cleared, so log_artifacts
+    # uploaded stale masks/overlays from earlier datasets; a temp dir is empty every time.
     backbone_kind = (config.get("backbone") or {}).get("type", "dino")
-    print(f"[run] '{config.get('run_name', 'run')}': backbone={backbone_kind} "
-          f"data={data_cfg.name} targets={targets} "
-          f"intra_pool={len(intra_ds)} inter_pool={len(inter_ds) if inter_ds else 0} "
-          f"-> {output_dir}")
-
     result: dict[str, Any] = {}
-    if "intra" in targets:
-        items = iter_intra_items(intra_ds, max_exemplars=max_exemplars, limit=limit)
-        result.update(_evaluate(backbone, items, foveate_cfg, output_dir / "intra", "intra",
-                                visualize=visualize, cascade_trace=cascade_trace, total=limit))
-    if "inter" in targets:
-        if inter_ds is None:
-            print("[run] inter eval requested but interval_images == 0; skipping.")
-        else:
-            support = build_support_index(intra_ds)
-            items = iter_inter_items(inter_ds, support, max_exemplars=max_exemplars, limit=limit)
-            result.update(_evaluate(backbone, items, foveate_cfg, output_dir / "inter", "inter",
+    with tempfile.TemporaryDirectory(prefix="foveate-run-") as tmp:
+        output_dir = Path(tmp)
+
+        print(f"[run] '{config.get('run_name', 'run')}': backbone={backbone_kind} "
+              f"data={data_cfg.name} targets={targets} "
+              f"intra_pool={len(intra_ds)} inter_pool={len(inter_ds) if inter_ds else 0} "
+              f"-> {output_dir}")
+
+        if "intra" in targets:
+            items = iter_intra_items(intra_ds, max_exemplars=max_exemplars, limit=limit)
+            result.update(_evaluate(backbone, items, foveate_cfg, output_dir / "intra", "intra",
                                     visualize=visualize, cascade_trace=cascade_trace, total=limit))
+        if "inter" in targets:
+            if inter_ds is None:
+                print("[run] inter eval requested but interval_images == 0; skipping.")
+            else:
+                support = build_support_index(intra_ds)
+                items = iter_inter_items(inter_ds, support, max_exemplars=max_exemplars, limit=limit)
+                result.update(_evaluate(backbone, items, foveate_cfg, output_dir / "inter", "inter",
+                                        visualize=visualize, cascade_trace=cascade_trace, total=limit))
 
-    (output_dir / "metrics.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-    print(json.dumps(result, indent=2))
+        (output_dir / "metrics.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        print(json.dumps(result, indent=2))
 
-    with _mlflow_run(config.get("mlflow", {}), config.get("run_name")) as mlflow:
-        if mlflow is not None:
-            params = {}
-            params.update(_flatten_params("backbone", config.get("backbone", {})))
-            params.update(_flatten_params("data", config["data"]))
-            params.update(_flatten_params("foveate", foveate_cfg.to_dict()))
-            params.update(_flatten_params("eval", eval_cfg))
-            mlflow.log_params(params)
-            mlflow.log_metrics({k: float(v) for k, v in result.items()
-                                if isinstance(v, (int, float)) and not np.isnan(float(v))})
-            mlflow.log_artifacts(str(output_dir))
+        with _mlflow_run(config.get("mlflow", {}), config.get("run_name")) as mlflow:
+            if mlflow is not None:
+                params = {}
+                params.update(_flatten_params("backbone", config.get("backbone", {})))
+                params.update(_flatten_params("data", config["data"]))
+                params.update(_flatten_params("foveate", foveate_cfg.to_dict()))
+                params.update(_flatten_params("eval", eval_cfg))
+                mlflow.log_params(params)
+                mlflow.log_metrics({k: float(v) for k, v in result.items()
+                                    if isinstance(v, (int, float)) and not np.isnan(float(v))})
+                mlflow.log_artifacts(str(output_dir))
 
     return result
 

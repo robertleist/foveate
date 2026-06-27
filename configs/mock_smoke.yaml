@@ -2,7 +2,6 @@
 # Runs end-to-end with no downloads and no DINOv3 weights:
 #   python -m experiments.run --config configs/mock_smoke.yaml
 run_name: mock_smoke
-output_dir: runs/mock_smoke
 
 backbone:
   type: mock

@@ -1,7 +1,6 @@
 # Baseline foveate run on a COCO subset (coral or any category).
 # Requires the [dino] extra and a downloaded COCO dataset; DINOv3 weights are HF-gated.
 run_name: coco_baseline
-output_dir: runs/coco_baseline
 
 backbone:
   type: dino
@@ -38,7 +37,7 @@ eval:
   limit: null
   visualize: 20                   # render prompt|GT|prediction overlays for the first N images
                                   #   (int caps count, true/"all" = every image, false = off);
-                                  #   saved to <output_dir>/{intra,inter}/viz and logged to MLflow
+                                  #   logged to MLflow under {intra,inter}/viz in the run's artifacts
   cascade_trace: 5                # contact sheet of the recursive zoom (gate/components/children)
                                   #   per region, for the first N images; same budget semantics
 
