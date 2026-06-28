@@ -217,6 +217,7 @@ def _evaluate(backbone, items, cfg: Config, output_dir: Path, prefix: str,
     trace_budget = _budget(cascade_trace)
     viz_dir = output_dir / "viz"
     trace_dir = output_dir / "viz" / "cascade"
+    traj_dir = output_dir / "viz" / "trajectory"
 
     bar = _progress(items, desc=prefix, total=total)
     for item in bar:
@@ -239,7 +240,9 @@ def _evaluate(backbone, items, cfg: Config, output_dir: Path, prefix: str,
             save_item_overlay(item, pred, viz_dir)
         if trace is not None:
             from experiments.visualize import save_cascade_trace
+            from experiments.trajectories import save_cls_trajectory
             save_cascade_trace(item, trace, trace_dir)
+            save_cls_trajectory(item, trace, traj_dir, cls_threshold=cfg.cls_threshold)
         # Live cost readout on the bar: predictions/image, embeds/image, sec/image.
         if hasattr(bar, "set_postfix"):
             bar.set_postfix(pred=f"{total_pred / n_items:.1f}",
