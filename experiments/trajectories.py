@@ -29,6 +29,7 @@ Quickstart
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -129,19 +130,25 @@ def _node(ev: dict) -> TraceNode:
     )
 
 
-def build_segments(events: list[dict]) -> list[list[TraceNode]]:
-    """Rebuild the zoom tree from observer events and slice it into single-component segments.
-
-    A child box becomes the box of its child region, so an exact box->event map reconstructs
-    parent->child. Roots are events whose box is never referenced as a child. Each segment is a
-    maximal chain of one-child ``zoom`` steps; forks (>= 2 children) end the segment and seed a
-    new one per child.
-    """
+def _reconstruct(events: list[dict]) -> tuple[dict[tuple, dict], list[dict]]:
+    """``(box -> event, roots)``. A child box becomes the box of its child region, so an exact
+    box map rebuilds parent->child; roots are events whose box is never referenced as a child."""
     by_box: dict[tuple, dict] = {}
     for ev in events:
         by_box.setdefault(tuple(ev["box"]), ev)
     referenced = {tuple(c) for ev in events for c in ev.get("children", [])}
     roots = [ev for ev in events if tuple(ev["box"]) not in referenced]
+    return by_box, roots
+
+
+def build_segments(events: list[dict]) -> list[list[TraceNode]]:
+    """Rebuild the zoom tree from observer events and slice it into single-component segments.
+
+    Each segment is a maximal chain of one-child ``zoom`` steps; forks (>= 2 children) end the
+    segment and seed a new one per child. For the *connected* root->leaf view use
+    :func:`build_paths` instead.
+    """
+    by_box, roots = _reconstruct(events)
 
     segments: list[list[TraceNode]] = []
     # Iterative walk (explicit stack) so a deep zoom can't blow the Python recursion limit.
@@ -160,6 +167,39 @@ def build_segments(events: list[dict]) -> list[list[TraceNode]]:
             stack.extend(kids)  # 0 -> terminal; >= 2 -> each child seeds a new segment
             break
     return segments
+
+
+def build_paths(events: list[dict]) -> list[list[TraceNode]]:
+    """Full **connected** root->leaf paths: every chain from the whole-image crop (depth 0) to a
+    terminal region (leaf / discard / cap), forks and all. One path per leaf; shared ancestors
+    are repeated in each path that passes through them. This is the view to *follow* a single
+    instance's zoom from the whole image down to its crop.
+    """
+    by_box, roots = _reconstruct(events)
+    paths: list[list[TraceNode]] = []
+    stack: list[list[TraceNode]] = [[_node(r)] for r in roots]
+    while stack:
+        path = stack.pop()
+        kids = [by_box[c] for c in path[-1].children if c in by_box]
+        if not kids:
+            paths.append(path)
+        else:
+            for k in kids:
+                stack.append(path + [_node(k)])  # branch: copy prefix per child
+    return paths
+
+
+def _terminal_segment(path: list[TraceNode]) -> list[TraceNode]:
+    """The single-component tail of a path — from the last fork's chosen child to the leaf.
+
+    Peak / overshoot are only well posed here: across a fork the curve is confounded by how many
+    instances are still in view, so the diagnosis is read off this tail, not the whole path.
+    """
+    last_fork = 0
+    for i, n in enumerate(path[:-1]):
+        if len(n.children) >= 2:
+            last_fork = i + 1
+    return path[last_fork:]
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +281,7 @@ def trajectory_report(events: list[dict], *, min_len: int = 2, tol: float = 1e-3
 # Plot — CLS vs depth, one line per single-component segment.
 # ---------------------------------------------------------------------------
 _KIND_STYLE = {
-    "single": ("0.6", "single node"),
+    "single": ("mediumpurple", "single node (leaf at fork)"),
     "rising": ("tab:orange", "rising at stop (underzoom?)"),
     "peaked": ("tab:green", "peaked at stop"),
     "overshoot": ("tab:red", "overshoot (ancestor was better)"),
@@ -299,12 +339,171 @@ def plot_cls_trajectories(
     return ax.figure
 
 
+# Diagnosis order so the failure modes lead the contact sheet.
+_KIND_ORDER = {"overshoot": 0, "rising": 1, "truncated": 2, "peaked": 3, "single": 4}
+
+
+def plot_cls_tree(
+    events: list[dict],
+    *,
+    cls_threshold: float | None = None,
+    ax=None,
+    tol: float = 1e-3,
+    title: str | None = None,
+):
+    """The whole zoom as **one** node-link tree: x = depth, y = CLS, branches at forks.
+
+    Shared ancestors are drawn once, so M leaves fan out from a common trunk instead of
+    producing M plots — trace any leaf by following branches back to the root. Grey edge width
+    encodes how many leaves flow through it (thick trunk -> thin twigs). Each leaf's
+    single-component tail is coloured by its diagnosis; ``□`` = fork, ``*`` = tail peak (red
+    edge if the leaf overshot it), ``o`` = leaf.
+    """
+    import matplotlib.pyplot as plt
+
+    by_box, _ = _reconstruct(events)
+    nodes = {box: _node(ev) for box, ev in by_box.items()}
+    paths = build_paths(events)
+
+    # How many leaves flow through each parent->child edge (trunk thickness).
+    edge_leaves: Counter = Counter()
+    for path in paths:
+        for a, b in zip(path, path[1:]):
+            edge_leaves[(a.box, b.box)] += 1
+
+    if ax is None:
+        max_d = max((n.depth for n in nodes.values()), default=0)
+        _, ax = plt.subplots(figsize=(max(7.0, 1.5 * (max_d + 1)), 6.0))
+
+    # 1) Every edge in grey, width ~ #leaves downstream (the branching structure / trunk).
+    for nd in nodes.values():
+        for cb in nd.children:
+            ch = nodes.get(cb)
+            if ch is None:
+                continue  # child enqueued but never processed (budget) — no node to draw
+            lw = 0.8 + 1.3 * np.log2(1 + edge_leaves[(nd.box, ch.box)])
+            ax.plot([nd.depth, ch.depth], [nd.cls_score, ch.cls_score],
+                    color="0.78", lw=lw, solid_capstyle="round", zorder=1)
+
+    # 2) Each leaf's single-component tail coloured by its diagnosis, on top of the trunk.
+    counts: dict[str, int] = {}
+    seen: set[str] = set()
+    for path in paths:
+        tail = _terminal_segment(path)
+        summ = summarize_segment(tail, tol=tol)
+        counts[summ.kind] = counts.get(summ.kind, 0) + 1
+        color = _KIND_STYLE.get(summ.kind, ("0.4", summ.kind))[0]
+        label = None
+        if summ.kind not in seen:
+            label = _KIND_STYLE.get(summ.kind, (None, summ.kind))[1]
+            seen.add(summ.kind)
+        ax.plot([n.depth for n in tail], [n.cls_score for n in tail],
+                color=color, lw=2.0, solid_capstyle="round", zorder=3, label=label)
+        pk = tail[summ.peak_index]
+        ax.plot(pk.depth, pk.cls_score, "*", ms=12, color=color, zorder=5,
+                mec="red" if summ.overshoot > tol else "none", mew=1.2)
+        leaf = path[-1]
+        ax.plot(leaf.depth, leaf.cls_score, "o", ms=6.5, mfc="white", mec=color, mew=1.8, zorder=5)
+
+    # 3) Fork nodes as open squares (where the single-component reasoning resets).
+    for nd in nodes.values():
+        if sum(c in nodes for c in nd.children) >= 2:
+            ax.plot(nd.depth, nd.cls_score, "s", mfc="none", mec="0.35", ms=7, mew=1.3, zorder=4)
+
+    if cls_threshold is not None:
+        ax.axhline(cls_threshold, ls="--", color="0.5", lw=1, label=f"cls_threshold={cls_threshold:g}")
+
+    kinds_str = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+    ax.set_xlabel("zoom depth")
+    ax.set_ylabel("mean cos(CLS, exemplar)")
+    ax.set_title(title or f"CLS zoom tree  ·  {len(paths)} leaves  ·  {kinds_str}")
+    ax.margins(x=0.04)
+    ax.grid(True, alpha=0.3)
+    if seen or cls_threshold is not None:
+        ax.legend(fontsize=8, loc="best")
+    return ax.figure
+
+
+def plot_leaf_paths(
+    events: list[dict],
+    *,
+    cls_threshold: float | None = None,
+    max_panels: int = 24,
+    ncols: int = 4,
+    tol: float = 1e-3,
+    suptitle: str | None = None,
+):
+    """One panel per leaf: the **connected** root->leaf CLS curve, whole image (depth 0) to crop.
+
+    The grey line is the full path; the thick coloured line is the single-component tail where
+    peak/overshoot is well defined (forks before it are drawn as dotted verticals + open
+    squares, since the curve is confounded across a fork). ★ = peak of the tail (red edge if the
+    leaf overshot it), ○ = leaf. Panels are ordered failure-mode first (overshoot, rising, ...).
+    """
+    import matplotlib.pyplot as plt
+
+    diagnosed = [(p, summarize_segment(_terminal_segment(p), tol=tol)) for p in build_paths(events)]
+    diagnosed.sort(key=lambda ps: (_KIND_ORDER.get(ps[1].kind, 9), -len(ps[0])))
+
+    tails = [s for _, s in diagnosed]
+    counts: dict[str, int] = {}
+    for s in tails:
+        counts[s.kind] = counts.get(s.kind, 0) + 1
+    multi = [s for s in tails if len(s.nodes) >= 2]
+    uni = sum(s.unimodal for s in multi)
+
+    shown = diagnosed[:max_panels]
+    n = len(shown)
+    ncols = min(ncols, n) or 1
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.4 * ncols, 2.9 * nrows), squeeze=False)
+
+    for k, ax in enumerate(axes.ravel()):
+        if k >= n:
+            ax.axis("off")
+            continue
+        path, summ = shown[k]
+        depths = [nd.depth for nd in path]
+        scores = [nd.cls_score for nd in path]
+        color = _KIND_STYLE.get(summ.kind, ("0.4", ""))[0]
+
+        ax.plot(depths, scores, "-o", color="0.6", ms=3, lw=1.1, zorder=2)  # full path (grey)
+        tail = _terminal_segment(path)
+        ax.plot([nd.depth for nd in tail], [nd.cls_score for nd in tail],
+                "-o", color=color, ms=4, lw=2.2, zorder=3)                  # single-component tail
+        for nd in path[:-1]:                                               # forks
+            if len(nd.children) >= 2:
+                ax.axvline(nd.depth, color="0.8", ls=":", lw=1, zorder=1)
+                ax.plot(nd.depth, nd.cls_score, "s", mfc="none", mec="0.4", ms=8, zorder=4)
+        pk_d, pk_v = tail[summ.peak_index].depth, summ.peak_cls
+        ax.plot(pk_d, pk_v, "*", ms=14, color=color, zorder=5,
+                mec="red" if summ.overshoot > tol else "none", mew=1.5)
+        ax.plot(depths[-1], scores[-1], "o", ms=9, mfc="none", mec=color, mew=2, zorder=5)  # leaf
+        if cls_threshold is not None:
+            ax.axhline(cls_threshold, ls="--", color="0.5", lw=0.8)
+        ax.set_title(f"leaf d{depths[-1]} · {summ.kind}\n"
+                     f"stop={summ.stop_decision} · peak@d{pk_d} · over={summ.overshoot:+.2f}",
+                     fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.grid(True, alpha=0.25)
+
+    kinds_str = ", ".join(f"{k}={v}" for k, v in sorted(counts.items(), key=lambda kv: kv[0]))
+    extra = f"  ·  showing {n}/{len(diagnosed)}" if n < len(diagnosed) else ""
+    fig.suptitle((suptitle or "root→leaf CLS paths")
+                 + f"  ·  {kinds_str}  ·  tail-unimodal {uni}/{len(multi)}{extra}", fontsize=11)
+    fig.supxlabel("zoom depth", fontsize=9)
+    fig.supylabel("mean cos(CLS, exemplar)", fontsize=9)
+    fig.tight_layout()
+    return fig
+
+
 def save_cls_trajectory(item, events: list[dict], out_dir, *,
                         cls_threshold: float | None = None) -> Path:
-    """Render :func:`plot_cls_trajectories` for one image and save ``<out_dir>/<image_id>.png``.
+    """Render :func:`plot_cls_tree` for one image and save ``<out_dir>/<image_id>.png``.
 
-    Mirrors ``experiments.visualize.save_cascade_trace`` so :mod:`experiments.run` can dump a
-    trajectory chart next to the cascade contact sheet under the same trace budget.
+    Mirrors ``experiments.visualize.save_cascade_trace`` so :mod:`experiments.run` can dump the
+    one-tree CLS view next to the cascade contact sheet under the same trace budget. One plot per
+    image regardless of leaf count (use :func:`plot_leaf_paths` for the per-leaf faceted view).
     """
     import matplotlib
 
@@ -313,8 +512,8 @@ def save_cls_trajectory(item, events: list[dict], out_dir, *,
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    fig = plot_cls_trajectories(events, cls_threshold=cls_threshold,
-                                title=f"{item.image_id}  CLS trajectory per segment")
+    fig = plot_cls_tree(events, cls_threshold=cls_threshold,
+                        title=f"{item.image_id}  CLS zoom tree")
     path = out_dir / f"{item.image_id}.png"
     fig.savefig(path, dpi=110, bbox_inches="tight")
     plt.close(fig)

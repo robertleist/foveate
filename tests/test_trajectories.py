@@ -4,6 +4,7 @@ import numpy as np
 
 from foveate import Config
 from experiments.trajectories import (
+    build_paths,
     build_segments,
     summarize_segment,
     summarize_segments,
@@ -33,6 +34,27 @@ def test_segments_reconstruct_from_events(backbone, two_squares):
         for parent, child in zip(seg, seg[1:]):
             assert len(parent.children) == 1
             assert parent.children[0] == child.box
+
+
+def test_paths_are_connected_root_to_leaf(backbone, two_squares):
+    """Each path runs from a depth-0 root to a terminal leaf with every step parent->child, and
+    there is exactly one path per leaf (terminal node with no processed children)."""
+    img, ex = two_squares
+    cfg = Config(min_crop=24, cascade_min_instance_area=4)
+    _, _, events = trace_discovery(backbone, img, ex, config=cfg)
+
+    paths = build_paths(events)
+    assert paths
+    leaf_boxes = set()
+    for path in paths:
+        assert path[0].depth == 0, "path does not start at the whole-image crop"
+        for parent, child in zip(path, path[1:]):
+            assert child.box in parent.children, "path step is not a real parent->child edge"
+            assert child.depth == parent.depth + 1
+        assert not path[-1].children or all(  # terminal: no enqueued children were processed
+            c not in {tuple(e["box"]) for e in events} for c in path[-1].children)
+        leaf_boxes.add(path[-1].box)
+    assert len(leaf_boxes) == len(paths), "a leaf is reachable by more than one path"
 
 
 def test_single_node_segment_is_classified_single(backbone, two_squares):
@@ -70,6 +92,21 @@ def test_overshoot_and_rising_detection():
 
     bimodal = [node(0, 0.4), node(1, 0.7), node(2, 0.5), node(3, 0.65, decision="leaf")]
     assert not summarize_segment(bimodal).unimodal
+
+
+def test_tree_plot_renders(backbone, two_squares):
+    """The one-tree CLS view builds a figure from real events without error."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from experiments.trajectories import plot_cls_tree
+
+    img, ex = two_squares
+    _, _, events = trace_discovery(backbone, img, ex, config=Config(min_crop=24,
+                                                                    cascade_min_instance_area=4))
+    fig = plot_cls_tree(events, cls_threshold=0.5)
+    # One axes; at least the leaves are drawn (leaf marker per path).
+    assert fig.axes
+    assert len(build_paths(events)) >= 1
 
 
 def test_report_runs(backbone, two_squares):
