@@ -25,7 +25,8 @@ foveate:
   standardize: false        # MockBackbone features are colour-based; z-scoring destroys the signal
   foreground_extractor: insid3
   insid3_crop_reference: true
-  cls_threshold: 0.0        # isolate the foreground-extraction ablation from leaf classification
+  cls_threshold: 0.0        # class FLOOR = 0 to isolate the foreground-extraction ablation
+                            # (split_margin / split_aggregate / boundary_smooth_sigma at defaults)
   min_crop: 24
   cascade_min_instance_area: 4
   gate_threshold: 0.4       # bank extractor only

@@ -28,7 +28,10 @@ foveate:
   insid3_tau: 0.6
   insid3_aggregate_threshold: 0.2
   insid3_crop_reference: true
-  cls_threshold: 0.0        # mock CLS is coarse; don't filter leaves on it in the smoke test
+  cls_threshold: 0.0        # class FLOOR; 0.0 = never reject on it (mock CLS is coarse)
+  split_aggregate: mean     # mean | max | min — sub-crop CLS pooled vs parent in the split test
+  split_margin: 0.0         # a clump split is kept only if it beats the parent CLS by this
+  boundary_smooth_sigma: 0.0  # Gaussian (patches) smoothing watershed maps; >0 = fewer fragments
   min_crop: 24
   cascade_min_instance_area: 4
   gate_threshold: 0.4       # bank extractor only
