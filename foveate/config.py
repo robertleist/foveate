@@ -38,6 +38,9 @@ class Config:
     elevation_alpha: float = 1.0          # weight of feature-boundary in watershed elevation
     elevation_beta: float = 0.5           # weight of geometric (1 - distance) term
     marker_min_distance: int = 2          # min spacing (patches) between geometric seeds
+    boundary_smooth_sigma: float = 0.0    # Gaussian sigma (patches) smoothing the distance /
+                                          # feature-boundary maps before watershed -> fewer
+                                          # spurious markers/minima (0 = off)
     merge_similarity: float = 0.6         # min prototype cosine to merge neighbours
     merge_boundary: float = 0.5           # max border feature-boundary to allow a merge
     min_instance_area: int = 4            # drop instances smaller than this (patches, pipeline)
@@ -48,8 +51,13 @@ class Config:
     min_crop: int = 64                    # resolution floor (px) — stop zooming below this
     pad_frac: float = 0.08               # padding fraction around child crops
     shrink_stop: float = 0.9             # converge when child/crop area ratio >= this
-    cls_threshold: float = 0.5           # min MEAN cos(CLS_crop, each exemplar CLS) to accept
-    clump_area_factor: float = 1.5       # CLS-rejected blob > this x exemplar area => clump
+    cls_threshold: float = 0.5           # absolute class FLOOR: converged crop below this is
+                                         # not the class -> reject (was the accept threshold)
+    clump_area_factor: float = 1.5       # blob <= this x exemplar area => single instance,
+                                         # accepted without the split-lookahead (fast path)
+    split_margin: float = 0.0            # a clump split is kept only if aggregate child CLS
+                                         # beats the parent CLS by more than this margin
+    split_aggregate: str = "mean"        # mean | max | min: how child CLS is pooled vs parent
     cascade_min_instance_area: int = 16  # drop leaf masks smaller than this (pixels)
     embed_batch_size: int = 8            # crops per backbone forward
     max_total_embeds: int = 512          # global embed budget (safety cap)

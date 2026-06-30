@@ -10,11 +10,15 @@ Breadth-first, batched, connected-components fixed point. For each crop:
    - ≥ 2 components  → enqueue each (tighter child crops);
    - 1 component whose bbox does **not** fill the crop → enqueue the tighter crop (keep zooming);
    - 1 component whose bbox **fills** the crop → *converged* (no tighter crop extractable).
-3. A converged crop is **accepted as a leaf** by a single test: the mean cosine similarity of
-   the crop's CLS token to *all* exemplar CLS clears ``config.cls_threshold`` — a majority-vote
-   that the crop contains the exemplar concept (this answers *what* is in the bbox). A
-   converged-but-rejected large crop is a seamless clump → optional watershed split; otherwise
-   accepted as a single instance (or discarded).
+3. A converged crop (zoom exhausted) is resolved by **whether splitting it helps**. Zoom
+   self-terminates — the box strictly shrinks — but a watershed split never does (it will
+   always over-segment a single instance), so the stopping criterion lives on the split side:
+   - below ``config.cls_threshold`` (the class *floor*) and not tiny → not the class → reject;
+   - tiny blob (``clump_area_factor``) or ``split_mode="none"`` → accepted whole (no lookahead);
+   - otherwise tentatively split, **embed the sub-crops**, and keep the split only if the pooled
+     child CLS beats the parent CLS by ``split_margin`` (the sub-crops are *more* exemplar-like
+     than the whole → it was a clump). If the subsplits get *worse*, the crop is a single
+     instance and is accepted whole.
 
 The exemplar defines the target *scale and granularity*. Only leaves are returned.
 """
@@ -40,6 +44,9 @@ _CONN8 = generate_binary_structure(2, 2)   # 8-connectivity: don't over-split si
 class _Region:
     box: tuple[int, int, int, int]
     depth: int
+    # CLS-gated clump children carry their lookahead embedding so they are not re-embedded
+    # next level (the split test already paid for one forward over this exact crop).
+    embedded: tuple | None = None
 
 
 def _grid_bbox(comp):
@@ -70,12 +77,23 @@ def _split_clump(feat, comp_grid, cfg):
     indiv = individuation.individuate(
         feat, comp_grid, labels, mode=cfg.marker_mode, alpha=cfg.elevation_alpha,
         beta=cfg.elevation_beta, marker_min_distance=cfg.marker_min_distance,
+        smooth_sigma=cfg.boundary_smooth_sigma,
     )
     merged = merge.merge_instances(
         feat, indiv.instances, indiv.feature_boundary,
         similarity_threshold=cfg.merge_similarity, boundary_threshold=cfg.merge_boundary,
     )
     return [merged == i for i in np.unique(merged) if i != 0]
+
+
+def _aggregate(scores: list[float], mode: str) -> float:
+    """Pool the CLS scores of a clump's sub-crops for comparison against the parent."""
+    arr = np.asarray(scores, dtype=float)
+    if mode == "max":
+        return float(arr.max())
+    if mode == "min":
+        return float(arr.min())
+    return float(arr.mean())
 
 
 def discover_instances(
@@ -124,9 +142,6 @@ def discover_instances(
         gallery = cls_bank.to(cls.device, cls.dtype)
         return float((cls @ gallery.T).mean())
 
-    def accept(cls_score: float) -> bool:
-        return cls_score >= cfg.cls_threshold
-
     def emit(region, comp_grid, score):
         y0, y1, x0, x1 = region.box
         mask_local = cv2.resize(comp_grid.astype(np.uint8), (x1 - x0, y1 - y0),
@@ -143,10 +158,17 @@ def discover_instances(
     level_idx = 0
     while frontier and stats.n_embeds < cfg.max_total_embeds:
         stats.level_sizes.append(len(frontier))
-        crops = [image[r.box[0]:r.box[1], r.box[2]:r.box[3]] for r in frontier]
-        embedded = featlib.embed_batch(backbone, crops, chunk=cfg.embed_batch_size,
-                                       standardize=cfg.standardize)
-        stats.n_embeds += len(crops)
+        # Embed only regions without a cached lookahead embedding (clump children carry theirs).
+        fresh_idx = [i for i, r in enumerate(frontier) if r.embedded is None]
+        fresh = featlib.embed_batch(
+            backbone, [image[frontier[i].box[0]:frontier[i].box[1],
+                             frontier[i].box[2]:frontier[i].box[3]] for i in fresh_idx],
+            chunk=cfg.embed_batch_size, standardize=cfg.standardize,
+        )
+        stats.n_embeds += len(fresh_idx)
+        fresh_map = dict(zip(fresh_idx, fresh))
+        embedded = [r.embedded if r.embedded is not None else fresh_map[i]
+                    for i, r in enumerate(frontier)]
 
         nxt: list[_Region] = []
         for r, (feat, cls) in zip(frontier, embedded):
@@ -158,6 +180,7 @@ def discover_instances(
 
             floor = (r.box[1] - r.box[0]) <= cfg.min_crop or (r.box[3] - r.box[2]) <= cfg.min_crop
             decision, children = "empty", []
+            child_embeds = None                           # cached lookahead embeds for kept clumps
             cls_score = classify(cls)
 
             if n == 0:
@@ -174,29 +197,45 @@ def discover_instances(
                 child = _child_box(comp, r.box, cfg.pad_frac)
                 if _box_area(child) / max(_box_area(r.box), 1) < cfg.shrink_stop:
                     decision, children = "zoom", [child]  # strictly tighter → keep zooming
-                else:                                     # converged — no tighter crop
+                else:                                     # converged — zoom exhausted
                     comp_area = float(comp.sum()) / comp.size * _box_area(r.box)
-                    if accept(cls_score) or comp_area <= cfg.clump_area_factor * exemplar_area:
-                        decision = "leaf"; emit(r, comp, cls_score)
-                    elif cfg.split_mode != "none":
-                        subs = _split_clump(feat, comp, cfg)
-                        if len(subs) >= 2:
-                            decision = "clump-split"
-                            children = [_child_box(s, r.box, cfg.pad_frac) for s in subs]
-                        elif cfg.discard_rejected:
+                    tiny = comp_area <= cfg.clump_area_factor * exemplar_area
+                    if cls_score < cfg.cls_threshold and not tiny:
+                        # below the class floor and not a small single blob → not the class
+                        if cfg.discard_rejected:
                             decision = "discard"; stats.discarded += 1
                         else:
-                            decision = "leaf"; emit(r, comp, cls_score)  # unsplittable → accept
-                    elif cfg.discard_rejected:
-                        decision = "discard"; stats.discarded += 1
+                            decision = "leaf"; emit(r, comp, cls_score)
+                    elif tiny or cfg.split_mode == "none":
+                        decision = "leaf"; emit(r, comp, cls_score)   # single instance (fast path)
                     else:
-                        decision = "leaf"; emit(r, comp, cls_score)
+                        # Tentative split: keep it only if the sub-crops are MORE exemplar-like
+                        # than the whole. Splitting never self-terminates, so this CLS gate is
+                        # what stops it — "accept the instance if its subsplits get worse".
+                        subs = _split_clump(feat, comp, cfg)
+                        sub_boxes = [_child_box(s, r.box, cfg.pad_frac) for s in subs]
+                        sub_emb = (featlib.embed_batch(
+                            backbone, [image[b[0]:b[1], b[2]:b[3]] for b in sub_boxes],
+                            chunk=cfg.embed_batch_size, standardize=cfg.standardize,
+                        ) if len(subs) >= 2 else [])
+                        stats.n_embeds += len(sub_emb)
+                        sub_scores = [classify(c) for _, c in sub_emb]
+                        if sub_scores and _aggregate(sub_scores, cfg.split_aggregate) \
+                                > cls_score + cfg.split_margin:
+                            decision = "clump-split"
+                            children, child_embeds = sub_boxes, sub_emb
+                        else:                                         # subsplits no better → whole
+                            decision = "leaf"; emit(r, comp, cls_score)
 
             if observer is not None:
                 observer(dict(level=level_idx, depth=r.depth, box=r.box, decision=decision,
                               n_components=int(n), cls_score=cls_score, feat=feat, fg=fg,
                               comp_labels=labels, children=list(children)))
-            nxt += [_Region(cb, r.depth + 1) for cb in children]
+            if child_embeds is not None:                  # kept clump: reuse lookahead embeds
+                nxt += [_Region(cb, r.depth + 1, embedded=ce)
+                        for cb, ce in zip(children, child_embeds)]
+            else:
+                nxt += [_Region(cb, r.depth + 1) for cb in children]
 
         frontier = nxt
         level_idx += 1

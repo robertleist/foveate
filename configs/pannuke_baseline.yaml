@@ -44,8 +44,13 @@ foveate:
   insid3_tau: 0.6                 # fine-grained clustering similarity threshold
   insid3_aggregate_threshold: 0.2 # alpha: min combined score to merge a cluster into the object
   insid3_crop_reference: true     # crop ref image+mask to each exemplar bbox (scale-match crops)
-  # --- leaf classification (WHAT): mean cos(crop CLS, exemplar CLS) >= cls_threshold ---
-  cls_threshold: 0.5
+  # --- acceptance & splitting (WHAT): touching nuclei are the canonical clump case — a converged
+  #     crop is kept as ONE nucleus unless splitting makes the sub-crops MORE exemplar-like.
+  #     cls_threshold is the class FLOOR (reject below it, not the accept test). ---
+  cls_threshold: 0.5              # reject floor on mean cos(crop CLS, exemplar CLS bank)
+  split_aggregate: mean           # mean | max | min — how sub-crop CLS is pooled vs the parent
+  split_margin: 0.0               # keep a split only if pooled child CLS beats the parent by this
+  boundary_smooth_sigma: 0.0      # Gaussian (patches) on watershed maps; try 0.5–1.0 for nuclei
   # --- recursion / cost ---
   debias: false                   # project out DINOv3 positional bias; enable for cross-image
   min_crop: 16                    # nuclei can be small (< 20 px)

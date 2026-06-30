@@ -26,9 +26,13 @@ foveate:               # any foveate.Config field
   insid3_tau: 0.6                 # fine-grained clustering similarity threshold
   insid3_aggregate_threshold: 0.2 # alpha: min combined score to merge a cluster into the object
   insid3_crop_reference: true     # crop ref image+mask to each exemplar bbox (scale-match crops)
-  # --- leaf classification (WHAT): accept a converged crop when its CLS is, on average,
-  #     cosine-similar enough to the exemplar CLS bank ---
-  cls_threshold: 0.2
+  # --- acceptance & splitting (WHAT): a converged crop is kept as ONE instance unless
+  #     splitting makes the sub-crops MORE exemplar-like (then it was a clump). cls_threshold
+  #     is the class FLOOR — a converged crop below it is not the class and is rejected. ---
+  cls_threshold: 0.2              # reject floor on mean cos(crop CLS, exemplar CLS bank)
+  split_aggregate: mean           # mean | max | min — how sub-crop CLS is pooled vs the parent
+  split_margin: 0.0               # keep a split only if pooled child CLS beats the parent by this
+  boundary_smooth_sigma: 0.0      # Gaussian (patches) smoothing watershed maps; >0 = fewer fragments
   # --- recursion / cost ---
   min_crop: 64
   max_total_embeds: 512
