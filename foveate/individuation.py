@@ -72,15 +72,19 @@ def _build_markers(
     atom_labels: np.ndarray,
     mode: str,
     min_distance: int,
+    peak_distance: np.ndarray | None = None,
 ) -> np.ndarray:
     """Seed image (int labels) for watershed. ``mode`` in {geometric, feature, hybrid}."""
     hp, wp = foreground.shape
     seed_mask = np.zeros((hp, wp), dtype=bool)
+    # Peaks come off a (possibly smoothed) distance map so close-but-spurious maxima merge;
+    # the raw ``distance`` is still used for the degenerate single-seed fallback below.
+    peaks_from = distance if peak_distance is None else peak_distance
 
     if mode in ("geometric", "hybrid"):
         # Distance-transform peaks -> one centre per convex blob.
         coords = peak_local_max(
-            distance, min_distance=max(1, min_distance), labels=foreground, exclude_border=False,
+            peaks_from, min_distance=max(1, min_distance), labels=foreground, exclude_border=False,
         )
         seed_mask[tuple(coords.T)] = True
 
@@ -113,6 +117,7 @@ def individuate(
     alpha: float = 1.0,
     beta: float = 0.5,
     marker_min_distance: int = 2,
+    smooth_sigma: float = 0.0,
 ) -> IndividuationResult:
     """Split the foreground class region into individual instances.
 
@@ -124,15 +129,25 @@ def individuate(
     alpha, beta:
         Weights of the feature-boundary and geometric (1 - distance) terms in the
         watershed elevation.
+    smooth_sigma:
+        Gaussian sigma (patches) applied to the feature-boundary map and to the distance
+        map used for geometric peaks. Smoothing collapses adjacent spurious maxima/minima,
+        so the splitter proposes fewer, cleaner fragments (0 = off).
     """
     fb = feature_boundary_map(features, foreground)
     distance = ndi.distance_transform_edt(foreground).astype(np.float32)
+    if smooth_sigma > 0:
+        fb = (ndi.gaussian_filter(fb, sigma=smooth_sigma) * foreground).astype(np.float32)
+        peak_distance = ndi.gaussian_filter(distance, sigma=smooth_sigma) * foreground
+    else:
+        peak_distance = None
     dist_norm = distance / distance.max() if distance.max() > 1e-12 else distance
 
     elevation = alpha * fb + beta * (1.0 - dist_norm)
     elevation = elevation * foreground                     # irrelevant outside FG
 
-    markers = _build_markers(foreground, distance, atom_labels, mode, marker_min_distance)
+    markers = _build_markers(foreground, distance, atom_labels, mode, marker_min_distance,
+                             peak_distance=peak_distance)
     instances = watershed(elevation, markers=markers, mask=foreground)
 
     return IndividuationResult(

@@ -1,6 +1,31 @@
 import numpy as np
 
 from foveate import Config, discover_instances
+from foveate.cascade import _aggregate
+
+
+def test_aggregate_modes():
+    scores = [0.2, 0.6, 0.4]
+    assert _aggregate(scores, "max") == 0.6
+    assert _aggregate(scores, "min") == 0.2
+    assert abs(_aggregate(scores, "mean") - 0.4) < 1e-9
+    assert abs(_aggregate(scores, "anything-else") - 0.4) < 1e-9  # defaults to mean
+
+
+def test_new_acceptance_config_defaults():
+    cfg = Config()
+    assert cfg.split_aggregate == "mean"
+    assert cfg.split_margin == 0.0
+    assert cfg.boundary_smooth_sigma == 0.0
+
+
+def test_split_aggregate_modes_still_discover_both(backbone, two_squares):
+    """The CLS-subsplit acceptance must not regress the clean two-instance case."""
+    img, ex = two_squares
+    for mode in ("mean", "max", "min"):
+        cfg = Config(min_crop=24, cascade_min_instance_area=4, split_aggregate=mode)
+        instances, stats = discover_instances(backbone, img, ex, config=cfg)
+        assert len(instances) == 2, mode
 
 
 def test_discovers_both_targets_not_distractor(backbone, two_squares):
