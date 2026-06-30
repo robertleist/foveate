@@ -9,13 +9,13 @@ backbone:
 
 data:
   name: coco
-  root: /data/robert/hifmb_corals
+  root: /data/robert/hifmb_polyps
   annotation_file: Corals_coco.json
   images_dir: images
-  categories: [Coral Fragment]
+  categories: [Polyps]
   min_instances: 2
-  train_images: 5        # intra pool (same-image discovery)
-  interval_images: 47     # disjoint novel images for cross-image (inter) eval
+  train_images: 2        # intra pool (same-image discovery)
+  interval_images: 2     # disjoint novel images for cross-image (inter) eval
   known_ratio: 0.3        # fraction of instances that are known/prompts; rest are discovery GT
   seed: 42
 
@@ -51,7 +51,7 @@ eval:
 
 mlflow:
   enabled: true
-  experiment_name: foveate-corals-ablations
+  experiment_name: foveate-polyps
   # Server connection — all optional; env vars from .env are used as fallback.
   # YAML values take precedence over the environment.
   tracking_uri: null              # overrides MLFLOW_TRACKING_URI; null -> ./mlruns
@@ -60,7 +60,6 @@ mlflow:
   dotenv: null                    # explicit .env path; null -> looks for ./.env
 
 sweep:
-  data.seed: [13, 42, 98, 1337, 140218]
-  data.train_images: [1, 2, 4, 8, 16]
-  data.known_ratio: [0.25, 0.5, 1.0]
-  foveate.cls_threshold: [0.1, 0.2, 0.3]
+  foveate.insid3_tau : [0.0, 0.1, 0.2, 0.5]
+  foveate.insid3_aggregate_threshold: [0.0, 0.1, 0.2, 0.3]
+  data.seed: [42, 1337, 140218]
