@@ -45,10 +45,12 @@ _DECISIONS = {
     "empty": "gate fired on nothing",
     "split": ">=2 components -> zoom each",
     "zoom": "1 component, still shrinking -> zoom",
-    "leaf": "converged -> accepted instance",
-    "leaf-cap": "depth/min-crop cap -> emit components",
-    "clump-split": "rejected clump -> watershed split",
-    "discard": "converged but rejected -> discarded",
+    "leaf": "converged, unsplittable / splitting off -> accepted instance",
+    "leaf-cap": "min-crop size floor -> emit components",
+    "clump-split": "converged -> k=2 split, CLS-gated next level",
+    "discard": "converged but below class floor -> discarded",
+    "cls-stop": "no split/zoom child beat this crop -> emit it",
+    "cls-worse": "CLS dropped below the parent -> discarded (why the cascade stopped)",
 }
 
 
@@ -157,6 +159,106 @@ def feature_pca_rgb(feat_grid) -> np.ndarray:
     span = np.where(pmax > pmin, pmax - pmin, 1.0)
     rgb = (proj - pmin) / span
     return (rgb.reshape(hp, wp, 3) * 255.0).clip(0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Region tree + instance overlays + IoU (pure numpy; used by the step-by-step app).
+# ---------------------------------------------------------------------------
+def region_tree(events: list[dict]) -> list[tuple[str, dict]]:
+    """Reconstruct the parent->child region tree and return it in DFS pre-order.
+
+    A child region is the event whose ``box`` equals a parent's ``children`` entry
+    (exact box-tuple match). Roots are events whose box never appears as any event's
+    child. Each returned entry is ``(path_id, event)`` where ``path_id`` is a
+    hierarchical dotted string: roots are ``"1"``, ``"2"``, ...; the k-th child (by
+    order in the parent's ``children`` list, skipping child boxes that have no event)
+    is ``parent_path + "." + str(k + 1)``. Example ids: ``"1"``, ``"1.1"``, ``"1.2"``,
+    ``"1.2.1"``. Uses an explicit stack (no recursion).
+    """
+    by_box: dict[tuple, dict] = {}
+    for ev in events:
+        by_box.setdefault(tuple(ev["box"]), ev)
+    referenced = {tuple(c) for ev in events for c in ev.get("children", [])}
+    roots = [ev for ev in events if tuple(ev["box"]) not in referenced]
+
+    out: list[tuple[str, dict]] = []
+    # Stack of (path_id, event); push roots in reverse so pre-order is 1, 2, ...
+    stack: list[tuple[str, dict]] = [
+        (str(i + 1), ev) for i, ev in enumerate(roots)
+    ][::-1]
+    while stack:
+        path_id, ev = stack.pop()
+        out.append((path_id, ev))
+        # Children with an actual event, numbered by their surviving order.
+        kids: list[tuple[str, dict]] = []
+        k = 0
+        for cb in ev.get("children", []):
+            child = by_box.get(tuple(cb))
+            if child is None:
+                continue  # child enqueued but never processed — skip in numbering
+            k += 1
+            kids.append((f"{path_id}.{k}", child))
+        stack.extend(kids[::-1])  # reverse so DFS visits them in order
+    return out
+
+
+def instances_overlay(crop_rgb: np.ndarray, grids, alpha: float = 0.5) -> np.ndarray:
+    """Overlay each patch-grid bool in ``grids`` onto ``crop_rgb`` in a palette colour.
+
+    Each grid is upsampled to the crop's ``(H, W)`` and blended with a distinct
+    ``_PALETTE`` colour via :func:`overlay_mask`. Empty list -> the crop as RGB uint8.
+    """
+    out = _as_rgb(crop_rgb).clip(0, 255).astype(np.uint8)
+    grids = grids or []
+    for k, g in enumerate(grids):
+        out = overlay_mask(out, np.asarray(g, dtype=bool),
+                           _PALETTE[k % len(_PALETTE)], alpha)
+    return out
+
+
+def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
+    """Intersection-over-union of two full-res boolean masks (empty union -> 0.0)."""
+    a = np.asarray(a, dtype=bool)
+    b = np.asarray(b, dtype=bool)
+    union = int(np.logical_or(a, b).sum())
+    if union == 0:
+        return 0.0
+    inter = int(np.logical_and(a, b).sum())
+    return inter / union
+
+
+def union_mask(masks, hw: tuple[int, int]) -> np.ndarray:
+    """Logical-OR of full-res boolean ``masks`` -> ``(H, W)`` bool (empty -> zeros)."""
+    out = np.zeros(hw, dtype=bool)
+    for m in masks or []:
+        out |= np.asarray(m, dtype=bool)
+    return out
+
+
+def annotation_iou(pred_masks, gt_masks, hw: tuple[int, int]) -> dict:
+    """IoU summary of predicted instance masks vs a full ground-truth annotation.
+
+    Returns ``{"union_iou", "mean_best_iou", "n_pred", "n_gt"}`` where ``union_iou``
+    is the IoU of the OR of all preds vs the OR of all GT, and ``mean_best_iou`` is
+    the mean over GT instances of the best IoU against any pred (0 if no pred). Pure
+    numpy, O(n_pred * n_gt).
+    """
+    pred_masks = list(pred_masks or [])
+    gt_masks = list(gt_masks or [])
+    union_iou = mask_iou(union_mask(pred_masks, hw), union_mask(gt_masks, hw))
+    if gt_masks:
+        best = []
+        for gt in gt_masks:
+            best.append(max((mask_iou(gt, p) for p in pred_masks), default=0.0))
+        mean_best_iou = float(np.mean(best))
+    else:
+        mean_best_iou = 0.0
+    return {
+        "union_iou": union_iou,
+        "mean_best_iou": mean_best_iou,
+        "n_pred": len(pred_masks),
+        "n_gt": len(gt_masks),
+    }
 
 
 # ---------------------------------------------------------------------------

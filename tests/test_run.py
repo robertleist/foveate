@@ -30,3 +30,13 @@ def test_run_intra_and_inter():
     result = run_experiment(_config(["intra", "inter"]))
     assert "intra_ap" in result and "inter_ap" in result
     assert result["inter_n_images"] >= 1
+
+
+def test_run_interval_minus_one_evaluates_all_non_train():
+    # interval_images=-1 through the full runner: the inter (cross-image) eval covers every
+    # qualifying image not in the train pool. With n_images=6 / train_images=4 that's 2 images.
+    cfg = _config(["intra", "inter"])
+    cfg["data"]["train_images"] = 4
+    cfg["data"]["interval_images"] = -1
+    result = run_experiment(cfg)
+    assert "inter_ap" in result and result["inter_n_images"] >= 1

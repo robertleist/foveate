@@ -28,7 +28,8 @@ class DataConfig:
     # One seeded shuffle of the qualifying pool is sliced into the intra pool (same-image
     # discovery) and a *disjoint* inter pool of novel images (cross-image discovery).
     train_images: Optional[int] = None          # intra-image pool size (None = all remaining)
-    interval_images: int = 0                     # disjoint novel images for cross-image (inter) eval
+    interval_images: int = 0                     # disjoint novel images for cross-image (inter) eval;
+                                                 # -1 = ALL images not in the train pool
     max_images: Optional[int] = None             # deprecated alias for train_images
     selection: str = "random"                    # random | first | densest
 

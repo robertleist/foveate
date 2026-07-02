@@ -131,10 +131,11 @@ _DECISIONS = {
     "empty": "gate fired on nothing",
     "split": "≥2 components → zoom each",
     "zoom": "1 component, still shrinking → zoom",
-    "leaf": "converged → accepted instance",
-    "leaf-cap": "depth/min-crop cap → emit components",
-    "clump-split": "rejected clump → watershed split",
-    "discard": "converged but rejected → discarded",
+    "leaf": "converged, unsplittable / splitting off → accepted instance",
+    "leaf-cap": "min-crop size floor → emit components",
+    "clump-split": "converged → k=2 split, CLS-gated next level",
+    "discard": "converged but below class floor → discarded",
+    "cls-stop": "no split/zoom child beat this crop → emit it",
 }
 
 

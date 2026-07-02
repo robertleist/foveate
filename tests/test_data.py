@@ -45,6 +45,16 @@ def test_build_returns_disjoint_intra_inter():
     assert len(intra.image_ids) == 4 and len(inter.image_ids) == 2
 
 
+def test_build_interval_minus_one_uses_all_remaining_images():
+    # interval_images=-1 → every qualifying image not in the train pool becomes the inter/eval set.
+    intra, inter = InstanceDataset.build(_cfg(train_images=4, interval_images=-1))
+    assert inter is not None
+    assert len(intra.image_ids) == 4
+    assert len(inter.image_ids) == 2                        # 6 qualifying - 4 train = all the rest
+    assert set(intra.image_ids).isdisjoint(set(inter.image_ids))
+    assert len(set(intra.image_ids) | set(inter.image_ids)) == 6   # together cover the whole pool
+
+
 def test_intra_items_prompt_with_known_discover_unknown():
     ds = InstanceDataset.from_config(_cfg())
     items = list(iter_intra_items(ds, max_exemplars=2))

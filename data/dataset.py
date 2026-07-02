@@ -70,7 +70,7 @@ class InstanceDataset(Dataset):
           - the first ``train_images`` → the **intra** pool (same-image discovery: prompt with
             an image's ``known`` instances, discover its ``unknown`` instances);
           - the next ``interval_images`` → a *disjoint* **inter** pool of novel images (used for
-            cross-image discovery: prompt with intra-pool exemplars, discover in these).
+            cross-image discovery: prompt with intra-pool exemplars, discover in these). ``interval_images == -1`` uses **all** remaining images (every qualifying image not in the train pool).
 
         Both pools use the same per-image ``known``/``unknown`` split (``known_ratio``). The two
         image pools are disjoint by construction. Returns ``(intra, inter)`` where ``inter`` is
@@ -96,9 +96,17 @@ class InstanceDataset(Dataset):
         ordered = select_images(metas, cfg.selection, None, cfg.seed)
 
         n_train = cfg.train_images if cfg.train_images is not None else cfg.max_images
+        # interval_images == -1 is a sentinel: evaluate cross-image on ALL images not in the train
+        # pool (every remaining qualifying image becomes the inter/novel eval set).
+        all_remaining = cfg.interval_images == -1
+        if all_remaining and n_train is None:
+            raise ValueError(
+                "interval_images=-1 (evaluate on all images not in the train set) requires "
+                "train_images to be set explicitly."
+            )
         if n_train is None:
             n_train = len(ordered) - cfg.interval_images
-        n_inter = cfg.interval_images or 0
+        n_inter = (len(ordered) - n_train) if all_remaining else (cfg.interval_images or 0)
 
         if n_train <= 0:
             raise ValueError(f"train_images resolved to {n_train}; must be positive.")

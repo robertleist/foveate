@@ -52,8 +52,8 @@ class GateResult:
 class ForegroundExtractor(Protocol):
     """Strategy interface for the foreground stage.
 
-    An extractor is configured once against a reference (the exemplar image and
-    its masks) via :meth:`set_reference`, then queried per target grid via
+    An extractor is configured once against a reference (the exemplar image(s) and
+    their masks) via :meth:`set_reference`, then queried per target grid via
     :meth:`predict`. After ``set_reference`` it exposes :attr:`cls_bank`, the
     ``(S, D)`` L2-normalized per-exemplar CLS stack, so the integration layer can
     classify leaf crops without re-deriving it.
@@ -64,17 +64,54 @@ class ForegroundExtractor(Protocol):
     def set_reference(
         self,
         backbone,
-        ref_image: np.ndarray,
+        ref_image: "np.ndarray | list[np.ndarray]",
         ref_masks: list[np.ndarray],
         negative_masks: list[np.ndarray] | None,
         cfg,
     ) -> None:
+        """``ref_image`` is a single array (all exemplars share it) or a list parallel to
+        ``ref_masks`` (each exemplar on its own image — multi-image exemplars). Normalize
+        with :func:`normalize_reference`."""
         ...
 
     def predict(
-        self, target_feat: torch.Tensor, *, return_internals: bool = False
+        self, target_feat: torch.Tensor, *, cls: torch.Tensor | None = None,
+        return_internals: bool = False,
     ) -> GateResult:
+        """``cls`` (the crop's CLS token, optional) lets an extractor pick which exemplars to run
+        against per crop; extractors that don't need it ignore it."""
         ...
+
+
+def normalize_reference(
+    ref_image: "np.ndarray | list[np.ndarray]",
+    ref_masks: list[np.ndarray],
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Normalize a reference into parallel ``(images, masks)`` lists over non-empty masks.
+
+    ``ref_image`` is either a single array (all exemplars live on it — the intra / single
+    support-image case) or a list parallel to ``ref_masks`` (each exemplar lives on its own
+    image — the multi-image exemplar case). A length-1 list broadcasts to every mask. Empty
+    masks are dropped in lockstep with their image, so downstream stages never special-case
+    how many images the reference spans.
+    """
+    masks = list(ref_masks)
+    if isinstance(ref_image, (list, tuple)):
+        images = list(ref_image)
+        if len(images) == 1:
+            images = images * len(masks)
+        if len(images) != len(masks):
+            raise ValueError(
+                f"exemplar images ({len(images)}) must be 1 or match exemplar masks ({len(masks)})"
+            )
+    else:
+        images = [ref_image] * len(masks)
+
+    pairs = [(im, m.astype(bool)) for im, m in zip(images, masks) if m.any()]
+    if not pairs:
+        raise ValueError("All reference masks are empty.")
+    imgs, msks = zip(*pairs)
+    return list(imgs), list(msks)
 
 
 def build_extractor(cfg) -> ForegroundExtractor:

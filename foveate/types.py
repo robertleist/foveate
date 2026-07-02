@@ -55,8 +55,9 @@ class Stats:
 
     n_embeds: int = 0
     max_depth: int = 0
-    leaves: int = 0
+    leaves: int = 0                                        # instances emitted (before NMS)
     discarded: int = 0
+    suppressed: int = 0                                    # emitted leaves dropped by final NMS
     level_sizes: list[int] = field(default_factory=list)   # frontier size per BFS level
 
 

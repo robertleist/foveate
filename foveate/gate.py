@@ -35,12 +35,15 @@ class BankExtractor:
     def set_reference(
         self,
         backbone,
-        ref_image: np.ndarray,
+        ref_image: "np.ndarray | list[np.ndarray]",
         ref_masks: list[np.ndarray],
         negative_masks: list[np.ndarray] | None,
         cfg,
     ) -> None:
-        """Build the prototype bank (optionally positionally debiased) from the reference."""
+        """Build the prototype bank (optionally positionally debiased) from the reference.
+
+        ``ref_image`` may be a single array or a list parallel to ``ref_masks`` (multi-image
+        exemplars); ``build_bank`` normalizes it."""
         self._B = None
         if cfg.debias:
             self._B = estimate_positional_basis(
@@ -57,9 +60,13 @@ class BankExtractor:
         self.cls_bank = bank.cls_bank
 
     def predict(
-        self, target_feat: torch.Tensor, *, return_internals: bool = False
+        self, target_feat: torch.Tensor, *, cls: torch.Tensor | None = None,
+        return_internals: bool = False,
     ) -> GateResult:
-        """Foreground = per-patch max cosine to the bank, thresholded (static/adaptive)."""
+        """Foreground = per-patch max cosine to the bank, thresholded (static/adaptive).
+
+        ``cls`` is accepted for interface parity with INSID3 but unused (the bank gate scores
+        every target patch against the whole prototype bank, no per-crop exemplar selection)."""
         hp, wp, d = target_feat.shape
         flat = project_out(target_feat.reshape(hp * wp, d), self._B)
         sims = (flat @ self.prototypes.T).max(dim=1).values.reshape(hp, wp).cpu().numpy()

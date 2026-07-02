@@ -29,7 +29,17 @@ class Config:
     insid3_linkage: str = "average"       # agglomerative linkage for INSID3 clustering (no graph)
     insid3_crop_reference: bool = True    # crop ref image+mask to each exemplar bbox before
                                           # embedding, so the reference scale matches zoomed crops
-    insid3_ref_pad_frac: float = 0.15     # padding around each exemplar bbox when cropping
+    insid3_ref_pad_frac: float = 0.15     # DEPRECATED / unused: the reference exemplar crops are now
+                                          # padded by ``pad_frac`` (below) so bank and target crops
+                                          # share one framing — a CLS comparison must be apples-to-
+                                          # apples. Kept for config compat.
+    insid3_top_k_exemplars: int = 1       # per crop, run INSID3 on the K exemplars whose CLS is
+                                          # most cosine-similar to the crop (1 = standard INSID3)
+    insid3_dynamic_params: bool = False   # derive tau / aggregate_threshold from the crop↔exemplar
+                                          # CLS similarity s (overrides the static values above):
+    insid3_tau_scale: float = 0.7         #   tau = tau_scale * s  (raw s≈1 over-segments; scale it)
+    insid3_aggregate_scale: float = 0.3   #   aggregate_threshold = aggregate_scale * (1 - s)
+                                          #   (similar crop → low threshold → aggregate freely)
 
     # --- semantic gate / clustering / individuation / merge (single-pass pipeline) ---
     gate_threshold: float = 0.55          # absolute cosine to keep a patch as the class
@@ -47,21 +57,40 @@ class Config:
     score_threshold: float = 0.0          # drop instances with mean gate score below this
 
     # --- recursion bounds (cascade) ---
-    max_depth: int = 8                    # BFS depth cap
-    min_crop: int = 64                    # resolution floor (px) — stop zooming below this
+    # The ONLY stopping signals are CLS re-identification (a child must beat the crop it came from)
+    # and crop SIZE (``min_crop``). There is no depth cap and no split margin.
+    max_depth: int = 8                    # DEPRECATED / unused: depth is no longer a stopping
+                                          # signal (CLS + min_crop are); kept for config compat
+    min_crop: int = 64                    # resolution floor (px) — stop zooming/splitting below this
     pad_frac: float = 0.08               # padding fraction around child crops
     shrink_stop: float = 0.9             # converge when child/crop area ratio >= this
     cls_threshold: float = 0.5           # absolute class FLOOR: converged crop below this is
                                          # not the class -> reject (was the accept threshold)
-    clump_area_factor: float = 1.5       # blob <= this x exemplar area => single instance,
-                                         # accepted without the split-lookahead (fast path)
-    split_margin: float = 0.0            # a clump split is kept only if aggregate child CLS
-                                         # beats the parent CLS by more than this margin
-    split_aggregate: str = "mean"        # mean | max | min: how child CLS is pooled vs parent
+    zoom_split_retry_eps: float = 0.01   # when a zoom peaks by only a hair (parent CLS beats the
+                                         # child by less than this), the crop may be a CLUMP that
+                                         # tightening onto one component can't improve — so try ONE
+                                         # k=2 split of the parent before emitting it. If the split
+                                         # doesn't improve either, the parent is emitted. 0 disables.
+    clump_area_factor: float = 1.5       # DEPRECATED / unused: convergence now ALWAYS attempts a
+                                         # split (no tiny-blob fast path); kept for config compat
+    split_margin: float = 0.0            # DEPRECATED / unused: a split is confirmed when its BEST
+                                         # sub-crop strictly beats the parent CLS (isolating a real
+                                         # object raises CLS), then every sub-crop above the class
+                                         # floor is kept; kept for config compat
+    split_aggregate: str = "mean"        # DEPRECATED / unused: sub-crops are gated by the split
+                                         # confirm + class floor, not pooled; kept for config compat
     cascade_min_instance_area: int = 16  # drop leaf masks smaller than this (pixels)
+    # --- deduplication (final NMS on emitted leaves) ---
+    nms_iou: float = 0.5                 # suppress a lower-scored leaf overlapping a kept one above
+                                         # this mask IoU (independent branches re-finding one object)
+    nms_containment: float = 0.7         # ...or contained in a kept one beyond this fraction of its
+                                         # area — catches the NESTED duplicate a plain IoU misses
+                                         # (a tight zoomed mask inside a looser one). Set BOTH
+                                         # nms_iou and nms_containment to 1.0 to disable NMS.
     embed_batch_size: int = 8            # crops per backbone forward
     max_total_embeds: int = 512          # global embed budget (safety cap)
-    split_mode: str = "watershed"        # watershed | none, for seamless clumps
+    split_mode: str = "kmeans"           # how a converged clump is split: kmeans (k=2 on features,
+                                         # always splits) | watershed (marker-controlled) | none
 
     # --- prototype bank ---
     prototype_reduction: str = "all"     # all | mean | cluster | kmeans

@@ -31,7 +31,7 @@ import torch
 
 from foveate import clustering, features as featlib
 from foveate.debias import estimate_positional_basis, project_out
-from foveate.foreground import GateResult
+from foveate.foreground import GateResult, normalize_reference
 
 
 def _mask_bbox(mask: np.ndarray, pad_frac: float) -> tuple[int, int, int, int]:
@@ -50,6 +50,12 @@ class InSID3Extractor:
         self.cfg = cfg
         self.cls_bank: torch.Tensor | None = None
         self._B: torch.Tensor | None = None
+        # Per-exemplar reference kept SEPARATE (not pooled): each entry is
+        # ``(ref_deb (Rs, D), ref_fg (Rs,) bool, p_ref (D,))``. ``predict`` picks the exemplars
+        # most CLS-similar to the crop and builds the matching gallery from just those — pooling
+        # every exemplar into one gallery dilutes the match (the failure the redesign fixes).
+        self._ex: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        # Pooled over ALL exemplars — the fallback used when ``predict`` gets no crop CLS.
         self.ref_deb: torch.Tensor | None = None      # (R, D) debiased reference patches
         self.ref_fg: torch.Tensor | None = None       # (R,) bool reference foreground
         self.p_ref: torch.Tensor | None = None        # (D,) debiased reference prototype
@@ -58,22 +64,29 @@ class InSID3Extractor:
     def set_reference(
         self,
         backbone,
-        ref_image: np.ndarray,
+        ref_image: "np.ndarray | list[np.ndarray]",
         ref_masks: list[np.ndarray],
         negative_masks: list[np.ndarray] | None,
         cfg,
     ) -> None:
         """Build the reference state: matching gallery + prototype + per-exemplar CLS bank.
 
-        With ``cfg.insid3_crop_reference`` (default) the reference is built from a tight crop
-        around *each* exemplar mask, so the exemplar fills its frame at the same scale the
-        cascade's zoomed-in target crops do. Embedding the whole image instead leaves the
-        exemplar tiny in a large frame, and the resulting scale mismatch makes INSID3's matching
-        progressively tighter as the cascade zooms (the foreground shrinks each level).
+        ``ref_image`` is a single array or a list parallel to ``ref_masks`` (multi-image
+        exemplars — each exemplar cropped from its own image; the CLS / prototype / matching
+        banks are simply stacked across images).
+
+        With ``cfg.insid3_crop_reference`` (default) the reference is built from a crop around
+        *each* exemplar mask padded by ``cfg.pad_frac`` — the SAME fraction the cascade pads its
+        child/foreground crops with (``_child_box``) — so the exemplar fills its frame at the exact
+        scale the target crops do. This matters for the CLS comparison: DINOv3's CLS token is
+        framing-sensitive, so if the bank exemplars carried more padding than the target crops, a
+        tightly-zoomed single instance would score *lower* than a looser parent crop purely from the
+        framing mismatch (nothing to do with content). Sharing ``pad_frac`` removes that bias.
+        Embedding the whole image instead (``insid3_crop_reference=False``) leaves the exemplar tiny
+        in a large frame, and that scale mismatch makes INSID3's matching progressively tighter as
+        the cascade zooms.
         """
-        valid = [m.astype(bool) for m in ref_masks if m.any()]
-        if not valid:
-            raise ValueError("All reference masks are empty.")
+        images, valid = normalize_reference(ref_image, ref_masks)
 
         self._B = None
         if cfg.debias:
@@ -83,63 +96,136 @@ class InSID3Extractor:
             )
 
         if cfg.insid3_crop_reference:
-            self._set_reference_cropped(backbone, ref_image, valid, cfg)
+            self._set_reference_cropped(backbone, images, valid, cfg)
         else:
-            self._set_reference_full(backbone, ref_image, valid, cfg)
+            self._set_reference_full(backbone, images, valid, cfg)
 
-    def _set_reference_cropped(self, backbone, ref_image, valid, cfg) -> None:
-        """Reference patches + prototype + CLS from a padded crop around each exemplar mask."""
-        boxes = [_mask_bbox(m, cfg.insid3_ref_pad_frac) for m in valid]
-        crops = [ref_image[y0:y1, x0:x1] for (y0, y1, x0, x1) in boxes]
+    def _set_reference_cropped(self, backbone, images, valid, cfg) -> None:
+        """Reference patches + prototype + CLS from a padded crop around each exemplar mask
+        (each cropped from its own image in ``images``). Padded by ``cfg.pad_frac`` — the same
+        fraction the cascade uses for its crops — so bank and target framing match (see
+        :meth:`set_reference`)."""
+        boxes = [_mask_bbox(m, cfg.pad_frac) for m in valid]
+        crops = [img[y0:y1, x0:x1] for img, (y0, y1, x0, x1) in zip(images, boxes)]
         embedded = featlib.embed_batch(backbone, crops, chunk=8, standardize=cfg.standardize)
         device = embedded[0][0].device
 
-        ref_parts, fg_parts, cls_list = [], [], []
+        cls_list = []
         for m, (y0, y1, x0, x1), (feat, cls) in zip(valid, boxes, embedded):
             hp, wp, d = feat.shape
             mask_grid = featlib.resize_mask_to_grid(m[y0:y1, x0:x1], (hp, wp))
             if not mask_grid.any():                              # mask thinner than a patch
                 mask_grid = np.ones((hp, wp), dtype=bool)
-            ref_parts.append(project_out(feat.reshape(hp * wp, d), self._B))   # (hp*wp, D)
-            fg_parts.append(torch.from_numpy(mask_grid.reshape(-1)).to(device))
+            rd = project_out(feat.reshape(hp * wp, d), self._B)  # (hp*wp, D)
+            rf = torch.from_numpy(mask_grid.reshape(-1)).to(device)
+            self._ex.append((rd, rf, featlib.l2_normalize(rd[rf].mean(dim=0), dim=0)))
             cls_list.append(cls)
 
-        self.ref_deb = torch.cat(ref_parts, dim=0)               # (R, D) debiased ref patches
-        self.ref_fg = torch.cat(fg_parts, dim=0)                 # (R,) bool foreground
-        self.p_ref = featlib.l2_normalize(self.ref_deb[self.ref_fg].mean(dim=0), dim=0)
+        self._set_pooled(device)
         self.cls_bank = featlib.l2_normalize(torch.stack(cls_list), dim=1).to(device)  # (S, D)
 
-    def _set_reference_full(self, backbone, ref_image, valid, cfg) -> None:
-        """Reference from the whole image (original behaviour); CLS still per-exemplar crop."""
-        ref_feat = featlib.embed_image(backbone, ref_image, standardize=cfg.standardize)
-        hp, wp, d = ref_feat.shape
-        device = ref_feat.device
+    def _set_reference_full(self, backbone, images, valid, cfg) -> None:
+        """Reference from the whole image(s) (original behaviour); CLS still per-exemplar crop.
 
-        grids = [featlib.resize_mask_to_grid(m, (hp, wp)) for m in valid]
-        union = np.logical_or.reduce(grids) if len(grids) > 1 else grids[0]
-        ref_fg = torch.from_numpy(union.reshape(-1)).to(device)
-        if not bool(ref_fg.any()):
+        Each distinct reference image is embedded once and its exemplar masks OR-merged into a
+        per-image foreground; the per-image patches (and foreground flags) are concatenated, so
+        multi-image references simply stack their patch galleries."""
+        by_image: dict[int, tuple[torch.Tensor, np.ndarray]] = {}
+        order: list[int] = []
+        for img, m in zip(images, valid):
+            key = id(img)
+            if key not in by_image:
+                feat = featlib.embed_image(backbone, img, standardize=cfg.standardize)
+                by_image[key] = (feat, np.zeros(feat.shape[:2], dtype=bool))
+                order.append(key)
+            feat, union = by_image[key]
+            union |= featlib.resize_mask_to_grid(m, feat.shape[:2])
+
+        device = by_image[order[0]][0].device
+        # One per-exemplar entry per distinct image (its patches + OR-merged mask foreground).
+        for key in order:
+            feat, union = by_image[key]
+            hp, wp, d = feat.shape
+            rd = project_out(feat.reshape(hp * wp, d), self._B)
+            rf = torch.from_numpy(union.reshape(-1)).to(device)
+            if not bool(rf.any()):
+                continue                                         # no ref patch overlaps this grid
+            self._ex.append((rd, rf, featlib.l2_normalize(rd[rf].mean(dim=0), dim=0)))
+
+        if not self._ex:
             raise ValueError("No reference patch overlaps the feature grid; image too small "
                              "or reference mask empty. Increase backbone image_size.")
+        self._set_pooled(device)
+        self.cls_bank = self._build_cls_bank(backbone, images, valid, cfg).to(device)
 
-        self.ref_deb = project_out(ref_feat.reshape(hp * wp, d), self._B)
-        self.ref_fg = ref_fg
-        self.p_ref = featlib.l2_normalize(self.ref_deb[ref_fg].mean(dim=0), dim=0)
-        self.cls_bank = self._build_cls_bank(backbone, ref_image, valid, cfg).to(device)
+    def _set_pooled(self, device) -> None:
+        """Concatenate the per-exemplar reference into the all-exemplar pooled fallback."""
+        self.ref_deb = torch.cat([e[0] for e in self._ex], dim=0).to(device)
+        self.ref_fg = torch.cat([e[1] for e in self._ex], dim=0).to(device)
+        self.p_ref = featlib.l2_normalize(self.ref_deb[self.ref_fg].mean(dim=0), dim=0)
 
-    def _build_cls_bank(self, backbone, ref_image, valid, cfg) -> torch.Tensor:
-        """Crop each exemplar bbox, embed it, stack the per-crop CLS (matches build_bank)."""
-        boxes = [_mask_bbox(m, cfg.insid3_ref_pad_frac) for m in valid]
-        crops = [ref_image[y0:y1, x0:x1] for (y0, y1, x0, x1) in boxes]
+    def _build_cls_bank(self, backbone, images, valid, cfg) -> torch.Tensor:
+        """Crop each exemplar bbox from its own image, embed it, stack the per-crop CLS. Padded by
+        ``cfg.pad_frac`` so the bank CLS is framed like the target crops it will be matched against."""
+        boxes = [_mask_bbox(m, cfg.pad_frac) for m in valid]
+        crops = [img[y0:y1, x0:x1] for img, (y0, y1, x0, x1) in zip(images, boxes)]
         embedded = featlib.embed_batch(backbone, crops, chunk=8, standardize=cfg.standardize)
         cls_list = [cls for _, cls in embedded]                  # each (D,), L2-normed
         return featlib.l2_normalize(torch.stack(cls_list), dim=1)  # (S, D)
 
+    # ------------------------------------------------------------------- select
+    def _select_reference(self, cls: torch.Tensor | None, device):
+        """Pick the exemplars to run INSID3 with, and the tau / aggregate to run it at.
+
+        ``cls`` is the crop's CLS token. The top ``insid3_top_k_exemplars`` exemplars by CLS
+        cosine build the matching gallery (``k=1`` ⇒ standard single-exemplar INSID3). With
+        ``insid3_dynamic_params`` the granularity follows that similarity ``s``:
+        ``tau = insid3_tau_scale * s`` (dissimilar crops stay coarse so the cascade zooms first;
+        similar crops cluster finely — scaled because raw ``s≈1`` over-segments) and
+        ``aggregate_threshold = insid3_aggregate_scale * (1 - s)`` (similar crops aggregate freely).
+        The similarity is measured even for a single exemplar; only ``cls=None`` (the single-pass
+        ``predict`` with no crop CLS) falls back to the pooled reference and static config.
+        """
+        cfg = self.cfg
+        n = len(self._ex)
+        if cls is None:
+            sel, sim = list(range(n)), None
+        else:
+            # Always measure the crop↔exemplar CLS similarity when we have a CLS — a single
+            # exemplar still needs it for the dynamic tau / aggregate. Only the top-k *selection*
+            # is trivial when n == 1 (sims is (1,) → sel == [0]).
+            sims = (self.cls_bank.to(cls.device, cls.dtype) @ cls).detach().cpu().numpy()  # (S,)
+            k = max(1, min(int(cfg.insid3_top_k_exemplars), n))
+            sel = sorted(int(i) for i in np.argsort(-sims)[:k])
+            sim = float(np.mean(sims[sel]))
+
+        ref_deb = torch.cat([self._ex[i][0] for i in sel], dim=0).to(device)
+        ref_fg = torch.cat([self._ex[i][1] for i in sel], dim=0).to(device)
+        p_ref = (featlib.l2_normalize(ref_deb[ref_fg].mean(dim=0), dim=0)
+                 if bool(ref_fg.any()) else featlib.l2_normalize(ref_deb.mean(dim=0), dim=0))
+
+        if cfg.insid3_dynamic_params and sim is not None:
+            tau = float(np.clip(cfg.insid3_tau_scale * sim, 0.05, 0.95))
+            aggregate = float(np.clip(cfg.insid3_aggregate_scale * (1.0 - sim), 0.0, 0.95))
+        else:
+            tau, aggregate = float(cfg.insid3_tau), float(cfg.insid3_aggregate_threshold)
+        return ref_deb, ref_fg, p_ref, tau, aggregate, sel, sim
+
+    def _selection_internals(self, sel_ex, sim, tau, aggregate) -> dict:
+        """Small viz payload describing which exemplars ran and at what granularity."""
+        return {"selected_exemplars": list(sel_ex), "select_sim": sim,
+                "tau_used": tau, "aggregate_used": aggregate}
+
     # ------------------------------------------------------------------- predict
     def predict(
-        self, target_feat: torch.Tensor, *, return_internals: bool = False
+        self, target_feat: torch.Tensor, *, cls: torch.Tensor | None = None,
+        return_internals: bool = False,
     ) -> GateResult:
         """Run INSID3 on an ``(Hp, Wp, D)`` L2-normalized target grid.
+
+        ``cls`` is the crop's CLS token; when given, only the ``insid3_top_k_exemplars`` exemplars
+        most similar to it build the matching gallery (and, if ``insid3_dynamic_params``, set the
+        granularity) — see :meth:`_select_reference`.
 
         Mirrors the official ``_locate_candidates`` + ``_seed_and_aggregate``: locate candidate
         patches (forward prototype prior ∧ backward nearest-neighbour vote), over-segment the
@@ -154,9 +240,7 @@ class InSID3Extractor:
         flat = target_feat.reshape(hp * wp, d)                   # (P, D) raw
         t_deb = project_out(flat, self._B)                       # (P, D) debiased
 
-        p_ref = self.p_ref.to(device)
-        ref_deb = self.ref_deb.to(device)
-        ref_fg = self.ref_fg.to(device)
+        ref_deb, ref_fg, p_ref, tau, aggregate, sel_ex, sim = self._select_reference(cls, device)
 
         # Forward prior: per-patch cosine to the reference prototype.
         fwd = t_deb @ p_ref                                      # (P,)
@@ -174,18 +258,19 @@ class InSID3Extractor:
 
         # Fine-grained clustering of ALL patches in feature space (no spatial graph).
         clusters = clustering.cluster_all(
-            target_feat, distance_threshold=1.0 - self.cfg.insid3_tau,
+            target_feat, distance_threshold=1.0 - tau,
             linkage=self.cfg.insid3_linkage,
         )                                                        # (Hp, Wp) int, labels 0..K-1
         labels = clusters.reshape(-1)
         K = int(labels.max()) + 1 if labels.size else 0
 
+        sel_info = self._selection_internals(sel_ex, sim, tau, aggregate)
         matched_ids = np.unique(labels[candidate]) if candidate.any() else np.empty(0, int)
         if matched_ids.size == 0:                                # nothing matched → raw candidates
             foreground = candidate.reshape(hp, wp)
             return self._make_result(foreground, score_map, clusters, candidate.reshape(hp, wp),
                                      backward.reshape(hp, wp).cpu().numpy(), -1, {},
-                                     return_internals)
+                                     return_internals, sel_info)
 
         # Area weight: fraction of each cluster's patches that are candidates (seed forced to 1).
         total_area = np.bincount(labels, minlength=K).astype(np.float64)
@@ -214,7 +299,7 @@ class InSID3Extractor:
         area_weights[seed_id] = 1.0
         combined = cross_sim * intra_sim * area_weights          # (K,)
 
-        keep = combined > self.cfg.insid3_aggregate_threshold
+        keep = combined > aggregate
         keep[seed_id] = True
         foreground = keep[labels].reshape(hp, wp)
 
@@ -225,11 +310,11 @@ class InSID3Extractor:
         }
         return self._make_result(foreground, score_map, clusters, candidate.reshape(hp, wp),
                                  backward.reshape(hp, wp).cpu().numpy(), seed_id, cluster_scores,
-                                 return_internals)
+                                 return_internals, sel_info)
 
     # ------------------------------------------------------------------- helpers
     def _make_result(self, foreground, score_map, clusters, candidate_grid, backward_grid,
-                     seed_id, cluster_scores, return_internals) -> GateResult:
+                     seed_id, cluster_scores, return_internals, sel_info=None) -> GateResult:
         internals: dict = {}
         if return_internals:
             internals = {
@@ -240,6 +325,7 @@ class InSID3Extractor:
                 "seed": (clusters == seed_id) if seed_id >= 0 else np.zeros_like(foreground),
                 "foreground": foreground,
                 "cluster_scores": cluster_scores,
+                **(sel_info or {}),
             }
         return GateResult(
             foreground=foreground,

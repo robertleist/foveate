@@ -231,6 +231,9 @@ def summarize_segment(nodes: list[TraceNode], *, tol: float = 1e-3) -> SegmentSu
     elif overshoot > tol:
         # CLS fell meaningfully after the peak: a shallower ancestor crop scored higher.
         kind = "overshoot"
+    elif stop_decision == "cls-stop":
+        # The cascade stopped here *because* the next zoom scored lower — a clean peak by design.
+        kind = "peaked"
     elif stop_decision in ("zoom", "empty"):
         # Still wanted to zoom (or gate emptied) but the chain didn't continue here: the
         # child wasn't processed (budget) — don't read it as a clean stop.

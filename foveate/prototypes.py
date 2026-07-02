@@ -21,6 +21,7 @@ import torch
 
 from foveate import features as featlib
 from foveate.debias import project_out
+from foveate.foreground import normalize_reference
 
 
 @dataclass
@@ -63,7 +64,7 @@ def _farthest_point_subsample(x: torch.Tensor, k: int) -> torch.Tensor:
 
 def build_bank(
     backbone,
-    image: np.ndarray,
+    image: "np.ndarray | list[np.ndarray]",
     masks: list[np.ndarray],
     *,
     reduction: str = "all",
@@ -76,20 +77,19 @@ def build_bank(
 ) -> Bank:
     """Build the prototype bank, cropping **each** exemplar separately.
 
-    ``debias_B`` (if given) is projected out of the bank patches so they match debiased query
-    patches in the cross-image gate.
+    ``image`` is a single array or a list parallel to ``masks`` (multi-image exemplars — each
+    cropped from its own image). ``debias_B`` (if given) is projected out of the bank patches so
+    they match debiased query patches in the cross-image gate.
     """
-    valid = [(i, m.astype(bool)) for i, m in enumerate(masks) if m.any()]
-    if not valid:
-        raise ValueError("All exemplar masks are empty.")
+    images, valid_masks = normalize_reference(image, masks)
 
-    boxes = [_mask_bbox(m, pad_frac) for _, m in valid]
-    crops = [image[y0:y1, x0:x1] for (y0, y1, x0, x1) in boxes]
+    boxes = [_mask_bbox(m, pad_frac) for m in valid_masks]
+    crops = [img[y0:y1, x0:x1] for img, (y0, y1, x0, x1) in zip(images, boxes)]
     embedded = featlib.embed_batch(backbone, crops, chunk=8, standardize=standardize)
 
     per_exemplar: list[torch.Tensor] = []   # (M_i, D) masked patches, optionally debiased
     cls_list: list[torch.Tensor] = []
-    for (idx, m), (feat, cls), (y0, y1, x0, x1) in zip(valid, embedded, boxes):
+    for m, (feat, cls), (y0, y1, x0, x1) in zip(valid_masks, embedded, boxes):
         mask_grid = featlib.resize_mask_to_grid(m[y0:y1, x0:x1], feat.shape[:2])
         if not mask_grid.any():
             mask_grid = np.ones(feat.shape[:2], dtype=bool)

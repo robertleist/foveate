@@ -1,6 +1,10 @@
-# Baseline foveate run on a COCO subset (coral or any category).
-# Requires the [dino] extra and a downloaded COCO dataset; DINOv3 weights are HF-gated.
-run_name: 
+# Comprehensive foveate sweep on the HIFMB polyps COCO dataset.
+# Emphasis: the INTRODUCED algorithm params — zoom-peak split retry + duplicate-suppression NMS —
+# x the class floor, with a light training-config axis. The training-config axes (image count,
+# known ratio, #exemplars pooled) are explored in depth on corals (run_corals.yaml); together the
+# two configs form one comprehensive study.
+# Requires the [dino] extra + the downloaded dataset; DINOv3 weights are HF-gated.
+run_name: polyps
 
 backbone:
   type: dino
@@ -14,52 +18,61 @@ data:
   images_dir: images
   categories: [Polyps]
   min_instances: 2
-  train_images: 2        # intra pool (same-image discovery)
-  interval_images: 2     # disjoint novel images for cross-image (inter) eval
+  train_images: 2         # intra pool + cross-image support pool; swept below
+  interval_images: -1     # -1 = evaluate on ALL images not in the train set (inter / cross-image)
   known_ratio: 0.3        # fraction of instances that are known/prompts; rest are discovery GT
   seed: 42
 
-foveate:               # any foveate.Config field
+foveate:                  # any foveate.Config field
   standardize: true
   foreground_extractor: insid3    # insid3 (default) | bank — "where is the class" on a crop
   # --- INSID3 foreground extractor (WHERE) ---
   insid3_tau: 0.0                 # fine-grained clustering similarity threshold
   insid3_aggregate_threshold: 0.1 # alpha: min combined score to merge a cluster into the object
   insid3_crop_reference: true     # crop ref image+mask to each exemplar bbox (scale-match crops)
-  # --- leaf classification (WHAT): accept a converged crop when its CLS is, on average,
-  #     cosine-similar enough to the exemplar CLS bank ---
-  cls_threshold: 0.1
+  # --- acceptance & splitting (WHAT). A converged crop is ALWAYS split k=2; the split is kept when
+  #     its best sub-crop beats the parent, then every sub-crop above cls_threshold is kept.
+  #     cls_threshold is the class FLOOR (a converged crop below it is not the class). ---
+  cls_threshold: 0.1              # reject floor on mean cos(crop CLS, exemplar CLS bank); swept
+  split_mode: kmeans              # kmeans (k=2, always splits) | watershed | none
+  # --- zoom-peak split retry (introduced): a zoom that peaks by < eps tries ONE k=2 split of the
+  #     parent before emitting (it may be a clump). 0 disables. Swept below. ---
+  zoom_split_retry_eps: 0.01
+  # --- duplicate suppression (introduced): nested k=2 sub-crops can re-find one object down two
+  #     branches; a final NMS keeps the best. Set both to 1.0 to disable. Swept below. ---
+  nms_iou: 0.5
+  nms_containment: 0.7
+  boundary_smooth_sigma: 0.0      # Gaussian (patches) smoothing watershed maps; >0 = fewer fragments
   # --- recursion / cost ---
-  min_crop: 16
+  min_crop: 16                    # px size floor — the ONLY geometric stop (no depth cap)
   max_total_embeds: 512
-  debias: true                   # project out DINOv3 positional bias; enable for cross-image
+  debias: true                    # project out DINOv3 positional bias; required for cross-image
   # --- bank extractor only (used when foreground_extractor: bank) ---
   gate_threshold: 0.5
-  gate_threshold_mode: static     # static | otsu | gmm2 | percentile
-  prototype_reduction: kmeans     # all | mean | cluster | kmeans
+  gate_threshold_mode: static
+  prototype_reduction: kmeans
   prototype_budget: 64
 
 eval:
-  targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (set debias: true)
-  max_exemplars: 3
+  targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (all non-train)
+  max_exemplars: 3                # how many exemplars to pool from the support
   limit: null
-  visualize: 20                   # render prompt|GT|prediction overlays for the first N images
-                                  #   (int caps count, true/"all" = every image, false = off);
-                                  #   logged to MLflow under {intra,inter}/viz in the run's artifacts
-  cascade_trace: 5                # contact sheet of the recursive zoom (gate/components/children)
-                                  #   per region, for the first N images; same budget semantics
+  visualize: 8                    # render prompt|GT|prediction overlays for the first N images
+  cascade_trace: 2                # contact sheet of the recursive zoom for the first N images
 
 mlflow:
   enabled: true
-  experiment_name: foveate-polyps
-  # Server connection — all optional; env vars from .env are used as fallback.
-  # YAML values take precedence over the environment.
-  tracking_uri: null              # overrides MLFLOW_TRACKING_URI; null -> ./mlruns
-  username: null                  # overrides MLFLOW_TRACKING_USERNAME
-  password: null                  # overrides MLFLOW_TRACKING_PASSWORD
-  dotenv: null                    # explicit .env path; null -> looks for ./.env
+  experiment_name: foveate-polyps-comprehensive
+  tracking_uri: null
+  username: null
+  password: null
+  dotenv: null
 
+# Comprehensive INTRODUCED-param x class-floor sweep (cartesian product: 2*2*3*2*2 = 48 runs).
+# Each run evaluates cross-image on ALL images not in its train pool (interval_images: -1).
 sweep:
-  foveate.insid3_tau : [0.0, 0.1, 0.2, 0.5]
-  foveate.insid3_aggregate_threshold: [0.0, 0.1, 0.2, 0.3]
-  data.seed: [42, 1337, 140218]
+  data.train_images: [1, 2]
+  foveate.cls_threshold: [0.1, 0.2]
+  foveate.zoom_split_retry_eps: [0.0, 0.01, 0.02]
+  foveate.nms_iou: [0.5, 0.7]
+  foveate.nms_containment: [0.7, 1.0]
