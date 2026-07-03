@@ -1,0 +1,61 @@
+# Naive "semantic + connected components" baseline on PanNuke nuclei segmentation.
+# Single-pass INSID3 foreground (shared WHERE params with the foveate run) split into instances
+# by plain connected components — no recursion, no individuation. This is the canonical clump
+# case: touching nuclei that share a foreground blob collapse into one connected component, which
+# is exactly the failure foveate's individuation is meant to fix. Sits beside
+# configs/pannuke_baseline.yaml.
+#
+#   python -m experiments.run --config configs/semantic_cc_pannuke.yaml
+run_name: pannuke_semantic_cc
+
+backbone:
+  type: dino
+  model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+  image_size: 256                 # PanNuke images are 256×256; no need to upscale
+
+data:
+  name: pannuke
+  root: /data/pannuke             # point at the directory containing images.npy + masks.npy
+  categories: [Neoplastic]        # or [] for all five classes; names are case-insensitive
+  min_instances: 2
+  train_images: 50                # intra pool (same-image discovery)
+  interval_images: 20             # disjoint novel images for cross-image (inter) eval
+  known_ratio: 0.3                # fraction of instances that are known/prompts; rest are GT
+  seed: 42
+
+foveate:               # SHARED WHERE params with the foveate run
+  standardize: true
+  foreground_extractor: insid3    # insid3 (default) | bank — "where is the class" on the image
+  # --- INSID3 foreground extractor (WHERE) ---
+  insid3_tau: 0.6                 # fine-grained clustering similarity threshold
+  insid3_aggregate_threshold: 0.2 # alpha: min combined score to merge a cluster into the object
+  insid3_crop_reference: true     # crop ref image+mask to each exemplar bbox (scale-match crops)
+  cls_threshold: 0.5              # (unused here: no cascade / acceptance step in this baseline)
+  boundary_smooth_sigma: 0.0
+  debias: false                   # project out DINOv3 positional bias; enable for cross-image
+  # --- bank extractor only (used when foreground_extractor: bank) ---
+  gate_threshold: 0.5
+  gate_threshold_mode: otsu       # static | otsu | gmm2 | percentile
+  prototype_reduction: kmeans
+  prototype_budget: 32            # nuclei are small; fewer prototypes suffice
+
+method:
+  type: semantic_cc
+  min_area: 8           # nuclei can be small (< 20 px); drop tinier CC blobs
+  connectivity: 8       # 4 or 8; 8 matches the cascade's connected-components structure
+  score_mode: mean_prob # score each component by mean foreground confidence under it
+
+eval:
+  targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (set debias: true)
+  max_exemplars: 3
+  limit: null
+  visualize: 10                   # render prompt|GT|prediction overlays for the first N images
+  cascade_trace: 0                # no cascade in this baseline — nothing to trace
+
+mlflow:
+  enabled: true
+  experiment_name: foveate-pannuke
+  tracking_uri: null              # overrides MLFLOW_TRACKING_URI; null -> ./mlruns
+  username: null                  # overrides MLFLOW_TRACKING_USERNAME
+  password: null                  # overrides MLFLOW_TRACKING_PASSWORD
+  dotenv: null                    # explicit .env path; null -> looks for ./.env

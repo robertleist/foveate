@@ -33,6 +33,7 @@ class EvalItem:
     gt_masks: np.ndarray               # (M, H, W) bool — instances to discover in `image`
     class_id: int
     exemplar_image: np.ndarray | None = None   # cross-image support; None => intra-image
+    class_name: str | None = None              # human-readable name for class_id (text baselines)
 
 
 def _image_to_numpy(image: torch.Tensor) -> np.ndarray:
@@ -55,7 +56,8 @@ def build_datasets(cfg: DataConfig) -> tuple[InstanceDataset, InstanceDataset | 
 # ---------------------------------------------------------------------------
 # intra-image: known prompts -> unknown GT, same image
 # ---------------------------------------------------------------------------
-def _intra_item(sample: InstanceSample, image_id: str, max_exemplars: int) -> EvalItem | None:
+def _intra_item(sample: InstanceSample, image_id: str, max_exemplars: int,
+                class_names: dict[int, str] | None = None) -> EvalItem | None:
     prompts = sample.known_instances
     if not prompts:
         return None
@@ -76,14 +78,16 @@ def _intra_item(sample: InstanceSample, image_id: str, max_exemplars: int) -> Ev
         gt_masks=np.stack([_mask_to_numpy(m) for m in gt]),
         class_id=int(target_class),
         exemplar_image=None,
+        class_name=(class_names or {}).get(int(target_class)),
     )
 
 
 def iter_intra_items(dataset: InstanceDataset, *, max_exemplars: int = 3, limit: int | None = None):
     """Yield same-image :class:`EvalItem`s for samples that have a prompt and an unknown target."""
     n = 0
+    class_names = dataset.class_names
     for idx in range(len(dataset)):
-        item = _intra_item(dataset[idx], dataset.image_ids[idx], max_exemplars)
+        item = _intra_item(dataset[idx], dataset.image_ids[idx], max_exemplars, class_names)
         if item is None:
             continue
         yield item
@@ -133,6 +137,7 @@ def iter_inter_items(
 ):
     """Yield cross-image :class:`EvalItem`s: support prompts vs all class instances in novel images."""
     n = 0
+    class_names = dataset.class_names
     for idx in range(len(dataset)):
         sample = dataset[idx]
         counts = Counter(inst.class_id for inst in sample.instances)
@@ -154,6 +159,7 @@ def iter_inter_items(
             gt_masks=np.stack(gt),
             class_id=int(target_class),
             exemplar_image=support_img,
+            class_name=class_names.get(int(target_class)),
         )
         n += 1
         if limit is not None and n >= limit:

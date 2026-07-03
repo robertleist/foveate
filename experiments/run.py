@@ -3,10 +3,13 @@
     python -m experiments.run --config configs/coco_baseline.yaml
     python -m experiments.run --config configs/coco_baseline.yaml --set foveate.gate_threshold=0.6
 
-A run: build the backbone + dataset from the YAML, thread one :class:`~foveate.config.Config`
-through :func:`foveate.discover_instances` for every image, compute the metrics in
+A run: build the method (default: foveate) + dataset from the YAML, call
+:meth:`~experiments.methods.base.Method.predict` for every image, compute the metrics in
 :mod:`experiments.eval`, and log params + metrics + per-image cost (embeds, runtime) and the
 saved masks to MLflow. Use the ``mock`` backbone (no weights) for smoke tests.
+
+Baselines plug in via the ``method:`` config block (see :mod:`experiments.methods`); configs
+without one run the foveate pipeline exactly as before.
 """
 
 from __future__ import annotations
@@ -31,7 +34,8 @@ from experiments.datasets import (
     iter_inter_items,
     iter_intra_items,
 )
-from foveate import Config, discover_instances
+from experiments.methods import Method, build_method
+from experiments.methods.base import build_backbone  # noqa: F401  (backward-compat re-export)
 
 
 # ---------------------------------------------------------------------------
@@ -49,23 +53,6 @@ def _progress(iterable, desc: str, total: int | None):
         print(f"[run] {desc}: processing{f' {total}' if total else ''} images...")
         return iterable
     return tqdm(iterable, desc=desc, total=total, unit="img", dynamic_ncols=True, leave=True)
-
-
-# ---------------------------------------------------------------------------
-# Backbone construction
-# ---------------------------------------------------------------------------
-def build_backbone(spec: dict[str, Any]):
-    spec = dict(spec or {})
-    kind = spec.pop("type", "dino")
-    if kind == "mock":
-        from foveate import MockBackbone
-
-        return MockBackbone(**spec)
-    if kind in ("dino", "dinov3"):
-        from foveate import DINOv3Backbone
-
-        return DINOv3Backbone(**spec)
-    raise ValueError(f"unknown backbone type {kind!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -140,9 +127,8 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
     if config.get("sweep"):
         print("[run] warning: this config has a 'sweep:' block but run_experiment runs a single "
               "config — use experiments.ablations.run_sweep (or the run.py CLI) to expand it.")
-    backbone = build_backbone(config.get("backbone", {}))
+    method = build_method(config)
     data_cfg = DataConfig.from_dict(config["data"])
-    foveate_cfg = Config.from_dict(config.get("foveate", {}))
     eval_cfg = config.get("eval", {}) or {}
     max_exemplars = eval_cfg.get("max_exemplars", 3)
     limit = eval_cfg.get("limit")
@@ -159,18 +145,19 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
     # A persistent output_dir was reused across runs without being cleared, so log_artifacts
     # uploaded stale masks/overlays from earlier datasets; a temp dir is empty every time.
     backbone_kind = (config.get("backbone") or {}).get("type", "dino")
+    method_kind = (config.get("method") or {}).get("type", "foveate")
     result: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(prefix="foveate-run-") as tmp:
         output_dir = Path(tmp)
 
-        print(f"[run] '{config.get('run_name', 'run')}': backbone={backbone_kind} "
-              f"data={data_cfg.name} targets={targets} "
+        print(f"[run] '{config.get('run_name', 'run')}': method={method_kind} "
+              f"backbone={backbone_kind} data={data_cfg.name} targets={targets} "
               f"intra_pool={len(intra_ds)} inter_pool={len(inter_ds) if inter_ds else 0} "
               f"-> {output_dir}")
 
         if "intra" in targets:
             items = iter_intra_items(intra_ds, max_exemplars=max_exemplars, limit=limit)
-            result.update(_evaluate(backbone, items, foveate_cfg, output_dir / "intra", "intra",
+            result.update(_evaluate(method, items, output_dir / "intra", "intra",
                                     visualize=visualize, cascade_trace=cascade_trace, total=limit))
         if "inter" in targets:
             if inter_ds is None:
@@ -178,7 +165,7 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
             else:
                 support = build_support_index(intra_ds)
                 items = iter_inter_items(inter_ds, support, max_exemplars=max_exemplars, limit=limit)
-                result.update(_evaluate(backbone, items, foveate_cfg, output_dir / "inter", "inter",
+                result.update(_evaluate(method, items, output_dir / "inter", "inter",
                                         visualize=visualize, cascade_trace=cascade_trace, total=limit))
 
         (output_dir / "metrics.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -189,7 +176,11 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
                 params = {}
                 params.update(_flatten_params("backbone", config.get("backbone", {})))
                 params.update(_flatten_params("data", config["data"]))
-                params.update(_flatten_params("foveate", foveate_cfg.to_dict()))
+                # Resolved per-method blocks (e.g. the full foveate Config, defaults included)
+                # keep new runs comparable with pre-abstraction MLflow runs.
+                for block_name, block in method.param_blocks().items():
+                    params.update(_flatten_params(block_name, block))
+                params.update(_flatten_params("method", config.get("method", {}) or {}))
                 params.update(_flatten_params("eval", eval_cfg))
                 mlflow.log_params(params)
                 mlflow.log_metrics({k: float(v) for k, v in result.items()
@@ -199,10 +190,10 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _evaluate(backbone, items, cfg: Config, output_dir: Path, prefix: str,
+def _evaluate(method: Method, items, output_dir: Path, prefix: str,
               visualize: Any = False, cascade_trace: Any = False,
               total: int | None = None) -> dict[str, Any]:
-    """Discover over ``items``, save per-image masks, and return ``{prefix}_<metric>`` results."""
+    """Predict over ``items``, save per-image masks, and return ``{prefix}_<metric>`` results."""
     output_dir.mkdir(parents=True, exist_ok=True)
     predictions: list[evallib.ImagePrediction] = []
     gts: list[np.ndarray] = []
@@ -222,12 +213,12 @@ def _evaluate(backbone, items, cfg: Config, output_dir: Path, prefix: str,
     bar = _progress(items, desc=prefix, total=total)
     for item in bar:
         trace: list | None = [] if n_items < trace_budget else None
-        pred, stats, elapsed = _discover_one(backbone, item, cfg, trace=trace)
+        pred, n_embeds, elapsed = _discover_one(method, item, trace=trace)
         predictions.append(pred)
         gts.append(item.gt_masks)
         if item.exemplar_image is None:           # recovery only meaningful for same-image prompts
             recoveries.append(evallib.exemplar_recovery_iou(pred, item.exemplar_masks))
-        total_embeds += stats.n_embeds
+        total_embeds += n_embeds
         total_time += elapsed
         total_pred += pred.masks.shape[0]
         n_items += 1
@@ -238,11 +229,12 @@ def _evaluate(backbone, items, cfg: Config, output_dir: Path, prefix: str,
         if n_items <= viz_budget:
             from experiments.visualize import save_item_overlay
             save_item_overlay(item, pred, viz_dir)
-        if trace is not None:
+        if trace:   # non-empty only when the method drove the observer (i.e. foveate)
             from experiments.visualize import save_cascade_trace
             from experiments.trajectories import save_cls_trajectory
             save_cascade_trace(item, trace, trace_dir)
-            save_cls_trajectory(item, trace, traj_dir, cls_threshold=cfg.cls_threshold)
+            save_cls_trajectory(item, trace, traj_dir,
+                                cls_threshold=getattr(method, "cls_threshold", 0.5))
         # Live cost readout on the bar: predictions/image, embeds/image, sec/image.
         if hasattr(bar, "set_postfix"):
             bar.set_postfix(pred=f"{total_pred / n_items:.1f}",
@@ -267,27 +259,18 @@ def _evaluate(backbone, items, cfg: Config, output_dir: Path, prefix: str,
     return out
 
 
-def _discover_one(backbone, item: EvalItem, cfg: Config, trace: list | None = None):
+def _discover_one(method: Method, item: EvalItem, trace: list | None = None):
     # When `trace` is a list, collect a lightweight observer event per region (drop the heavy
-    # `feat` tensor; keep the grids/boxes the cascade visualization needs).
+    # `feat` tensor; keep the grids/boxes the cascade visualization needs). Methods that don't
+    # cascade simply never call the observer, so the trace stays empty and nothing is rendered.
     observer = None
     if trace is not None:
         def observer(info: dict) -> None:
             trace.append({k: v for k, v in info.items() if k != "feat"})
     t0 = time.perf_counter()
-    instances, stats = discover_instances(
-        backbone, item.image, item.exemplar_masks, config=cfg,
-        exemplar_image=item.exemplar_image, observer=observer,
-    )
+    pred = method.predict(item, observer=observer)
     elapsed = time.perf_counter() - t0
-    h, w = item.image.shape[:2]
-    if instances:
-        masks = np.stack([inst.mask.astype(bool) for inst in instances])
-        scores = np.array([inst.score for inst in instances], dtype=np.float64)
-    else:
-        masks = np.zeros((0, h, w), dtype=bool)
-        scores = np.zeros((0,), dtype=np.float64)
-    return evallib.ImagePrediction(masks=masks, scores=scores), stats, elapsed
+    return evallib.ImagePrediction(masks=pred.masks, scores=pred.scores), pred.n_embeds, elapsed
 
 
 # ---------------------------------------------------------------------------

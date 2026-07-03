@@ -1,4 +1,13 @@
+import math
+
+import numpy as np
+import pytest
+
+from experiments.datasets import build_datasets, iter_inter_items, iter_intra_items
+from experiments.methods import Method, MethodPrediction, build_method, register_method
+from experiments.methods.foveate_method import FoveateMethod
 from experiments.run import run_experiment
+from data import DataConfig
 
 
 def _config(targets):
@@ -30,6 +39,82 @@ def test_run_intra_and_inter():
     result = run_experiment(_config(["intra", "inter"]))
     assert "intra_ap" in result and "inter_ap" in result
     assert result["inter_n_images"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Method abstraction
+# ---------------------------------------------------------------------------
+def _results_equal(a: dict, b: dict) -> bool:
+    if a.keys() != b.keys():
+        return False
+    for k in a:
+        if k.endswith("_mean_runtime_s"):   # wall-clock — never bit-identical across runs
+            continue
+        va, vb = a[k], b[k]
+        if isinstance(va, float) and math.isnan(va):
+            if not (isinstance(vb, float) and math.isnan(vb)):
+                return False
+        elif va != vb:
+            return False
+    return True
+
+
+def test_default_method_is_foveate():
+    # No `method:` block => FoveateMethod, so every existing config keeps working.
+    assert isinstance(build_method(_config(["intra"])), FoveateMethod)
+
+
+def test_explicit_foveate_method_is_identical():
+    # `method: {type: foveate}` must behave exactly like the implicit default.
+    base = run_experiment(_config(["intra"]))
+    cfg = _config(["intra"])
+    cfg["method"] = {"type": "foveate"}
+    assert _results_equal(run_experiment(cfg), base)
+
+
+def test_build_method_unknown_type_raises():
+    cfg = _config(["intra"])
+    cfg["method"] = {"type": "does-not-exist"}
+    with pytest.raises(ValueError, match="unknown method type 'does-not-exist'"):
+        build_method(cfg)
+
+
+@register_method("_test_gt_oracle")
+class _GTOracleMethod(Method):
+    """Returns the GT masks verbatim; records the items it saw (registry is process-global,
+    so the name is test-prefixed to avoid colliding with real methods)."""
+
+    seen: list = []
+
+    def predict(self, item, observer=None):
+        _GTOracleMethod.seen.append(item)
+        masks = item.gt_masks.astype(bool)
+        return MethodPrediction(masks=masks, scores=np.ones(masks.shape[0]), n_embeds=0)
+
+
+def test_custom_registered_method_is_dispatched():
+    _GTOracleMethod.seen.clear()
+    cfg = _config(["intra"])
+    cfg["method"] = {"type": "_test_gt_oracle"}
+    result = run_experiment(cfg)
+    assert _GTOracleMethod.seen, "run_experiment never called the registered method"
+    # A GT oracle scores perfectly and spends no embeds.
+    assert result["intra_ap"] == pytest.approx(1.0)
+    assert result["intra_mean_embeds"] == 0
+    # class_name is plumbed through EvalItem for text-prompted baselines.
+    assert all(item.class_name and item.class_name.startswith("colour")
+               for item in _GTOracleMethod.seen)
+
+
+def test_eval_items_carry_class_names():
+    intra_ds, inter_ds = build_datasets(DataConfig.from_dict(_config(["intra"])["data"]))
+    names = intra_ds.class_names
+    assert names and all(v == f"colour{k}" for k, v in names.items())
+    intra = list(iter_intra_items(intra_ds, max_exemplars=2))
+    assert intra and all(it.class_name == names[it.class_id] for it in intra)
+    from experiments.datasets import build_support_index
+    inter = list(iter_inter_items(inter_ds, build_support_index(intra_ds), max_exemplars=2))
+    assert inter and all(it.class_name == names[it.class_id] for it in inter)
 
 
 def test_run_interval_minus_one_evaluates_all_non_train():

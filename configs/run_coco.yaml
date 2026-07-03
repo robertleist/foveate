@@ -37,11 +37,6 @@ foveate:               # any foveate.Config field
   min_crop: 16
   max_total_embeds: 512
   debias: true                   # project out DINOv3 positional bias; enable for cross-image
-  # --- bank extractor only (used when foreground_extractor: bank) ---
-  gate_threshold: 0.5
-  gate_threshold_mode: static     # static | otsu | gmm2 | percentile
-  prototype_reduction: kmeans     # all | mean | cluster | kmeans
-  prototype_budget: 64
 
 eval:
   targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (set debias: true)

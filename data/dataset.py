@@ -59,6 +59,18 @@ class InstanceDataset(Dataset):
         }
         self.num_classes = len(category_ids)
 
+    @property
+    def class_names(self) -> Dict[int, str]:
+        """Remapped class id (``1..num_classes``) -> human-readable category name.
+
+        Names come from the source (:meth:`DatasetSource.category_name`), so baselines that
+        prompt with text (e.g. "person") can resolve the remapped ids back to dataset names.
+        """
+        return {
+            class_id: self.source.category_name(cat_id)
+            for cat_id, class_id in self.category_to_class.items()
+        }
+
     # ------------------------------------------------------------------
     # Construction
     # ------------------------------------------------------------------

@@ -202,7 +202,7 @@ with st.sidebar:
     device = st.selectbox("device", ["auto", "cpu", "cuda"], index=0)
 
     st.header("Foreground (WHERE)")
-    extractor = st.selectbox("extractor", ["insid3", "bank"], index=0)
+    extractor = st.selectbox("extractor", ["insid3"], index=0)
     insid3_top_k_exemplars = st.number_input(
         "insid3_top_k_exemplars", 1, 32, 1, 1,
         help="Per crop, run INSID3 on the K exemplars most CLS-similar to it (1 = standard "

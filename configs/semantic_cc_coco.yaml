@@ -1,0 +1,59 @@
+# Naive "semantic + connected components" baseline on a COCO subset.
+# Single-pass INSID3 foreground (shared WHERE params with the foveate run) split into instances
+# by plain connected components — no recursion, no individuation. Sits beside configs/run_coco.yaml.
+# Requires the [dino] extra and a downloaded COCO dataset; DINOv3 weights are HF-gated.
+run_name: coco_semantic_cc
+
+backbone:
+  type: dino
+  model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+  image_size: 768
+
+data:
+  name: coco
+  root: /data/robert/coco
+  annotation_file: annotations/instances_train2017.json
+  images_dir: train2017
+  categories: [person]
+  min_instances: 2
+  train_images: 20        # intra pool (same-image discovery)
+  interval_images: 10     # disjoint novel images for cross-image (inter) eval
+  known_ratio: 0.3        # fraction of instances used as known/prompts (intra GT = all instances)
+  seed: 42
+
+foveate:               # any foveate.Config field — SHARED WHERE params with the foveate run
+  standardize: true
+  foreground_extractor: insid3    # insid3 (default) | bank — "where is the class" on the image
+  # --- INSID3 foreground extractor (WHERE) ---
+  insid3_tau: 0.0                 # fine-grained clustering similarity threshold
+  insid3_aggregate_threshold: 0.1 # alpha: min combined score to merge a cluster into the object
+  insid3_crop_reference: true     # crop ref image+mask to each exemplar bbox (scale-match crops)
+  cls_threshold: 0.1              # (unused here: no cascade / acceptance step in this baseline)
+  boundary_smooth_sigma: 0.0
+  debias: true                   # project out DINOv3 positional bias; enable for cross-image
+  # --- bank extractor only (used when foreground_extractor: bank) ---
+  gate_threshold: 0.5
+  gate_threshold_mode: static     # static | otsu | gmm2 | percentile
+  prototype_reduction: kmeans     # all | mean | cluster | kmeans
+  prototype_budget: 64
+
+method:
+  type: semantic_cc
+  min_area: 10          # drop connected components smaller than this (pixels)
+  connectivity: 8       # 4 or 8; 8 matches the cascade's connected-components structure
+  score_mode: mean_prob # score each component by mean foreground confidence under it
+
+eval:
+  targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (set debias: true)
+  max_exemplars: 3
+  limit: null
+  visualize: 10                   # render prompt|GT|prediction overlays for the first N images
+  cascade_trace: 0                # no cascade in this baseline — nothing to trace
+
+mlflow:
+  enabled: true
+  experiment_name: foveate-coco
+  tracking_uri: null              # overrides MLFLOW_TRACKING_URI; null -> ./mlruns
+  username: null                  # overrides MLFLOW_TRACKING_USERNAME
+  password: null                  # overrides MLFLOW_TRACKING_PASSWORD
+  dotenv: null                    # explicit .env path; null -> looks for ./.env
