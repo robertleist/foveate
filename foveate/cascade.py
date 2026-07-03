@@ -402,7 +402,13 @@ def discover_instances(
                     comp = parent.comps[0]
                     subs = _split_component(parent.feat, comp, cfg)
                     if len(subs) >= 2:
-                        sub_boxes = [_child_box(s, parent.box, cfg.pad_frac) for s in subs]
+                        # Same no-progress guard as the convergence split: a sub-box equal to
+                        # the parent's box would re-embed the identical crop forever.
+                        pairs = [(s, _child_box(s, parent.box, cfg.pad_frac)) for s in subs]
+                        pairs = [(s, b) for s, b in pairs if b != parent.box]
+                        subs = [s for s, _ in pairs]
+                        sub_boxes = [b for _, b in pairs]
+                    if len(subs) >= 2:
                         sub_emb = featlib.embed_batch(
                             backbone, [image[b[0]:b[1], b[2]:b[3]] for b in sub_boxes],
                             chunk=cfg.embed_batch_size, standardize=cfg.standardize,
@@ -461,9 +467,23 @@ def discover_instances(
                 for cid in range(1, n + 1):
                     emit(r, labels == cid, cls_score)
             elif n >= 2:                                  # multiple instances → tighter crops
-                decision = "split"
-                child_comps = [labels == cid for cid in range(1, n + 1)]
-                children = [_child_box(c, r.box, cfg.pad_frac) for c in child_comps]
+                # A component whose padded bbox clips back to THIS crop's box makes no
+                # geometric progress: re-enqueuing it re-embeds the identical crop, finds the
+                # identical components and splits again — an infinite loop only the embed
+                # budget stops (and a self-referential trace event that hangs the trajectory
+                # tools). Emit such a component as-is; recurse only into genuinely tighter ones.
+                comps_all = [labels == cid for cid in range(1, n + 1)]
+                boxes_all = [_child_box(c, r.box, cfg.pad_frac) for c in comps_all]
+                kept = [(c, b) for c, b in zip(comps_all, boxes_all) if b != r.box]
+                for c, b in zip(comps_all, boxes_all):
+                    if b == r.box:
+                        emit(r, c, cls_score)
+                if kept:
+                    decision = "split"
+                    child_comps = [c for c, _ in kept]
+                    children = [b for _, b in kept]
+                else:                                     # nothing tightenable → all emitted
+                    decision = "leaf-cap"
             else:                                         # single component
                 comp = labels == 1
                 child = _child_box(comp, r.box, cfg.pad_frac)
@@ -485,14 +505,23 @@ def discover_instances(
                     # falls back and emits this crop — the crop that led to the split — as ``cls-stop``.
                     subs = _split_component(feat, comp, cfg)
                     if len(subs) >= 2:
-                        sub_boxes = [_child_box(s, r.box, cfg.pad_frac) for s in subs]
+                        # Drop a sub-crop whose padded box clips back to THIS crop's box: it
+                        # makes no geometric progress (identical crop → identical CLS →
+                        # identical split), so pursuing it loops until the embed budget.
+                        pairs = [(s, _child_box(s, r.box, cfg.pad_frac)) for s in subs]
+                        pairs = [(s, b) for s, b in pairs if b != r.box]
+                    else:
+                        pairs = []
+                    if pairs:
+                        subs = [s for s, _ in pairs]
+                        sub_boxes = [b for _, b in pairs]
                         child_embeds = featlib.embed_batch(   # lookahead embeds, reused next level
                             backbone, [image[b[0]:b[1], b[2]:b[3]] for b in sub_boxes],
                             chunk=cfg.embed_batch_size, standardize=cfg.standardize,
                         )
                         stats.n_embeds += len(child_embeds)
                         decision, children, child_comps = "clump-split", sub_boxes, [comp]
-                    else:                                 # unsplittable (one patch) → this crop is it
+                    else:                                 # unsplittable / no tighter sub-crop
                         decision = "leaf"; emit(r, comp, cls_score)
 
             if decision == "leaf-cap":

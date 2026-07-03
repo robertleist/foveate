@@ -159,7 +159,10 @@ def build_segments(events: list[dict]) -> list[list[TraceNode]]:
         while True:
             node = _node(ev)
             seg.append(node)
-            kids = [by_box[c] for c in node.children if c in by_box]
+            # A degenerate child box equal to the node's own box (pre-fix cascades could emit
+            # one when a split sub-box clipped back to the parent) is a self-loop in the
+            # box-keyed tree — following it would walk forever.
+            kids = [by_box[c] for c in node.children if c in by_box and c != node.box]
             if len(kids) == 1:
                 ev = kids[0]  # stay on the same single-component chain
                 continue
@@ -180,7 +183,9 @@ def build_paths(events: list[dict]) -> list[list[TraceNode]]:
     stack: list[list[TraceNode]] = [[_node(r)] for r in roots]
     while stack:
         path = stack.pop()
-        kids = [by_box[c] for c in path[-1].children if c in by_box]
+        # Same self-loop guard as build_segments: never follow a child box equal to the
+        # node's own box (pre-fix cascades could emit one; it loops forever here).
+        kids = [by_box[c] for c in path[-1].children if c in by_box and c != path[-1].box]
         if not kids:
             paths.append(path)
         else:

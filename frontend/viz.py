@@ -193,6 +193,8 @@ def region_tree(events: list[dict]) -> list[tuple[str, dict]]:
         kids: list[tuple[str, dict]] = []
         k = 0
         for cb in ev.get("children", []):
+            if tuple(cb) == tuple(ev["box"]):
+                continue  # degenerate self-referential child (pre-fix cascades) — never follow
             child = by_box.get(tuple(cb))
             if child is None:
                 continue  # child enqueued but never processed — skip in numbering
