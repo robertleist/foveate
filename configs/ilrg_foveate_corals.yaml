@@ -79,5 +79,7 @@ mlflow:
 # Cartesian product: 2 * 2 * 1 * 3 * 2 * 3 * 3 = 216 runs.
 # Each run evaluates cross-image on ALL images not in its train pool (interval_images: -1).
 sweep:
-  data.train_images: [1, 3, 10]
+  data.train_images: [10]
   foveate.split_mode: [kmeans, none]
+  foveate.insid3_tau: [0.1, 0.3, 0.5]                # fine-grained clustering similarity threshold; swept below
+  foveate.insid3_aggregate_threshold: [0.1, 0.3, 0.5]  # alpha: min combined score to merge a cluster; swept below
