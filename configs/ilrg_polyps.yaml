@@ -57,7 +57,7 @@ foveate:                  # any foveate.Config field — full algorithm knob set
   nms_iou: 0.5
   nms_containment: 0.7
   # --- recursion / cost ---
-  min_crop: 16                    # px size floor — the ONLY geometric stop (no depth cap)
+  min_crop: 64                    # px size floor — the ONLY geometric stop (no depth cap)
   max_total_embeds: 512           # global embed budget (safety cap)
   # --- bank extractor only (used when foreground_extractor: bank) ---
   gate_threshold: 0.5

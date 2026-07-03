@@ -495,6 +495,7 @@ if run and ref_image is not None and exemplar_masks:
             norms = np.linalg.norm(bank_np, axis=1)
             if bank_np.shape[0] >= 2:
                 sim = bank_np @ bank_np.T  # already L2-normalized → cosine
+
                 rc1.caption("Pairwise CLS cosine")
                 rc1.dataframe(np.round(sim, 3))
     else:
@@ -550,22 +551,15 @@ if run and ref_image is not None and exemplar_masks:
     hw = target_image.shape[:2]
     pred_masks = [np.asarray(inst.mask, dtype=bool) for inst in instances]
 
-    final_pred = target_image
-    for k in range(len(instances)):
-        final_pred = viz.overlay_mask(final_pred, pred_masks[k], viz._PALETTE[k % len(viz._PALETTE)])
 
-    ic0, ic1, ic2 = st.columns(3)
+
     if gt_masks:
         from experiments.eval import ImagePrediction, evaluate
-
-        final_gt = target_image
-        for k in range(len(gt_masks)):
-            final_gt = viz.overlay_mask(final_gt, gt_masks[k], viz._PALETTE[k % len(viz._PALETTE)])
-
         pmasks = np.stack(pred_masks) if pred_masks else np.zeros((0, *hw), dtype=bool)
         pscores = np.array([float(inst.score) for inst in instances], dtype=np.float64)
         gt = np.stack([np.asarray(m, dtype=bool) for m in gt_masks])
-        metrics = evaluate([ImagePrediction(masks=pmasks, scores=pscores)], [gt])
+        with st.spinner("Evaluating predictions", show_time=True):
+            metrics = evaluate([ImagePrediction(masks=pmasks, scores=pscores)], [gt])
         mc = st.columns(6)
         mc[0].metric("AP", f"{metrics.ap:.3f}", help="mean over IoU 0.50:0.95")
         mc[1].metric("AP@50", f"{metrics.ap50:.3f}")
@@ -573,14 +567,22 @@ if run and ref_image is not None and exemplar_masks:
         mc[3].metric("mean IoU", f"{metrics.mean_iou:.3f}", help="mean IoU of matched pairs")
         mc[4].metric("PQ", f"{metrics.pq:.3f}", help="panoptic quality")
         mc[5].metric("#pred / #gt", f"{metrics.n_pred} / {metrics.n_gt}")
-
-        ic0.image(final_pred,
-                  caption="prediction", width="content")
+    ic0, ic1, ic2 = st.columns(3)
+    with st.spinner("Loading prediction plot", show_time=True):
+        final_pred = target_image
+        for k in range(len(instances)):
+            final_pred = viz.overlay_mask(final_pred, pred_masks[k], viz._PALETTE[k % len(viz._PALETTE)])
+    ic0.image(final_pred,
+              caption="prediction", width="content")
+    if gt_masks:
+        with st.spinner("Loading GT plot", show_time=True):
+            final_gt = target_image
+            for k in range(len(gt_masks)):
+                final_gt = viz.overlay_mask(final_gt, gt_masks[k], viz._PALETTE[k % len(viz._PALETTE)])
         ic1.image(final_gt,
                   caption="annotation", width="content")
     else:
-        ic1.caption("No annotation available for this source — metrics skipped.")
-        ic1.image(final_pred, caption="prediction (union)", width="content")
+        ic1.caption("No GT available for this source.")
 
     # ---------------- 4 · Cascade ----------------
     st.header("4 · Cascade")
