@@ -9,6 +9,7 @@ backbone:
 
 data:
   name: coco
+  label: coco                 # dataset name for MLflow logging/filtering
   root: /data/robert/coco
   annotation_file: annotations/instances_train2017.json
   images_dir: train2017
@@ -19,28 +20,45 @@ data:
   known_ratio: 0.3        # fraction of instances used as known/prompts (intra GT = all instances)
   seed: 42
 
-foveate:               # any foveate.Config field
-  standardize: true
+foveate:               # any foveate.Config field — full algorithm knob set (mirrors frontend/app.py)
+  # --- features ---
+  standardize: true               # z-score feature dims before L2-norm
+  # --- INSID3 foreground extractor (WHERE is the concept on a crop) ---
   foreground_extractor: insid3    # insid3 (default) | bank — "where is the class" on a crop
-  # --- INSID3 foreground extractor (WHERE) ---
   insid3_tau: 0.0                 # fine-grained clustering similarity threshold
   insid3_aggregate_threshold: 0.1 # alpha: min combined score to merge a cluster into the object
   insid3_crop_reference: true     # crop ref image+mask to each exemplar bbox (scale-match crops)
-  # --- acceptance & splitting (WHAT): a converged crop is kept as ONE instance unless
-  #     splitting makes the sub-crops MORE exemplar-like (then it was a clump). cls_threshold
-  #     is the class FLOOR — a converged crop below it is not the class and is rejected. ---
+  insid3_top_k_exemplars: 1       # per crop, run INSID3 on the K bank exemplars most CLS-similar
+                                  #   to it (1 = standard single-exemplar INSID3). This is the
+                                  #   ALGORITHM's pooling knob; eval.max_exemplars sizes the bank.
+  insid3_dynamic_params: false    # derive tau/aggregate from the crop↔exemplar CLS sim s
+                                  #   (overrides the two static values above)
+  insid3_tau_scale: 0.7           #   dynamic: tau = tau_scale * s (raw s≈1 over-segments)
+  insid3_aggregate_scale: 0.3     #   dynamic: aggregate_threshold = aggregate_scale * (1 - s)
+  # --- positional debiasing (cross-image matching) ---
+  debias: true                    # project out DINOv3 positional bias; enable for cross-image
+  debias_subspace_dim: 8          # rank of the positional subspace projected out
+  # --- acceptance & splitting (WHAT does a crop contain). A converged crop is ALWAYS split k=2;
+  #     the split is kept when its best sub-crop beats the parent, then every sub-crop above
+  #     cls_threshold is kept. cls_threshold is the class FLOOR (below it -> not the class). ---
   cls_threshold: 0.1              # reject floor on mean cos(crop CLS, exemplar CLS bank)
-  split_aggregate: mean           # mean | max | min — how sub-crop CLS is pooled vs the parent
-  split_margin: 0.0               # keep a split only if pooled child CLS beats the parent by this
-  boundary_smooth_sigma: 0.0      # Gaussian (patches) smoothing watershed maps; >0 = fewer fragments
+  split_mode: kmeans              # kmeans (k=2 on features, always splits) | watershed | none
+  zoom_split_retry_eps: 0.01      # a zoom peaking by < eps tries ONE k=2 split of the parent
+                                  #   before emitting (it may be a clump); 0 disables
+  boundary_smooth_sigma: 0.0      # Gaussian (patches) on watershed maps (split_mode: watershed only)
+  # --- duplicate suppression: nested k=2 sub-crops can re-find one object down two branches;
+  #     a final NMS keeps the best. Set both to 1.0 to disable. ---
+  nms_iou: 0.5                    # suppress a lower-scored leaf above this mask IoU with a kept one
+  nms_containment: 0.7            # ...or contained in a kept one beyond this fraction of its area
   # --- recursion / cost ---
-  min_crop: 16
-  max_total_embeds: 512
-  debias: true                   # project out DINOv3 positional bias; enable for cross-image
+  min_crop: 16                    # px size floor — the ONLY geometric stop (no depth cap)
+  max_total_embeds: 512           # global embed budget (safety cap)
 
 eval:
   targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (set debias: true)
-  max_exemplars: 3
+  max_exemplars: 3                # exemplar prompts drawn from the dataset = bank size (eval
+                                  #   protocol knob, NOT an algorithm param; per-crop pooling
+                                  #   from the bank is foveate.insid3_top_k_exemplars)
   limit: null
   visualize: 20                   # render prompt|GT|prediction overlays for the first N images
                                   #   (int caps count, true/"all" = every image, false = off);

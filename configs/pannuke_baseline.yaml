@@ -26,6 +26,7 @@ backbone:
 
 data:
   name: pannuke
+  label: pannuke                 # dataset name for MLflow logging/filtering
   root: /data/pannuke             # point at the directory containing images.npy + masks.npy
   categories: [Neoplastic]        # or [] for all five classes; names are case-insensitive
   min_instances: 2
@@ -37,25 +38,40 @@ data:
   # options:
   #   fold_dirs: [fold1, fold2, fold3]
 
-foveate:
-  standardize: true
+foveate:                          # full algorithm knob set (mirrors frontend/app.py)
+  # --- features ---
+  standardize: true               # z-score feature dims before L2-norm
+  # --- INSID3 foreground extractor (WHERE is the concept on a crop) ---
   foreground_extractor: insid3    # insid3 (default) | bank — "where is the class" on a crop
-  # --- INSID3 foreground extractor (WHERE) ---
   insid3_tau: 0.6                 # fine-grained clustering similarity threshold
   insid3_aggregate_threshold: 0.2 # alpha: min combined score to merge a cluster into the object
   insid3_crop_reference: true     # crop ref image+mask to each exemplar bbox (scale-match crops)
-  # --- acceptance & splitting (WHAT): touching nuclei are the canonical clump case — a converged
-  #     crop is kept as ONE nucleus unless splitting makes the sub-crops MORE exemplar-like.
-  #     cls_threshold is the class FLOOR (reject below it, not the accept test). ---
-  cls_threshold: 0.5              # reject floor on mean cos(crop CLS, exemplar CLS bank)
-  split_aggregate: mean           # mean | max | min — how sub-crop CLS is pooled vs the parent
-  split_margin: 0.0               # keep a split only if pooled child CLS beats the parent by this
-  boundary_smooth_sigma: 0.0      # Gaussian (patches) on watershed maps; try 0.5–1.0 for nuclei
-  # --- recursion / cost ---
+  insid3_top_k_exemplars: 1       # per crop, run INSID3 on the K bank exemplars most CLS-similar
+                                  #   to it (1 = standard single-exemplar INSID3). This is the
+                                  #   ALGORITHM's pooling knob; eval.max_exemplars sizes the bank.
+  insid3_dynamic_params: false    # derive tau/aggregate from the crop↔exemplar CLS sim s
+                                  #   (overrides the two static values above)
+  insid3_tau_scale: 0.7           #   dynamic: tau = tau_scale * s (raw s≈1 over-segments)
+  insid3_aggregate_scale: 0.3     #   dynamic: aggregate_threshold = aggregate_scale * (1 - s)
+  # --- positional debiasing (cross-image matching) ---
   debias: false                   # project out DINOv3 positional bias; enable for cross-image
+  debias_subspace_dim: 8          # rank of the positional subspace projected out
+  # --- acceptance & splitting (WHAT): touching nuclei are the canonical clump case. A converged
+  #     crop is ALWAYS split k=2; the split is kept when its best sub-crop beats the parent, then
+  #     every sub-crop above cls_threshold is kept. cls_threshold is the class FLOOR. ---
+  cls_threshold: 0.5              # reject floor on mean cos(crop CLS, exemplar CLS bank)
+  split_mode: kmeans              # kmeans (k=2 on features, always splits) | watershed | none
+  zoom_split_retry_eps: 0.01      # a zoom peaking by < eps tries ONE k=2 split of the parent
+                                  #   before emitting (it may be a clump); 0 disables
+  boundary_smooth_sigma: 0.0      # Gaussian (patches) on watershed maps; try 0.5–1.0 for nuclei
+  # --- duplicate suppression: nested k=2 sub-crops can re-find one object down two branches;
+  #     a final NMS keeps the best. Set both to 1.0 to disable. ---
+  nms_iou: 0.5                    # suppress a lower-scored leaf above this mask IoU with a kept one
+  nms_containment: 0.7            # ...or contained in a kept one beyond this fraction of its area
+  # --- recursion / cost ---
   min_crop: 16                    # nuclei can be small (< 20 px)
   cascade_min_instance_area: 8    # reject fragments smaller than 8 px²
-  max_total_embeds: 256
+  max_total_embeds: 256           # global embed budget (safety cap)
   # --- bank extractor only (used when foreground_extractor: bank) ---
   gate_threshold: 0.5
   gate_threshold_mode: otsu       # static | otsu | gmm2 | percentile
@@ -64,7 +80,9 @@ foveate:
 
 eval:
   targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (set debias: true)
-  max_exemplars: 3
+  max_exemplars: 3                # exemplar prompts drawn from the dataset = bank size (eval
+                                  #   protocol knob, NOT an algorithm param; per-crop pooling
+                                  #   from the bank is foveate.insid3_top_k_exemplars)
   limit: null
 
 mlflow:

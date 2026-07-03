@@ -16,6 +16,7 @@ run_name: sam3_pannuke
 
 data:
   name: pannuke
+  label: pannuke                 # dataset name for MLflow logging/filtering
   root: /data/pannuke             # directory containing images.npy + masks.npy
   categories: [Neoplastic]        # or [] for all five classes; names are case-insensitive
   min_instances: 2

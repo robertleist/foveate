@@ -10,6 +10,7 @@ backbone:
 
 data:
   name: synthetic
+  label: synthetic                 # dataset name for MLflow logging/filtering
   categories: []          # all colour categories
   min_instances: 2
   train_images: 6         # intra pool (same-image discovery)
@@ -22,24 +23,40 @@ data:
     n_instances: 4
     n_categories: 2
 
-foveate:
+foveate:                    # full algorithm knob set (mirrors frontend/app.py)
   standardize: false        # MockBackbone features are colour-based; z-scoring destroys the signal
+  # --- INSID3 foreground extractor (WHERE) ---
   foreground_extractor: insid3   # insid3 (default) | bank
   insid3_tau: 0.6
   insid3_aggregate_threshold: 0.2
   insid3_crop_reference: true
+  insid3_top_k_exemplars: 1    # per-crop pooling from the bank (1 = standard INSID3);
+                               #   eval.max_exemplars sizes the bank itself
+  insid3_dynamic_params: false # derive tau/aggregate from crop↔exemplar CLS sim (overrides above)
+  insid3_tau_scale: 0.7
+  insid3_aggregate_scale: 0.3
+  # --- positional debiasing ---
+  debias: false             # mock features carry no DINOv3 positional bias
+  debias_subspace_dim: 8
+  # --- acceptance & splitting (WHAT) ---
   cls_threshold: 0.0        # class FLOOR; 0.0 = never reject on it (mock CLS is coarse)
-  split_aggregate: mean     # mean | max | min — sub-crop CLS pooled vs parent in the split test
-  split_margin: 0.0         # a clump split is kept only if it beats the parent CLS by this
-  boundary_smooth_sigma: 0.0  # Gaussian (patches) smoothing watershed maps; >0 = fewer fragments
+  split_mode: kmeans        # kmeans (k=2, always splits) | watershed | none
+  zoom_split_retry_eps: 0.01  # near-flat zoom peak retries ONE k=2 split; 0 disables
+  boundary_smooth_sigma: 0.0  # Gaussian (patches) on watershed maps (split_mode: watershed only)
+  # --- duplicate suppression (final NMS; both 1.0 = off) ---
+  nms_iou: 0.5
+  nms_containment: 0.7
+  # --- recursion / cost ---
   min_crop: 24
   cascade_min_instance_area: 4
-  gate_threshold: 0.4       # bank extractor only
-  prototype_reduction: all  # bank extractor only
+  # --- bank extractor only ---
+  gate_threshold: 0.4
+  prototype_reduction: all
 
 eval:
   targets: [intra, inter]   # intra = same-image discovery; inter = cross-image
-  max_exemplars: 2
+  max_exemplars: 2          # exemplar prompts drawn from the dataset = bank size (eval protocol
+                            #   knob; per-crop pooling is foveate.insid3_top_k_exemplars)
   limit: null
   visualize: all            # int caps count, true/"all" renders every image, false disables
   cascade_trace: 2          # contact sheet of the recursive zoom (same budget semantics)

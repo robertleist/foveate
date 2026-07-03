@@ -10,6 +10,7 @@ backbone:
 
 data:
   name: synthetic
+  label: synthetic                 # dataset name for MLflow logging/filtering
   categories: []
   min_instances: 2
   train_images: 6
@@ -21,18 +22,36 @@ data:
     n_instances: 4
     n_categories: 2
 
-foveate:
+foveate:                    # full algorithm knob set (mirrors frontend/app.py)
   standardize: false        # MockBackbone features are colour-based; z-scoring destroys the signal
+  # --- INSID3 foreground extractor (WHERE); tau + aggregate_threshold swept below ---
   foreground_extractor: insid3
   insid3_crop_reference: true
+  insid3_top_k_exemplars: 1    # per-crop pooling from the bank (1 = standard INSID3);
+                               #   eval.max_exemplars sizes the bank itself
+  insid3_dynamic_params: false # derive tau/aggregate from crop↔exemplar CLS sim (overrides sweep)
+  insid3_tau_scale: 0.7
+  insid3_aggregate_scale: 0.3
+  # --- positional debiasing ---
+  debias: false             # mock features carry no DINOv3 positional bias
+  debias_subspace_dim: 8
+  # --- acceptance & splitting (WHAT), held at defaults to isolate the WHERE ablation ---
   cls_threshold: 0.0        # class FLOOR = 0 to isolate the foreground-extraction ablation
-                            # (split_margin / split_aggregate / boundary_smooth_sigma at defaults)
+  split_mode: kmeans        # kmeans (k=2, always splits) | watershed | none
+  zoom_split_retry_eps: 0.01  # near-flat zoom peak retries ONE k=2 split; 0 disables
+  boundary_smooth_sigma: 0.0  # Gaussian (patches) on watershed maps (split_mode: watershed only)
+  # --- duplicate suppression (final NMS; both 1.0 = off) ---
+  nms_iou: 0.5
+  nms_containment: 0.7
+  # --- recursion / cost ---
   min_crop: 24
   cascade_min_instance_area: 4
-  gate_threshold: 0.4       # bank extractor only
+  # --- bank extractor only ---
+  gate_threshold: 0.4
 
 eval:
-  max_exemplars: 2
+  max_exemplars: 2          # exemplar prompts drawn from the dataset = bank size (eval protocol
+                            #   knob; per-crop pooling is foveate.insid3_top_k_exemplars)
 
 mlflow:
   enabled: true

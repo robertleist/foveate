@@ -11,15 +11,15 @@
 # Intra runs always prompt SAM 3 with boxes derived from the exemplar masks on the same image.
 #
 #   python -m experiments.run --config configs/sam3_coco.yaml
-run_name: sam3_coco
+run_name: sam3_corals
 
 data:
-  name: coco
-  label: coco                 # dataset name for MLflow logging/filtering
-  root: /data/robert/coco
-  annotation_file: annotations/instances_train2017.json
-  images_dir: train2017
-  categories: [person]
+  name: coco                    # registry key (the corals dataset is COCO-format)
+  label: corals                 # dataset name for MLflow logging/filtering
+  root: /data/robert/hifmb_corals
+  annotation_file: annotations.json
+  images_dir: images
+  categories: [Coral Fragment]
   min_instances: 2
   train_images: 20        # intra pool (same-image discovery)
   interval_images: 10     # disjoint novel images for cross-image (inter) eval
@@ -34,15 +34,20 @@ method:
 
 eval:
   targets: [intra, inter]         # intra = same-image; inter = cross-image (concat/text prompting)
-  max_exemplars: 3
+  max_exemplars: 1000
   limit: null
   visualize: 10                   # render prompt|GT|prediction overlays for the first N images
   cascade_trace: 0                # SAM 3 has no recursive cascade
 
 mlflow:
   enabled: true
-  experiment_name: foveate-coco   # same experiment as foveate so SAM 3 sits beside it
+  experiment_name: foveate@eccv # same experiment as foveate so SAM 3 sits beside it
   tracking_uri: null              # overrides MLFLOW_TRACKING_URI; null -> ./mlruns
   username: null                  # overrides MLFLOW_TRACKING_USERNAME
   password: null                  # overrides MLFLOW_TRACKING_PASSWORD
   dotenv: null                    # explicit .env path; null -> looks for ./.env
+
+sweep:
+  data.train_images: [1, 3, 10]
+  method.threshold: [0.3, 0.5]
+  method.inter_mode: [concat, text]
