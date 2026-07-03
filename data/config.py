@@ -15,6 +15,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 class DataConfig:
     # --- which dataset ---
     name: str                                   # registry key, e.g. "coco", "pannuke"
+    label: Optional[str] = None                 # human-readable dataset name (e.g. "corals",
+                                                # "polyps") — logging/plots only; several datasets
+                                                # share the "coco" registry key
     root: Optional[str] = None                  # raw-data root (None for auto-download sources)
     annotation_file: Optional[str] = None       # source-specific (COCO JSON path, relative to root)
     images_dir: Optional[str] = None            # source-specific (image subdir, relative to root)

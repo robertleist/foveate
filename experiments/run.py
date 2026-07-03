@@ -174,6 +174,18 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
         with _mlflow_run(config.get("mlflow", {}), config.get("run_name")) as mlflow:
             if mlflow is not None:
                 params = {}
+                # Which method produced this run (foveate | sam3 | semantic_cc | ...) and which
+                # dataset it ran on — logged as both a param and a tag so runs group/filter by
+                # model x dataset in the MLflow UI. The dataset name prefers the explicit
+                # data.label (several datasets share the "coco" registry key), then the root
+                # folder name, then the registry key.
+                dataset = (config["data"].get("label")
+                           or Path(str(config["data"].get("root") or "")).name
+                           or config["data"].get("name", ""))
+                params["model"] = method_kind
+                params["dataset"] = dataset
+                mlflow.set_tag("model", method_kind)
+                mlflow.set_tag("dataset", dataset)
                 params.update(_flatten_params("backbone", config.get("backbone", {})))
                 params.update(_flatten_params("data", config["data"]))
                 # Resolved per-method blocks (e.g. the full foveate Config, defaults included)
