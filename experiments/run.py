@@ -97,8 +97,27 @@ def _mlflow_run(mlflow_cfg: dict[str, Any], run_name: str | None):
     if cfg.get("password"):
         os.environ.setdefault("MLFLOW_TRACKING_PASSWORD", cfg["password"])
 
-    mlflow.set_experiment(cfg.get("experiment_name", "foveate"))
-    with mlflow.start_run(run_name=run_name):
+    # Validate the connection *now* (before the long eval) so a bad URI / unreachable server
+    # fails fast with a clear message instead of after all the work is done. set_experiment and
+    # start_run both round-trip to the tracking backend.
+    resolved_uri = mlflow.get_tracking_uri()
+    try:
+        mlflow.set_experiment(cfg.get("experiment_name", "foveate"))
+    except Exception as exc:  # noqa: BLE001 — surface connection/auth problems up front
+        print(f"[run] MLflow: could NOT connect to tracking backend '{resolved_uri}' "
+              f"({type(exc).__name__}: {exc}). Fix the connection or set mlflow.enabled=false.")
+        raise
+    # log_system_metrics samples CPU / RAM / GPU utilization + per-GPU memory on a background
+    # thread for the run's lifetime — the inference-cost signal the paper needs. Needs psutil
+    # (and nvidia-ml-py for GPU); mlflow warns and continues if they're missing. Sample every 5s
+    # (default 10s) so shorter runs still capture a few points; long paper runs get a dense trace.
+    try:
+        mlflow.set_system_metrics_sampling_interval(5)
+    except Exception:  # noqa: BLE001 — older mlflow without the setter; default interval is fine
+        pass
+    with mlflow.start_run(run_name=run_name, log_system_metrics=True) as active:
+        print(f"[run] MLflow: connected to '{resolved_uri}' | experiment "
+              f"'{cfg.get('experiment_name', 'foveate')}' | run_id {active.info.run_id}")
         yield mlflow
 
 
@@ -146,14 +165,46 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
     # uploaded stale masks/overlays from earlier datasets; a temp dir is empty every time.
     backbone_kind = (config.get("backbone") or {}).get("type", "dino")
     method_kind = (config.get("method") or {}).get("type", "foveate")
+
+    # Report the compute device before any embedding so a silent CPU fallback (which makes runs
+    # ~10-100x slower) is visible immediately, not inferred from the runtime afterwards.
+    print(f"[run] compute device: {_device_str(method)}")
+
     result: dict[str, Any] = {}
-    with tempfile.TemporaryDirectory(prefix="foveate-run-") as tmp:
+    # Open the MLflow run FIRST (validates the connection up front and logs params before the
+    # long eval), then run the protocols inside it, then log metrics + artifacts at the end.
+    with tempfile.TemporaryDirectory(prefix="foveate-run-") as tmp, \
+            _mlflow_run(config.get("mlflow", {}), config.get("run_name")) as mlflow:
         output_dir = Path(tmp)
 
         print(f"[run] '{config.get('run_name', 'run')}': method={method_kind} "
               f"backbone={backbone_kind} data={data_cfg.name} targets={targets} "
               f"intra_pool={len(intra_ds)} inter_pool={len(inter_ds) if inter_ds else 0} "
               f"-> {output_dir}")
+
+        if mlflow is not None:
+            # Log params up front: the connection is already validated, and params survive even
+            # if the eval later crashes. Metrics + artifacts are logged after eval completes.
+            # Which method produced this run (foveate | sam3 | semantic_cc | ...) and which
+            # dataset it ran on — logged as both a param and a tag so runs group/filter by
+            # model x dataset in the MLflow UI. The dataset name prefers the explicit data.label
+            # (several datasets share the "coco" registry key), then the root folder name, then
+            # the registry key.
+            dataset = (config["data"].get("label")
+                       or Path(str(config["data"].get("root") or "")).name
+                       or config["data"].get("name", ""))
+            params: dict[str, Any] = {"model": method_kind, "dataset": dataset}
+            mlflow.set_tag("model", method_kind)
+            mlflow.set_tag("dataset", dataset)
+            params.update(_flatten_params("backbone", config.get("backbone", {})))
+            params.update(_flatten_params("data", config["data"]))
+            # Resolved per-method blocks (e.g. the full foveate Config, defaults included)
+            # keep new runs comparable with pre-abstraction MLflow runs.
+            for block_name, block in method.param_blocks().items():
+                params.update(_flatten_params(block_name, block))
+            params.update(_flatten_params("method", config.get("method", {}) or {}))
+            params.update(_flatten_params("eval", eval_cfg))
+            mlflow.log_params(params)
 
         if "intra" in targets:
             items = iter_intra_items(intra_ds, max_exemplars=max_exemplars, limit=limit)
@@ -171,35 +222,24 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
         (output_dir / "metrics.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         print(json.dumps(result, indent=2))
 
-        with _mlflow_run(config.get("mlflow", {}), config.get("run_name")) as mlflow:
-            if mlflow is not None:
-                params = {}
-                # Which method produced this run (foveate | sam3 | semantic_cc | ...) and which
-                # dataset it ran on — logged as both a param and a tag so runs group/filter by
-                # model x dataset in the MLflow UI. The dataset name prefers the explicit
-                # data.label (several datasets share the "coco" registry key), then the root
-                # folder name, then the registry key.
-                dataset = (config["data"].get("label")
-                           or Path(str(config["data"].get("root") or "")).name
-                           or config["data"].get("name", ""))
-                params["model"] = method_kind
-                params["dataset"] = dataset
-                mlflow.set_tag("model", method_kind)
-                mlflow.set_tag("dataset", dataset)
-                params.update(_flatten_params("backbone", config.get("backbone", {})))
-                params.update(_flatten_params("data", config["data"]))
-                # Resolved per-method blocks (e.g. the full foveate Config, defaults included)
-                # keep new runs comparable with pre-abstraction MLflow runs.
-                for block_name, block in method.param_blocks().items():
-                    params.update(_flatten_params(block_name, block))
-                params.update(_flatten_params("method", config.get("method", {}) or {}))
-                params.update(_flatten_params("eval", eval_cfg))
-                mlflow.log_params(params)
-                mlflow.log_metrics({k: float(v) for k, v in result.items()
-                                    if isinstance(v, (int, float)) and not np.isnan(float(v))})
-                mlflow.log_artifacts(str(output_dir))
+        if mlflow is not None:
+            mlflow.log_metrics({k: float(v) for k, v in result.items()
+                                if isinstance(v, (int, float)) and not np.isnan(float(v))})
+            mlflow.log_artifacts(str(output_dir))
 
     return result
+
+
+def _device_str(method: Method) -> str:
+    """Human-readable compute device + dtype for the method's backbone (best effort).
+
+    Methods expose the device differently — feature methods via ``method.backbone.device``,
+    SAM 3 via ``method.device`` — so probe both. Returns e.g. ``cuda:0 (torch.float32)``.
+    """
+    backbone = getattr(method, "backbone", None)
+    device = getattr(backbone, "device", None) or getattr(method, "device", None) or "unknown"
+    dtype = getattr(backbone, "dtype", None)
+    return f"{device} ({dtype})" if dtype is not None else str(device)
 
 
 def _evaluate(method: Method, items, output_dir: Path, prefix: str,

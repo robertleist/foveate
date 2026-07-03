@@ -268,6 +268,7 @@ def discover_instances(
     *,
     exemplar_image: np.ndarray | None = None,
     exemplar_images: list[np.ndarray] | None = None,
+    extractor=None,
     observer=None,
 ) -> tuple[list[Instance], Stats]:
     """Discover instances of the exemplar class by recursive, batched zoom-in.
@@ -287,6 +288,14 @@ def discover_instances(
         mask lives on (each exemplar is cropped from its own image; the reference banks are
         stacked across images). Mutually exclusive with ``exemplar_image``; implies the
         cross-image setting (enable ``config.debias``).
+    extractor:
+        Optional pre-built foreground extractor with its reference already set (see
+        :func:`foveate.foreground.build_extractor` + ``set_reference``). When the same exemplar
+        bank is reused across many target images — the cross-image (inter) protocol, where the
+        support is identical for every target of a class — building it once and passing it in
+        skips re-embedding every exemplar crop per image. ``None`` (default) builds and sets the
+        reference here, as before. The caller is responsible for passing an extractor whose
+        reference matches ``exemplar_image`` / ``exemplar_images``.
     observer:
         Optional ``callable(info: dict)`` invoked once per processed region for tracing.
     """
@@ -302,11 +311,14 @@ def discover_instances(
 
     # Foreground extractor: set the reference (image(s) + exemplar masks) once, then predict the
     # class region on every target crop. This is the INSID3 reference-at-gating-time flow.
-    extractor = build_extractor(cfg)
-    ref_image = exemplar_images if multi else (image if same_image else exemplar_image)
-    extractor.set_reference(backbone, ref_image, exemplar_masks, negative_masks, cfg)
+    # A caller reusing one bank across images (inter) may hand in a pre-built extractor, so the
+    # exemplar crops are embedded once, not per target image.
+    if extractor is None:
+        extractor = build_extractor(cfg)
+        ref_image = exemplar_images if multi else (image if same_image else exemplar_image)
+        extractor.set_reference(backbone, ref_image, exemplar_masks, negative_masks, cfg)
+        stats.n_embeds += 1
     cls_bank = extractor.cls_bank                       # (S, D) L2-normalized exemplar CLS
-    stats.n_embeds += 1
 
     def classify(cls: torch.Tensor) -> float:
         """Mean cosine of the crop's CLS to all exemplar CLS — the "what is in the bbox" test."""

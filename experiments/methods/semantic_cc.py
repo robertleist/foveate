@@ -111,6 +111,32 @@ class SemanticCCMethod(Method):
         if self.connectivity not in (4, 8):
             raise ValueError(f"connectivity must be 4 or 8, got {self.connectivity}")
         self.score_mode = str(self.method_config.get("score_mode", "mean_prob"))
+        # Cross-image (inter) reuses one exemplar bank for every target of a class; cache the
+        # reference-set extractor so set_reference (which embeds every exemplar crop) runs once
+        # per class instead of once per target image.
+        self._ref_cache: dict = {}
+
+    def _reference_extractor(self, item: EvalItem):
+        """Build (or fetch from cache) the INSID3 extractor with its reference set for ``item``.
+
+        Intra exemplars live on the per-image target, so there is nothing to reuse — a fresh
+        extractor is built each call. Inter exemplars live on a shared support image, so the
+        extractor is cached by ``(support image, class)`` and reused across all targets.
+        """
+        cfg = self.foveate_config
+        # ref_image is where the exemplar masks live: the target itself (intra) or the support.
+        ref_image = item.image if item.exemplar_image is None else item.exemplar_image
+        if item.exemplar_image is None:                 # intra: per-image exemplars, no caching
+            extractor = build_extractor(cfg)
+            extractor.set_reference(self.backbone, ref_image, item.exemplar_masks, None, cfg)
+            return extractor
+        key = (id(item.exemplar_image), item.class_id)
+        extractor = self._ref_cache.get(key)
+        if extractor is None:
+            extractor = build_extractor(cfg)
+            extractor.set_reference(self.backbone, ref_image, item.exemplar_masks, None, cfg)
+            self._ref_cache[key] = extractor
+        return extractor
 
     def predict(
         self, item: EvalItem, observer: Callable[[dict], None] | None = None
@@ -120,11 +146,8 @@ class SemanticCCMethod(Method):
 
         # --- single-pass WHERE: INSID3 foreground on the FULL target image, no recursion ---
         feats = featlib.embed_image(self.backbone, item.image, standardize=cfg.standardize)
-        extractor = build_extractor(cfg)
-        # ref_image is where the exemplar masks live: the target itself (intra) or the support
-        # image (inter). This is the same set_reference call the cascade root makes.
-        ref_image = item.image if item.exemplar_image is None else item.exemplar_image
-        extractor.set_reference(self.backbone, ref_image, item.exemplar_masks, None, cfg)
+        # The reference (exemplar bank) is built once and, for inter, reused across targets.
+        extractor = self._reference_extractor(item)
         n_embeds = 1                                   # one target forward; reference embeds are
         # extractor-internal and not tracked here, so this is a lower bound like the pipeline's.
         gate = extractor.predict(feats)                # single-pass; no cls => pooled reference

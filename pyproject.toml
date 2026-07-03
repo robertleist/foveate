@@ -27,7 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dino = ["transformers>=4.56", "huggingface-hub"]                 # default backbone
-exp = ["pycocotools", "matplotlib", "pyyaml", "pandas", "mlflow", "tqdm", "pillow", "python-dotenv"]  # experiments
+exp = ["pycocotools", "matplotlib", "pyyaml", "pandas", "mlflow", "tqdm", "pillow", "python-dotenv", "psutil", "nvidia-ml-py"]  # experiments (psutil + nvidia-ml-py: MLflow system-metrics + GPU logging)
 frontend = ["streamlit", "streamlit-drawable-canvas", "matplotlib", "pillow"]  # streamlit viz app
 dev = ["pytest", "ruff"]
 
