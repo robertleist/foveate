@@ -34,7 +34,7 @@ foveate:                  # any foveate.Config field — full algorithm knob set
   insid3_top_k_exemplars: 1       # per crop, run INSID3 on the K bank exemplars most CLS-similar
                                   #   to it (1 = standard single-exemplar INSID3). This is the
                                   #   ALGORITHM's pooling knob; eval.max_exemplars sizes the bank.
-  insid3_dynamic_params: true    # derive tau/aggregate from the crop↔exemplar CLS sim s
+  insid3_dynamic_params: false    # derive tau/aggregate from the crop↔exemplar CLS sim s
                                   #   (overrides the two static values above)
   insid3_tau_scale: 0.7           #   dynamic: tau = tau_scale * s (raw s≈1 over-segments)
   insid3_aggregate_scale: 0.3     #   dynamic: aggregate_threshold = aggregate_scale * (1 - s)
@@ -60,10 +60,7 @@ foveate:                  # any foveate.Config field — full algorithm knob set
 
 eval:
   targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (all non-train)
-  max_exemplars: null             # exemplar-prompt cap = bank size; null = UNLIMITED (every known
-                                  #   instance of the class; for inter that means all known masks
-                                  #   of the single best support image). Per-crop pooling from the
-                                  #   bank is foveate.insid3_top_k_exemplars.
+  max_exemplars: 5                
   limit: null
   visualize: 8                    # render prompt|GT|prediction overlays for the first N images
   cascade_trace: 0                # contact sheet of the recursive zoom for the first N images
@@ -84,6 +81,3 @@ mlflow:
 sweep:
   data.train_images: [1, 3, 10]
   foveate.split_mode: [kmeans, none]
-  foveate.insid3_top_k_exemplars: [1, 3]
-  foveate.insid3_tau_scale: [0.1, 0.3, 0.5]          #   dynamic: tau = tau_scale * s (raw s≈1 over-segments)
-  foveate.insid3_aggregate_scale: [0.1, 0.3, 0.5]     #   dynamic: aggregate_threshold = aggregate_scale * (1 - s)

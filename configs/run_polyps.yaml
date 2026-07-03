@@ -15,7 +15,7 @@ data:
   name: coco                    # registry key (the polyps dataset is COCO-format)
   label: polyps                 # dataset name for MLflow logging/filtering
   root: /data/robert/hifmb_polyps
-  annotation_file: Corals_coco.json
+  annotation_file: annotations.json
   images_dir: images
   categories: [Polyps]
   min_instances: 2
