@@ -56,7 +56,7 @@ foveate:                  # any foveate.Config field — full algorithm knob set
   nms_containment: 0.7
   # --- recursion / cost ---
   min_crop: 16                    # px size floor — the ONLY geometric stop (no depth cap)
-  max_total_embeds: 2048          # global embed budget (safety cap)
+  max_total_embeds: 512          # global embed budget (safety cap)
 
 eval:
   targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (all non-train)
