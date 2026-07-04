@@ -81,5 +81,5 @@ mlflow:
 sweep:
   data.train_images: [10]
   foveate.split_mode: [kmeans, none]
-  foveate.insid3_tau: [0.1, 0.3, 0.5]                # fine-grained clustering similarity threshold; swept below
-  foveate.insid3_aggregate_threshold: [0.1, 0.3, 0.5]  # alpha: min combined score to merge a cluster; swept below
+  foveate.insid3_tau: [0.25, 0.3, 0.35]                # fine-grained clustering similarity threshold; swept below
+  foveate.insid3_aggregate_threshold: [0.05, 0.1, 0.15]  # alpha: min combined score to merge a cluster; swept below
