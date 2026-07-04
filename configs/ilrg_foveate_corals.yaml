@@ -80,6 +80,6 @@ mlflow:
 # Each run evaluates cross-image on ALL images not in its train pool (interval_images: -1).
 sweep:
   data.train_images: [10]
-  foveate.split_mode: [kmeans, none]
+  foveate.split_mode: [kmeans]
   foveate.insid3_tau: [0.25, 0.3, 0.35]                # fine-grained clustering similarity threshold; swept below
   foveate.insid3_aggregate_threshold: [0.05, 0.1, 0.15]  # alpha: min combined score to merge a cluster; swept below
