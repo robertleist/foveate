@@ -89,6 +89,6 @@ sweep:
   data.train_images: [1]
   foveate.split_mode: [kmeans]
   foveate.insid3_top_k_exemplars: [1]
-  foveate.insid3_tau: [0.99, 0.995, 1.0]
-  foveate.insid3_aggregate_threshold: [0.1, 0.2]
+  foveate.insid3_tau: [0.99, 0.9925, 0.995]
+  foveate.insid3_aggregate_threshold: [0.01, 0.05, 0.1]
 
