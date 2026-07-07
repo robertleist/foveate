@@ -48,7 +48,8 @@ def _results_equal(a: dict, b: dict) -> bool:
     if a.keys() != b.keys():
         return False
     for k in a:
-        if k.endswith("_mean_runtime_s"):   # wall-clock — never bit-identical across runs
+        # Wall-clock / throughput — never bit-identical across runs.
+        if k.endswith(("_runtime_s", "_throughput_img_s")):
             continue
         va, vb = a[k], b[k]
         if isinstance(va, float) and math.isnan(va):

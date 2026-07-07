@@ -560,13 +560,15 @@ if run and ref_image is not None and exemplar_masks:
         gt = np.stack([np.asarray(m, dtype=bool) for m in gt_masks])
         with st.spinner("Evaluating predictions", show_time=True):
             metrics = evaluate([ImagePrediction(masks=pmasks, scores=pscores)], [gt])
-        mc = st.columns(6)
-        mc[0].metric("AP", f"{metrics.ap:.3f}", help="mean over IoU 0.50:0.95")
-        mc[1].metric("AP@50", f"{metrics.ap50:.3f}")
-        mc[2].metric("AP@75", f"{metrics.ap75:.3f}")
-        mc[3].metric("mean IoU", f"{metrics.mean_iou:.3f}", help="mean IoU of matched pairs")
-        mc[4].metric("PQ", f"{metrics.pq:.3f}", help="panoptic quality")
-        mc[5].metric("#pred / #gt", f"{metrics.n_pred} / {metrics.n_gt}")
+        mc = st.columns(7)
+        mc[0].metric("AP", f"{metrics.ap:.3f}", help="mask AP, mean over IoU 0.50:0.95")
+        mc[1].metric("AP@50", f"{metrics.ap50:.3f}", help="mask AP@50")
+        mc[2].metric("box AP", f"{metrics.box_ap:.3f}",
+                     help="detection AP over box IoU, mean 0.50:0.95")
+        mc[3].metric("box AP@50", f"{metrics.box_ap50:.3f}", help="detection AP@50")
+        mc[4].metric("mean IoU", f"{metrics.mean_iou:.3f}", help="mean IoU of matched pairs")
+        mc[5].metric("PQ", f"{metrics.pq:.3f}", help="panoptic quality")
+        mc[6].metric("#pred / #gt", f"{metrics.n_pred} / {metrics.n_gt}")
     ic0, ic1, ic2 = st.columns(3)
     with st.spinner("Loading prediction plot", show_time=True):
         final_pred = target_image

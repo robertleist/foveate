@@ -236,10 +236,48 @@ def _device_str(method: Method) -> str:
     Methods expose the device differently — feature methods via ``method.backbone.device``,
     SAM 3 via ``method.device`` — so probe both. Returns e.g. ``cuda:0 (torch.float32)``.
     """
+    device = _method_device(method) or "unknown"
     backbone = getattr(method, "backbone", None)
-    device = getattr(backbone, "device", None) or getattr(method, "device", None) or "unknown"
     dtype = getattr(backbone, "dtype", None)
     return f"{device} ({dtype})" if dtype is not None else str(device)
+
+
+def _method_device(method: Method):
+    """The method's compute device (``method.backbone.device`` or ``method.device``), or None."""
+    backbone = getattr(method, "backbone", None)
+    return getattr(backbone, "device", None) or getattr(method, "device", None)
+
+
+def _cuda_device(method: Method):
+    """The method's CUDA device if it is on one, else None (memory tracking is CUDA-only)."""
+    try:
+        import torch
+    except Exception:
+        return None
+    device = _method_device(method)
+    if device is None:
+        return None
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+    return device
+
+
+def _reset_peak_gpu_mem(method: Method) -> None:
+    """Zero the peak-allocated counter so the next window measures this eval only (no-op on CPU)."""
+    device = _cuda_device(method)
+    if device is not None:
+        import torch
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def _peak_gpu_mem_mb(method: Method) -> float:
+    """Peak GPU memory allocated since the last reset, in MiB (NaN when not on CUDA)."""
+    device = _cuda_device(method)
+    if device is None:
+        return float("nan")
+    import torch
+    return torch.cuda.max_memory_allocated(device) / (1024 ** 2)
 
 
 def _evaluate(method: Method, items, output_dir: Path, prefix: str,
@@ -250,8 +288,10 @@ def _evaluate(method: Method, items, output_dir: Path, prefix: str,
     predictions: list[evallib.ImagePrediction] = []
     gts: list[np.ndarray] = []
     recoveries: list[float] = []
+    times: list[float] = []
     total_embeds, total_time, n_items = 0, 0.0, 0
     total_pred = 0
+    _reset_peak_gpu_mem(method)
 
     def _budget(flag: Any) -> float:
         return float("inf") if flag in (True, "all") else int(flag or 0)
@@ -272,6 +312,7 @@ def _evaluate(method: Method, items, output_dir: Path, prefix: str,
             recoveries.append(evallib.exemplar_recovery_iou(pred, item.exemplar_masks))
         total_embeds += n_embeds
         total_time += elapsed
+        times.append(elapsed)
         total_pred += pred.masks.shape[0]
         n_items += 1
         np.savez_compressed(
@@ -303,11 +344,27 @@ def _evaluate(method: Method, items, output_dir: Path, prefix: str,
         float(np.nanmean(recoveries)) if recoveries else float("nan")
     )
     out[f"{prefix}_mean_embeds"] = total_embeds / max(n_items, 1)
-    out[f"{prefix}_mean_runtime_s"] = total_time / max(n_items, 1)
     out[f"{prefix}_n_images"] = n_items
+
+    # Inference time. ``mean_runtime_s`` is kept for continuity; median is the more robust
+    # per-image figure for the paper (the first image pays one-off warmup), and throughput is
+    # the headline efficiency number. Peak GPU memory rounds out the accuracy/latency/memory trio.
+    t = np.asarray(times, dtype=np.float64)
+    out[f"{prefix}_mean_runtime_s"] = float(t.mean()) if t.size else float("nan")
+    out[f"{prefix}_median_runtime_s"] = float(np.median(t)) if t.size else float("nan")
+    out[f"{prefix}_std_runtime_s"] = float(t.std()) if t.size else float("nan")
+    out[f"{prefix}_total_runtime_s"] = float(t.sum())
+    out[f"{prefix}_throughput_img_s"] = float(t.size / t.sum()) if t.sum() > 0 else float("nan")
+    peak_mem_mb = _peak_gpu_mem_mb(method)
+    out[f"{prefix}_peak_gpu_mem_mb"] = peak_mem_mb
+
+    mem_str = f" {peak_mem_mb:.0f}MB peak" if not np.isnan(peak_mem_mb) else ""
     print(f"[run] {prefix}: {n_items} imgs | AP={metrics.ap:.3f} AP50={metrics.ap50:.3f} "
+          f"boxAP={metrics.box_ap:.3f} boxAP50={metrics.box_ap50:.3f} "
           f"PQ={metrics.pq:.3f} mIoU={metrics.mean_iou:.3f} "
-          f"count_err={metrics.count_error:.2f} | {total_embeds / max(n_items, 1):.0f} embeds/img")
+          f"count_err={metrics.count_error:.2f} | {total_embeds / max(n_items, 1):.0f} embeds/img "
+          f"{out[f'{prefix}_median_runtime_s']:.2f}s/img "
+          f"({out[f'{prefix}_throughput_img_s']:.1f} img/s){mem_str}")
     return out
 
 

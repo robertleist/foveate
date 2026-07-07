@@ -2,8 +2,9 @@
 
 Class-agnostic (the exemplar defines a single concept), mask-based:
 
-* **AP / AP50 / AP75** — COCO-style average precision over IoU thresholds, predictions ranked
-  by score, greedy IoU matching.
+* **AP / AP50 / AP75** — COCO-style average precision over mask-IoU thresholds, predictions
+  ranked by score, greedy IoU matching. ``box_ap*`` are the same, but over bounding-box IoU
+  (boxes derived from the masks) — i.e. detection rather than segmentation AP.
 * **Panoptic Quality (PQ)** — ``SQ × RQ`` with the IoU>0.5 unique-matching rule.
 * **mean IoU** — mean IoU over matched (TP) pairs.
 * **count error** — mean ``|n_pred - n_gt|`` and its relative form.
@@ -50,6 +51,43 @@ def iou_matrix(pred_masks: np.ndarray, gt_masks: np.ndarray) -> np.ndarray:
     return np.where(union > 0, inter / np.maximum(union, 1e-9), 0.0)
 
 
+def masks_to_boxes(masks: np.ndarray) -> np.ndarray:
+    """Tight bounding boxes ``[x0, y0, x1, y1]`` (x1/y1 exclusive) for ``(N, H, W)`` masks.
+
+    Empty masks map to a zero-area box, which yields zero IoU against anything.
+    """
+    m = _as_bool(masks)
+    boxes = np.zeros((m.shape[0], 4), dtype=np.float64)
+    for i in range(m.shape[0]):
+        ys, xs = np.where(m[i])
+        if ys.size == 0:
+            continue
+        boxes[i] = (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)
+    return boxes
+
+
+def box_iou_matrix(pred_boxes: np.ndarray, gt_boxes: np.ndarray) -> np.ndarray:
+    """Pairwise IoU between ``(N, 4)`` and ``(M, 4)`` boxes ``[x0, y0, x1, y1]`` → ``(N, M)``."""
+    pred = np.asarray(pred_boxes, dtype=np.float64).reshape(-1, 4)
+    gt = np.asarray(gt_boxes, dtype=np.float64).reshape(-1, 4)
+    if pred.shape[0] == 0 or gt.shape[0] == 0:
+        return np.zeros((pred.shape[0], gt.shape[0]), dtype=np.float64)
+    x0 = np.maximum(pred[:, None, 0], gt[None, :, 0])
+    y0 = np.maximum(pred[:, None, 1], gt[None, :, 1])
+    x1 = np.minimum(pred[:, None, 2], gt[None, :, 2])
+    y1 = np.minimum(pred[:, None, 3], gt[None, :, 3])
+    inter = np.clip(x1 - x0, 0.0, None) * np.clip(y1 - y0, 0.0, None)
+    area_p = ((pred[:, 2] - pred[:, 0]) * (pred[:, 3] - pred[:, 1]))[:, None]
+    area_g = ((gt[:, 2] - gt[:, 0]) * (gt[:, 3] - gt[:, 1]))[None, :]
+    union = area_p + area_g - inter
+    return np.where(union > 0, inter / np.maximum(union, 1e-9), 0.0)
+
+
+def box_iou_from_masks(pred_masks: np.ndarray, gt_masks: np.ndarray) -> np.ndarray:
+    """Box IoU ``(N, M)`` between predictions and GT, boxes derived from their masks."""
+    return box_iou_matrix(masks_to_boxes(pred_masks), masks_to_boxes(gt_masks))
+
+
 def _match(iou: np.ndarray, order: np.ndarray, threshold: float):
     """Greedy match detections (in ``order``) to GT at ``threshold``. Returns (tp, gt_matched)."""
     n_pred, n_gt = iou.shape
@@ -93,11 +131,47 @@ def _ap_from_pr(scores: np.ndarray, tp: np.ndarray, n_gt: int) -> float:
     return float(out.mean())
 
 
+def _ap_per_threshold(
+    predictions: list["ImagePrediction"],
+    ious: list[np.ndarray],
+    total_gt: int,
+    iou_thresholds: np.ndarray,
+) -> dict[float, float]:
+    """COCO AP at each IoU threshold, pooling all detections globally, ranked by score.
+
+    ``ious[i]`` is the ``(N_i, M_i)`` IoU matrix (mask or box) for image ``i``.
+    """
+    per_threshold_ap: dict[float, float] = {}
+    for t in iou_thresholds:
+        all_scores, all_tp = [], []
+        for p, iou in zip(predictions, ious):
+            if iou.shape[0] == 0:
+                continue
+            order = np.argsort(-np.asarray(p.scores))
+            tp, _ = _match(iou, order, float(t))
+            all_scores.append(np.asarray(p.scores, dtype=np.float64))
+            all_tp.append(tp)
+        scores = np.concatenate(all_scores) if all_scores else np.array([])
+        tp = np.concatenate(all_tp) if all_tp else np.array([], dtype=bool)
+        per_threshold_ap[float(t)] = _ap_from_pr(scores, tp, total_gt)
+    return per_threshold_ap
+
+
+def _summarize_ap(per_threshold_ap: dict[float, float]) -> tuple[float, float, float]:
+    """(mean AP over thresholds, AP50, AP75) from a per-threshold AP dict."""
+    aps = np.array([v for v in per_threshold_ap.values() if not np.isnan(v)])
+    ap = float(aps.mean()) if aps.size else float("nan")
+    return ap, per_threshold_ap.get(0.5, float("nan")), per_threshold_ap.get(0.75, float("nan"))
+
+
 @dataclass
 class Metrics:
     ap: float = float("nan")
     ap50: float = float("nan")
     ap75: float = float("nan")
+    box_ap: float = float("nan")
+    box_ap50: float = float("nan")
+    box_ap75: float = float("nan")
     mean_iou: float = float("nan")
     pq: float = float("nan")
     sq: float = float("nan")
@@ -107,10 +181,13 @@ class Metrics:
     n_pred: int = 0
     n_gt: int = 0
     per_threshold_ap: dict = field(default_factory=dict)
+    box_per_threshold_ap: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        d = {k: v for k, v in self.__dict__.items() if k != "per_threshold_ap"}
+        skip = {"per_threshold_ap", "box_per_threshold_ap"}
+        d = {k: v for k, v in self.__dict__.items() if k not in skip}
         d.update({f"ap_{t:.2f}": v for t, v in self.per_threshold_ap.items()})
+        d.update({f"box_ap_{t:.2f}": v for t, v in self.box_per_threshold_ap.items()})
         return d
 
 
@@ -126,29 +203,16 @@ def evaluate(
     """
     iou_thresholds = np.asarray(iou_thresholds, dtype=np.float64)
     ious = [iou_matrix(p.masks, g) for p, g in zip(predictions, gts)]
+    box_ious = [box_iou_from_masks(p.masks, g) for p, g in zip(predictions, gts)]
 
     total_gt = int(sum(_as_bool(g).shape[0] for g in gts))
 
-    # AP per threshold: pool all detections globally, ranked by score.
-    per_threshold_ap: dict[float, float] = {}
-    for t in iou_thresholds:
-        all_scores, all_tp = [], []
-        for p, iou in zip(predictions, ious):
-            n = iou.shape[0]
-            if n == 0:
-                continue
-            order = np.argsort(-np.asarray(p.scores))
-            tp, _ = _match(iou, order, float(t))
-            all_scores.append(np.asarray(p.scores, dtype=np.float64))
-            all_tp.append(tp)
-        scores = np.concatenate(all_scores) if all_scores else np.array([])
-        tp = np.concatenate(all_tp) if all_tp else np.array([], dtype=bool)
-        per_threshold_ap[float(t)] = _ap_from_pr(scores, tp, total_gt)
-
-    aps = np.array([v for v in per_threshold_ap.values() if not np.isnan(v)])
-    ap = float(aps.mean()) if aps.size else float("nan")
-    ap50 = per_threshold_ap.get(0.5, float("nan"))
-    ap75 = per_threshold_ap.get(0.75, float("nan"))
+    # AP per threshold, over mask IoU (segmentation) and box IoU (detection); detections are
+    # pooled globally and ranked by score.
+    per_threshold_ap = _ap_per_threshold(predictions, ious, total_gt, iou_thresholds)
+    box_per_threshold_ap = _ap_per_threshold(predictions, box_ious, total_gt, iou_thresholds)
+    ap, ap50, ap75 = _summarize_ap(per_threshold_ap)
+    box_ap, box_ap50, box_ap75 = _summarize_ap(box_per_threshold_ap)
 
     # PQ + mean IoU at the 0.5 unique-matching rule.
     tp_iou_sum, n_tp, n_fp, n_fn = 0.0, 0, 0, 0
@@ -186,11 +250,14 @@ def evaluate(
     count_error_rel = rel_err / n_img if n_img else float("nan")
 
     return Metrics(
-        ap=ap, ap50=ap50, ap75=ap75, mean_iou=mean_iou,
+        ap=ap, ap50=ap50, ap75=ap75,
+        box_ap=box_ap, box_ap50=box_ap50, box_ap75=box_ap75,
+        mean_iou=mean_iou,
         pq=pq, sq=sq, rq=rq,
         count_error=count_error, count_error_rel=count_error_rel,
         n_pred=n_pred_total, n_gt=total_gt,
         per_threshold_ap=per_threshold_ap,
+        box_per_threshold_ap=box_per_threshold_ap,
     )
 
 
