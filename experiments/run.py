@@ -2,6 +2,7 @@
 
     python -m experiments.run --config configs/coco_baseline.yaml
     python -m experiments.run --config configs/coco_baseline.yaml --set foveate.gate_threshold=0.6
+    python -m experiments.run --config configs/cv4e@eccv26   # run every yaml under a folder
 
 A run: build the method (default: foveate) + dataset from the YAML, call
 :meth:`~experiments.methods.base.Method.predict` for every image, compute the metrics in
@@ -396,16 +397,23 @@ def _apply_overrides(config: dict[str, Any], overrides: list[str]) -> dict[str, 
     return config
 
 
-def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Run a foveate experiment.")
-    parser.add_argument("--config", required=True, help="Path to a YAML experiment config.")
-    parser.add_argument("--set", dest="overrides", action="append", default=[],
-                        help="Override a config value, e.g. --set foveate.gate_threshold=0.6")
-    args = parser.parse_args(argv)
+def _iter_config_files(path: Path) -> list[Path]:
+    """Config files at ``path``: the file itself, or every ``*.yaml``/``*.yml`` under a directory.
 
-    with open(args.config, encoding="utf-8") as f:
+    Directories are walked recursively (the paper configs nest, e.g. ``cv4e@eccv26/single_exemplar``)
+    and returned sorted so a batch runs in a stable, predictable order.
+    """
+    if path.is_dir():
+        return sorted(p for p in path.rglob("*")
+                      if p.is_file() and p.suffix.lower() in {".yaml", ".yml"})
+    return [path]
+
+
+def _run_config_file(config_path: Path, overrides: list[str]) -> None:
+    """Load one config, apply ``--set`` overrides, and dispatch it (sweep grid or single run)."""
+    with open(config_path, encoding="utf-8") as f:
         config = yaml.safe_load(f)
-    config = _apply_overrides(config, args.overrides)
+    config = _apply_overrides(config, overrides)
 
     # A `sweep:` block expands to a grid of runs. Dispatch here so the single runner does the
     # right thing too — otherwise the block is silently ignored and only the base config runs.
@@ -413,11 +421,54 @@ def main(argv: list[str] | None = None) -> None:
         from experiments.ablations import run_sweep
 
         n = len(config["sweep"])
-        print(f"[run] '{args.config}' has a sweep block ({n} swept key(s)); expanding the grid.")
+        print(f"[run] '{config_path}' has a sweep block ({n} swept key(s)); expanding the grid.")
         run_sweep(config)
         return
 
     run_experiment(config)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Run a foveate experiment.")
+    parser.add_argument("--config", required=True,
+                        help="Path to a YAML config file, or a directory of them "
+                             "(every *.yaml/*.yml under it is run, recursively).")
+    parser.add_argument("--set", dest="overrides", action="append", default=[],
+                        help="Override a config value, e.g. --set foveate.gate_threshold=0.6")
+    args = parser.parse_args(argv)
+
+    root = Path(args.config)
+    if not root.exists():
+        parser.error(f"--config path does not exist: {root}")
+
+    # Single file: run it directly, preserving the original one-shot behavior and exit semantics.
+    if not root.is_dir():
+        _run_config_file(root, args.overrides)
+        return
+
+    # Directory: run each config in turn. Keep going if one fails so a single broken config
+    # doesn't abort the whole batch; summarize at the end and exit non-zero if any failed.
+    configs = _iter_config_files(root)
+    if not configs:
+        parser.error(f"no .yaml/.yml config files found under {root}")
+
+    print(f"[run] batch: {len(configs)} config(s) under {root}")
+    failures: list[tuple[Path, str]] = []
+    for i, config_path in enumerate(configs, 1):
+        print(f"\n[run] === ({i}/{len(configs)}) {config_path} ===")
+        try:
+            _run_config_file(config_path, args.overrides)
+        except Exception as exc:  # noqa: BLE001 — one config failing must not kill the batch
+            import traceback
+            traceback.print_exc()
+            failures.append((config_path, f"{type(exc).__name__}: {exc}"))
+
+    ok = len(configs) - len(failures)
+    print(f"\n[run] batch done: {ok}/{len(configs)} succeeded.")
+    for config_path, err in failures:
+        print(f"[run]   FAILED {config_path}: {err}")
+    if failures:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
