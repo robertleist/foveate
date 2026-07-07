@@ -1,0 +1,53 @@
+# SAM 3 baseline on a COCO subset — the paper's in-context instance-segmentation comparison.
+#
+# This is a *baseline* run: it swaps foveate's recursive discovery for Meta's promptable SAM 3
+# (facebook/sam3, HF-gated — HF_TOKEN from .env). It sits in the same MLflow experiment as the
+# foveate COCO runs so the two are directly comparable.
+#
+# inter_mode controls the cross-image (inter) protocol:
+#   concat (default) — paste exemplar + target into one canvas, prompt with the exemplar boxes,
+#                       crop masks back to the target (INSID3: concat beats video propagation).
+#   text            — ignore exemplar geometry; prompt with the class name as a text concept only.
+# Intra runs always prompt SAM 3 with boxes derived from the exemplar masks on the same image.
+#
+#   python -m experiments.run --config configs/sam3_coco.yaml
+run_name: sam3_corals
+
+data:
+  name: coco                    # registry key (the corals dataset is COCO-format)
+  label: corals                 # dataset name for MLflow logging/filtering
+  root: /data/robert/hifmb_corals
+  annotation_file: annotations.json
+  images_dir: images
+  categories: [Coral Fragment]
+  min_instances: 2
+  train_images: 20        # intra pool (same-image discovery)
+  interval_images: -1     # disjoint novel images for cross-image (inter) eval
+  known_ratio: 0.3        # fraction of instances used as known/prompts (intra GT = all instances)
+  seed: 42
+
+method:
+  type: sam3
+  threshold: 0.3          # detection sensitivity; low because SAM 3 scores are a product of sigmoids
+  mask_threshold: 0.5     # per-instance mask binarization point
+  inter_mode: concat      # concat | text — cross-image protocol (see header)
+
+eval:
+  targets: [intra, inter]         # intra = same-image; inter = cross-image (concat/text prompting)
+  max_exemplars: null
+  limit: null
+  visualize: 10                   # render prompt|GT|prediction overlays for the first N images
+  cascade_trace: 0                # SAM 3 has no recursive cascade
+
+mlflow:
+  enabled: true
+  experiment_name: foveate@eccv # same experiment as foveate so SAM 3 sits beside it
+  tracking_uri: null              # overrides MLFLOW_TRACKING_URI; null -> ./mlruns
+  username: null                  # overrides MLFLOW_TRACKING_USERNAME
+  password: null                  # overrides MLFLOW_TRACKING_PASSWORD
+  dotenv: null                    # explicit .env path; null -> looks for ./.env
+
+sweep:
+  data.train_images: [10]
+  method.threshold: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+  method.inter_mode: [concat, text]

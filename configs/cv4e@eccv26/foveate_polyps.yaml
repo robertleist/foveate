@@ -67,7 +67,7 @@ foveate:                  # any foveate.Config field — full algorithm knob set
 
 eval:
   targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (all non-train)
-  max_exemplars: 3             # exemplar-prompt cap = bank size; null = UNLIMITED (every known
+  max_exemplars: null             # exemplar-prompt cap = bank size; null = UNLIMITED (every known
                                   #   instance of the class; for inter that means all known masks
                                   #   of the single best support image). Per-crop pooling from the
                                   #   bank is foveate.insid3_top_k_exemplars.
@@ -89,6 +89,6 @@ sweep:
   data.train_images: [1]
   foveate.split_mode: [kmeans]
   foveate.insid3_top_k_exemplars: [1]
-  foveate.insid3_tau: [0.99, 0.9925, 0.995]
-  foveate.insid3_aggregate_threshold: [0.01, 0.05, 0.1]
+  foveate.insid3_tau: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  foveate.insid3_aggregate_threshold: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
