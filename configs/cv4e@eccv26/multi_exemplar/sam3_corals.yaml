@@ -21,7 +21,7 @@ data:
   images_dir: images
   categories: [Coral Fragment]
   min_instances: 2
-  train_images: 20        # intra pool (same-image discovery)
+  train_images: 10        # intra pool (same-image discovery)
   interval_images: -1     # disjoint novel images for cross-image (inter) eval
   known_ratio: 0.3        # fraction of instances used as known/prompts (intra GT = all instances)
   seed: 42
@@ -41,13 +41,12 @@ eval:
 
 mlflow:
   enabled: true
-  experiment_name: foveate@eccv # same experiment as foveate so SAM 3 sits beside it
+  experiment_name: cv4e@eccv # same experiment as foveate so SAM 3 sits beside it
   tracking_uri: null              # overrides MLFLOW_TRACKING_URI; null -> ./mlruns
   username: null                  # overrides MLFLOW_TRACKING_USERNAME
   password: null                  # overrides MLFLOW_TRACKING_PASSWORD
   dotenv: null                    # explicit .env path; null -> looks for ./.env
 
 sweep:
-  data.train_images: [10]
   method.threshold: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
   method.inter_mode: [concat, text]

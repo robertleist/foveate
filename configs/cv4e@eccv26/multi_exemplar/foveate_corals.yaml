@@ -1,0 +1,83 @@
+# Comprehensive foveate sweep on the HIFMB corals COCO dataset.
+# Emphasis: TRAINING configs (image count, known ratio, #exemplars pooled) x the core quality
+# knobs (cls_threshold, zoom_split_retry_eps). The introduced dedup/retry params are explored in
+# depth on polyps (run_polyps.yaml) — together the two configs form one comprehensive study.
+# Requires the [dino] extra + the downloaded dataset; DINOv3 weights are HF-gated.
+run_name: corals
+
+backbone:
+  type: dino
+  model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+  image_size: 768
+
+data:
+  name: coco                    # registry key (the corals dataset is COCO-format)
+  label: corals                 # dataset name for MLflow logging/filtering
+  root: /data/robert/hifmb_corals
+  annotation_file: annotations.json
+  images_dir: images
+  categories: [Coral Fragment]
+  min_instances: 2
+  train_images: 10         # intra pool + cross-image support pool; swept below
+  interval_images: -1     # -1 = evaluate on ALL images not in the train set (inter / cross-image)
+  known_ratio: 0.3        # fraction of instances that are known/prompts; rest are discovery GT
+  seed: 42
+
+foveate:                  # any foveate.Config field — full algorithm knob set (mirrors frontend/app.py)
+  # --- features ---
+  standardize: true               # z-score feature dims before L2-norm
+  # --- INSID3 foreground extractor (WHERE is the concept on a crop) ---
+  foreground_extractor: insid3    # insid3 (default) | bank — "where is the class" on a crop
+  insid3_tau: 0.0                 # fine-grained clustering similarity threshold; swept below
+  insid3_aggregate_threshold: 0.1 # alpha: min combined score to merge a cluster; swept below
+  insid3_crop_reference: true     # crop ref image+mask to each exemplar bbox (scale-match crops)
+  insid3_top_k_exemplars: 1       # per crop, run INSID3 on the K bank exemplars most CLS-similar
+                                  #   to it (1 = standard single-exemplar INSID3). This is the
+                                  #   ALGORITHM's pooling knob; eval.max_exemplars sizes the bank.
+  insid3_dynamic_params: false    # derive tau/aggregate from the crop↔exemplar CLS sim s
+                                  #   (overrides the two static values above)
+  insid3_tau_scale: 0.7           #   dynamic: tau = tau_scale * s (raw s≈1 over-segments)
+  insid3_aggregate_scale: 0.3     #   dynamic: aggregate_threshold = aggregate_scale * (1 - s)
+  # --- positional debiasing (cross-image matching) ---
+  debias: true                    # project out DINOv3 positional bias; required for cross-image
+  debias_subspace_dim: 8          # rank of the positional subspace projected out
+  # --- acceptance & splitting (WHAT). A converged crop is ALWAYS split k=2; the split is kept when
+  #     its best sub-crop beats the parent, then every sub-crop above cls_threshold is kept.
+  #     cls_threshold is the class FLOOR (a converged crop below it is not the class). ---
+  cls_threshold: 0.3              # reject floor on mean cos(crop CLS, exemplar CLS bank)
+  split_mode: kmeans              # kmeans (k=2, always splits) | watershed | none
+  # --- zoom-peak split retry (introduced): a zoom that peaks by < eps tries ONE k=2 split of the
+  #     parent before emitting (it may be a clump). 0 disables. Swept below. ---
+  zoom_split_retry_eps: 0.01
+  boundary_smooth_sigma: 0.0      # Gaussian (patches) on watershed maps (split_mode: watershed only)
+  # --- duplicate suppression (introduced): nested k=2 sub-crops can re-find one object down two
+  #     branches; a final NMS keeps the best. Set both to 1.0 to disable. ---
+  nms_iou: 0.5
+  nms_containment: 0.7
+  # --- recursion / cost ---
+  min_crop: 16                    # px size floor — the ONLY geometric stop (no depth cap)
+  max_total_embeds: 512          # global embed budget (safety cap)
+
+eval:
+  targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (all non-train)
+  max_exemplars: null
+  limit: null
+  visualize: 8                    # render prompt|GT|prediction overlays for the first N images
+  cascade_trace: 2                # contact sheet of the recursive zoom for the first N images
+
+mlflow:
+  enabled: true
+  experiment_name: cv4e@eccv
+  tracking_uri: null
+  username: null
+  password: null
+  dotenv: null
+
+# Comprehensive TRAINING-config x core-knob sweep. Sweep keys MUST be dotted config paths
+# (e.g. foveate.insid3_tau) — a bare key sets an ignored top-level entry and the axis silently
+# does nothing while still multiplying the run count.
+# Cartesian product: 2 * 2 * 1 * 3 * 2 * 3 * 3 = 216 runs.
+# Each run evaluates cross-image on ALL images not in its train pool (interval_images: -1).
+sweep:
+  foveate.insid3_tau: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  foveate.insid3_aggregate_threshold: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
