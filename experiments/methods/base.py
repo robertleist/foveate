@@ -41,6 +41,8 @@ class MethodPrediction:
     masks: np.ndarray            # (N, H, W) bool
     scores: np.ndarray           # (N,) float
     n_embeds: int = 0            # backbone forwards spent (0 when the method doesn't track it)
+    boxes: np.ndarray | None = None   # (N, 4) [x0,y0,x1,y1] detection boxes for box AP; None →
+    #                                   the runner scores the tight mask box instead
 
 
 class Method(ABC):

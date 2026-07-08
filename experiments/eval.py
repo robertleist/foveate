@@ -3,8 +3,10 @@
 Class-agnostic (the exemplar defines a single concept), mask-based:
 
 * **AP / AP50 / AP75** — COCO-style average precision over mask-IoU thresholds, predictions
-  ranked by score, greedy IoU matching. ``box_ap*`` are the same, but over bounding-box IoU
-  (boxes derived from the masks) — i.e. detection rather than segmentation AP.
+  ranked by score, greedy IoU matching. ``box_ap*`` are the same, but over bounding-box IoU —
+  i.e. detection rather than segmentation AP. Predicted boxes come from ``ImagePrediction.boxes``
+  when supplied (foveate passes the final *crop* the cascade converged on), else the tight box
+  of each mask; GT boxes are always the tight box of the GT mask.
 * **Panoptic Quality (PQ)** — ``SQ × RQ`` with the IoU>0.5 unique-matching rule.
 * **mean IoU** — mean IoU over matched (TP) pairs.
 * **count error** — mean ``|n_pred - n_gt|`` and its relative form.
@@ -27,6 +29,10 @@ COCO_IOU_THRESHOLDS = np.round(np.arange(0.5, 1.0, 0.05), 2)
 class ImagePrediction:
     masks: np.ndarray            # (N, H, W) bool
     scores: np.ndarray           # (N,) float
+    # (N, 4) detection boxes ``[x0, y0, x1, y1]`` for box AP. ``None`` → fall back to the tight
+    # bounding box of each mask. Foveate supplies the final *crop* box here (the region insid3
+    # converged on), which is what detection AP is scored against — see ``box_boxes`` in evaluate.
+    boxes: np.ndarray | None = None
 
 
 def _as_bool(masks: np.ndarray) -> np.ndarray:
@@ -203,7 +209,15 @@ def evaluate(
     """
     iou_thresholds = np.asarray(iou_thresholds, dtype=np.float64)
     ious = [iou_matrix(p.masks, g) for p, g in zip(predictions, gts)]
-    box_ious = [box_iou_from_masks(p.masks, g) for p, g in zip(predictions, gts)]
+    # Detection: predicted boxes (the final crop when the method supplies them, else the tight
+    # mask box) against tight GT-mask boxes.
+    box_ious = [
+        box_iou_matrix(
+            p.boxes if p.boxes is not None else masks_to_boxes(p.masks),
+            masks_to_boxes(g),
+        )
+        for p, g in zip(predictions, gts)
+    ]
 
     total_gt = int(sum(_as_bool(g).shape[0] for g in gts))
 

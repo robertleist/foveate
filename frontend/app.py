@@ -557,9 +557,14 @@ if run and ref_image is not None and exemplar_masks:
         from experiments.eval import ImagePrediction, evaluate
         pmasks = np.stack(pred_masks) if pred_masks else np.zeros((0, *hw), dtype=bool)
         pscores = np.array([float(inst.score) for inst in instances], dtype=np.float64)
+        # box AP is scored on the final crop box (inst.box is (y0,y1,x0,x1) → [x0,y0,x1,y1]).
+        pboxes = np.array(
+            [(inst.box[2], inst.box[0], inst.box[3], inst.box[1]) for inst in instances],
+            dtype=np.float64,
+        ).reshape(-1, 4)
         gt = np.stack([np.asarray(m, dtype=bool) for m in gt_masks])
         with st.spinner("Evaluating predictions", show_time=True):
-            metrics = evaluate([ImagePrediction(masks=pmasks, scores=pscores)], [gt])
+            metrics = evaluate([ImagePrediction(masks=pmasks, scores=pscores, boxes=pboxes)], [gt])
         mc = st.columns(7)
         mc[0].metric("AP", f"{metrics.ap:.3f}", help="mask AP, mean over IoU 0.50:0.95")
         mc[1].metric("AP@50", f"{metrics.ap50:.3f}", help="mask AP@50")

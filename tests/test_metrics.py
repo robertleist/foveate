@@ -85,6 +85,19 @@ def test_box_ap_forgives_ragged_masks():
     assert m.ap < m.box_ap            # hole drops mask IoU at the stricter thresholds
 
 
+def test_box_ap_uses_supplied_boxes():
+    # Supplied detection boxes (e.g. the crop) are scored for box AP, not the mask's tight box.
+    gt = _square(40, 40, 10, 20, 10, 20)
+    pred_mask = gt.copy()
+    # A loose box around the object (padding) -> lower box IoU than the tight mask box.
+    loose = np.array([[5.0, 5.0, 25.0, 25.0]])   # [x0, y0, x1, y1]
+    pred = ImagePrediction(masks=np.stack([pred_mask]), scores=np.array([0.9]), boxes=loose)
+    m = evaluate([pred], [np.stack([gt])])
+    assert m.ap50 == 1.0                          # mask matches exactly
+    # Loose box IoU = 100/400 = 0.25 < 0.5 -> misses every threshold.
+    assert m.box_ap50 == 0.0
+
+
 def test_exemplar_recovery():
     ex = _square(30, 30, 5, 15, 5, 15)
     pred = ImagePrediction(masks=np.stack([ex.copy()]), scores=np.array([1.0]))

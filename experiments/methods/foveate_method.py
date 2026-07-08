@@ -67,10 +67,18 @@ class FoveateMethod(Method):
         if instances:
             masks = np.stack([inst.mask.astype(bool) for inst in instances])
             scores = np.array([inst.score for inst in instances], dtype=np.float64)
+            # Detection box = the final crop insid3 converged on (Instance.box is (y0,y1,x0,x1)),
+            # reordered to the eval's [x0,y0,x1,y1]. This is scored for box AP instead of the
+            # tight mask box.
+            boxes = np.array(
+                [(inst.box[2], inst.box[0], inst.box[3], inst.box[1]) for inst in instances],
+                dtype=np.float64,
+            )
         else:
             masks = np.zeros((0, h, w), dtype=bool)
             scores = np.zeros((0,), dtype=np.float64)
-        return MethodPrediction(masks=masks, scores=scores, n_embeds=stats.n_embeds)
+            boxes = np.zeros((0, 4), dtype=np.float64)
+        return MethodPrediction(masks=masks, scores=scores, n_embeds=stats.n_embeds, boxes=boxes)
 
     def param_blocks(self) -> dict[str, dict[str, Any]]:
         # Log the *resolved* foveate Config (defaults included), matching the pre-abstraction

@@ -319,6 +319,8 @@ def _evaluate(method: Method, items, output_dir: Path, prefix: str,
         np.savez_compressed(
             output_dir / f"{item.image_id}.npz",
             masks=pred.masks, scores=pred.scores, gt=item.gt_masks, class_id=item.class_id,
+            boxes=(pred.boxes if pred.boxes is not None
+                   else np.zeros((pred.masks.shape[0], 4), dtype=np.float64)),
         )
         if n_items <= viz_budget:
             from experiments.visualize import save_item_overlay
@@ -380,7 +382,10 @@ def _discover_one(method: Method, item: EvalItem, trace: list | None = None):
     t0 = time.perf_counter()
     pred = method.predict(item, observer=observer)
     elapsed = time.perf_counter() - t0
-    return evallib.ImagePrediction(masks=pred.masks, scores=pred.scores), pred.n_embeds, elapsed
+    image_pred = evallib.ImagePrediction(
+        masks=pred.masks, scores=pred.scores, boxes=getattr(pred, "boxes", None),
+    )
+    return image_pred, pred.n_embeds, elapsed
 
 
 # ---------------------------------------------------------------------------
