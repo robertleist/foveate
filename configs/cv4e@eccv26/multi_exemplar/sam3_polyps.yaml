@@ -48,5 +48,5 @@ mlflow:
   dotenv: null                    # explicit .env path; null -> looks for ./.env
 
 sweep:
-  method.threshold: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
-  method.inter_mode: [concat, text]
+  method.threshold: [0.1, 0.2, 0.3]
+  method.inter_mode: [concat]
