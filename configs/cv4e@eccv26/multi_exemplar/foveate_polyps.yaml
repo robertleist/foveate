@@ -88,5 +88,5 @@ mlflow:
 sweep:
   foveate.split_mode: [kmeans, none]
   foveate.insid3_tau: [0.9, 0.95, 0.975, 0.98, 0.99]
-  foveate.insid3_aggregate_threshold: [0.0, -0.25, -0.5]
+  foveate.insid3_aggregate_threshold: [0.0, -0.1]
 
