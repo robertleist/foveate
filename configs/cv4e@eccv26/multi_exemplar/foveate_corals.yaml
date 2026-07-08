@@ -80,5 +80,5 @@ mlflow:
 # Each run evaluates cross-image on ALL images not in its train pool (interval_images: -1).
 sweep:
   foveate.split_mode: [kmeans, none]
-  foveate.insid3_tau: [0.8, 0.85, 0.9, 1.0]
-  foveate.insid3_aggregate_threshold: [0.0, -0.1, -0.2, -0.3, -0.4, -0.5]
+  foveate.insid3_tau: [0.8, 0.85, 0.9]
+  foveate.insid3_aggregate_threshold: [0.0, -0.25, -0.5]
