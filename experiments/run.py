@@ -158,6 +158,9 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
     visualize = eval_cfg.get("visualize", False)
     # Per-image cascade trace (contact sheet of the recursive zoom). Same budget semantics.
     cascade_trace = eval_cfg.get("cascade_trace", False)
+    # Images to harvest the insid3 aggregate-score histogram over (None → reuse cascade_trace,
+    # which already runs the gate with internals; int/"all" to sample more).
+    gate_hist = eval_cfg.get("gate_hist")
 
     intra_ds, inter_ds = build_datasets(data_cfg)
 
@@ -210,7 +213,8 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
         if "intra" in targets:
             items = iter_intra_items(intra_ds, max_exemplars=max_exemplars, limit=limit)
             result.update(_evaluate(method, items, output_dir / "intra", "intra",
-                                    visualize=visualize, cascade_trace=cascade_trace, total=limit))
+                                    visualize=visualize, cascade_trace=cascade_trace,
+                                    gate_hist=gate_hist, total=limit))
         if "inter" in targets:
             if inter_ds is None:
                 print("[run] inter eval requested but interval_images == 0; skipping.")
@@ -218,7 +222,8 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
                 support = build_support_index(intra_ds)
                 items = iter_inter_items(inter_ds, support, max_exemplars=max_exemplars, limit=limit)
                 result.update(_evaluate(method, items, output_dir / "inter", "inter",
-                                        visualize=visualize, cascade_trace=cascade_trace, total=limit))
+                                        visualize=visualize, cascade_trace=cascade_trace,
+                                    gate_hist=gate_hist, total=limit))
 
         (output_dir / "metrics.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         print(json.dumps(result, indent=2))
@@ -281,9 +286,32 @@ def _peak_gpu_mem_mb(method: Method) -> float:
     return torch.cuda.max_memory_allocated(device) / (1024 ** 2)
 
 
+def _harvest_combined(events: list[dict]) -> list[float]:
+    """Pull the per-cluster insid3 ``combined`` scores out of a cascade observer trace.
+
+    Each region event carries ``internals["cluster_scores"][k]["combined"]`` when the gate ran
+    with ``return_internals`` (true whenever an observer is attached); non-insid3 regions and the
+    synthetic ``cls-worse`` drop events have no cluster scores and are skipped.
+    """
+    vals: list[float] = []
+    for ev in events:
+        scores = (ev.get("internals") or {}).get("cluster_scores") or {}
+        for cs in scores.values():
+            c = cs.get("combined")
+            if c is not None:
+                vals.append(float(c))
+    return vals
+
+
+def _aggregate_threshold(method: Method) -> float | None:
+    """The static ``insid3_aggregate_threshold`` (alpha) for foveate, else None."""
+    cfg = getattr(method, "foveate_config", None)
+    return getattr(cfg, "insid3_aggregate_threshold", None) if cfg is not None else None
+
+
 def _evaluate(method: Method, items, output_dir: Path, prefix: str,
               visualize: Any = False, cascade_trace: Any = False,
-              total: int | None = None) -> dict[str, Any]:
+              gate_hist: Any = None, total: int | None = None) -> dict[str, Any]:
     """Predict over ``items``, save per-image masks, and return ``{prefix}_<metric>`` results."""
     output_dir.mkdir(parents=True, exist_ok=True)
     predictions: list[evallib.ImagePrediction] = []
@@ -299,13 +327,22 @@ def _evaluate(method: Method, items, output_dir: Path, prefix: str,
 
     viz_budget = _budget(visualize)
     trace_budget = _budget(cascade_trace)
+    # Gate histogram: harvest per-cluster ``combined`` scores over this many images. Defaults to
+    # the cascade-trace budget (those images already run the gate with internals, so it's free);
+    # bump ``eval.gate_hist`` to sample more (each extra image pays the internals cost).
+    hist_budget = _budget(cascade_trace if gate_hist is None else gate_hist)
     viz_dir = output_dir / "viz"
     trace_dir = output_dir / "viz" / "cascade"
     traj_dir = output_dir / "viz" / "trajectory"
+    gate_combined: list[float] = []
 
     bar = _progress(items, desc=prefix, total=total)
     for item in bar:
-        trace: list | None = [] if n_items < trace_budget else None
+        want_trace = n_items < trace_budget
+        want_hist = n_items < hist_budget
+        # Collect an observer trace whenever we render the contact sheet OR harvest gate stats;
+        # a hist-only trace is reduced to floats and dropped right after the call.
+        trace: list | None = [] if (want_trace or want_hist) else None
         pred, n_embeds, elapsed = _discover_one(method, item, trace=trace)
         predictions.append(pred)
         gts.append(item.gt_masks)
@@ -323,9 +360,13 @@ def _evaluate(method: Method, items, output_dir: Path, prefix: str,
                    else np.zeros((pred.masks.shape[0], 4), dtype=np.float64)),
         )
         if n_items <= viz_budget:
-            from experiments.visualize import save_item_overlay
+            from experiments.visualize import save_final_crops, save_item_overlay
             save_item_overlay(item, pred, viz_dir)
-        if trace:   # non-empty only when the method drove the observer (i.e. foveate)
+            if pred.boxes is not None and pred.boxes.shape[0]:   # foveate: box = final crop
+                save_final_crops(item, pred, viz_dir / "crops")
+        if want_hist and trace:
+            gate_combined.extend(_harvest_combined(trace))
+        if want_trace and trace:   # non-empty only when the method drove the observer (foveate)
             from experiments.visualize import save_cascade_trace
             from experiments.trajectories import save_cls_trajectory
             save_cascade_trace(item, trace, trace_dir)
@@ -348,6 +389,27 @@ def _evaluate(method: Method, items, output_dir: Path, prefix: str,
     )
     out[f"{prefix}_mean_embeds"] = total_embeds / max(n_items, 1)
     out[f"{prefix}_n_images"] = n_items
+
+    # insid3 aggregate-score distribution: histogram artifact + summary stats. The percentiles
+    # show where the `combined` mass actually sits so the `insid3_aggregate_threshold` sweep can be
+    # ranged sensibly (most of it clusters near 0). Empty for non-insid3 methods (no cluster scores).
+    if gate_combined:
+        from experiments.visualize import save_combined_histogram
+        agg_thr = _aggregate_threshold(method)
+        v = np.asarray(gate_combined, dtype=np.float64)
+        save_combined_histogram(
+            v, viz_dir / "gate_combined_hist.png", aggregate_threshold=agg_thr,
+            title=f"{prefix}: insid3 combined ({v.size} clusters, {n_items} imgs)",
+        )
+        np.save(output_dir / f"{prefix}_gate_combined.npy", v)   # raw values for re-binning
+        pcts = {f"p{p}": float(np.percentile(v, p)) for p in (10, 25, 50, 75, 90, 95, 99)}
+        out[f"{prefix}_gate_combined_n"] = int(v.size)
+        out[f"{prefix}_gate_combined_mean"] = float(v.mean())
+        out[f"{prefix}_gate_combined_max"] = float(v.max())
+        for name, val in pcts.items():
+            out[f"{prefix}_gate_combined_{name}"] = val
+        if agg_thr is not None:
+            out[f"{prefix}_gate_combined_frac_below_alpha"] = float((v < agg_thr).mean())
 
     # Inference time. ``mean_runtime_s`` is kept for continuity; median is the more robust
     # per-image figure for the paper (the first image pays one-off warmup), and throughput is

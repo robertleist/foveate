@@ -211,3 +211,116 @@ def save_cascade_trace(item: EvalItem, events: list[dict], out_dir: Path) -> Pat
     fig.savefig(path, dpi=110, bbox_inches="tight")
     plt.close(fig)
     return path
+
+
+# ---------------------------------------------------------------------------
+# Final crops: the boxes the cascade converged on (what box AP is scored against).
+# ---------------------------------------------------------------------------
+def render_final_crops(item: EvalItem, pred: ImagePrediction, *, max_crops: int = 24):
+    """Overview of the target image with every final crop box, plus a montage of the crops.
+
+    The crop box (``ImagePrediction.boxes``, ``[x0, y0, x1, y1]``) is the region insid3
+    converged on and what detection (box) AP scores — so this answers, at a glance, "did the
+    cascade zoom onto the right objects?" Boxes/crops are ordered by score (highest first).
+    """
+    import matplotlib.patches as mpatches
+    from matplotlib.gridspec import GridSpec
+
+    boxes = (np.asarray(pred.boxes, dtype=np.float64).reshape(-1, 4)
+             if pred.boxes is not None else np.zeros((0, 4)))
+    scores = np.asarray(pred.scores, dtype=np.float64).ravel()
+    order = np.argsort(-scores) if scores.size == boxes.shape[0] and scores.size else \
+        np.arange(boxes.shape[0])
+    shown = list(order[:max_crops])
+
+    ncols = min(6, max(len(shown), 1))
+    crop_rows = (len(shown) + ncols - 1) // ncols
+    fig = plt.figure(figsize=(3.0 * ncols, 4.0 + 2.7 * crop_rows))
+    gs = GridSpec(crop_rows + 2, ncols, figure=fig)
+
+    # Overview: the whole target image with every crop box drawn + its rank/score label.
+    ax = fig.add_subplot(gs[0:2, :])
+    ax.imshow(item.image if item.image.ndim == 3 else np.repeat(item.image[..., None], 3, 2))
+    for rank, idx in enumerate(order):
+        x0, y0, x1, y1 = boxes[idx]
+        colour = _PALETTE[rank % len(_PALETTE)] / 255.0
+        ax.add_patch(mpatches.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False,
+                                        edgecolor=colour, linewidth=2.0))
+        ax.text(x0, max(y0 - 2, 0), f"#{rank}", color=colour, fontsize=8,
+                va="bottom", ha="left", weight="bold")
+    kind = "inter" if item.exemplar_image is not None else "intra"
+    ax.set_title(f"{item.image_id}  [{kind}, class {item.class_id}]  "
+                 f"{boxes.shape[0]} final crop(s)", fontsize=12)
+    ax.set_xticks([]); ax.set_yticks([])
+
+    # Montage: each crop cut from the image, titled with its rank + score.
+    for k, idx in enumerate(shown):
+        r, c = divmod(k, ncols)
+        cax = fig.add_subplot(gs[2 + r, c])
+        x0, y0, x1, y1 = boxes[idx].astype(int)
+        crop = item.image[max(y0, 0):y1, max(x0, 0):x1]
+        if crop.size:
+            cax.imshow(crop if crop.ndim == 3 else np.repeat(crop[..., None], 3, 2))
+        s = scores[idx] if idx < scores.size else float("nan")
+        cax.set_title(f"#{k}  s={s:.2f}", fontsize=8.5)
+        cax.set_xticks([]); cax.set_yticks([])
+
+    fig.tight_layout()
+    return fig
+
+
+def save_final_crops(item: EvalItem, pred: ImagePrediction, out_dir: Path) -> Path:
+    """Render :func:`render_final_crops` and save it as ``<out_dir>/<image_id>.png``."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig = render_final_crops(item, pred)
+    path = out_dir / f"{item.image_id}.png"
+    fig.savefig(path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# insid3 aggregate-score histogram: the distribution the ``insid3_aggregate_threshold``
+# (alpha) gates. ``combined = cross · intra · area`` per candidate cluster, pooled over the
+# cascade's traced regions — see experiments.run._harvest_combined.
+# ---------------------------------------------------------------------------
+def render_combined_histogram(values, *, aggregate_threshold: float | None = None,
+                              title: str = "", bins: int = 60):
+    """Linear + log-y histograms of the per-cluster ``combined`` scores.
+
+    The product of three sub-1 terms piles mass near 0, so the useful dynamic range is tiny —
+    the log-y panel makes the small foreground lobe visible above the background spike. The
+    dashed line marks the static ``insid3_aggregate_threshold`` (alpha) for reference.
+    """
+    v = np.asarray(values, dtype=np.float64)
+    v = v[np.isfinite(v)]
+    lo = float(min(0.0, v.min())) if v.size else 0.0
+    hi = float(v.max()) if v.size else 1.0
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.2))
+    for ax, logy in zip(axes, (False, True)):
+        if v.size:
+            ax.hist(v, bins=bins, range=(lo, hi), color="#377eb8", edgecolor="white", linewidth=0.3)
+        if aggregate_threshold is not None:
+            ax.axvline(aggregate_threshold, color="#e41a1c", ls="--", linewidth=1.6,
+                       label=f"alpha = {aggregate_threshold:g}")
+            ax.legend(fontsize=9)
+        ax.set_xlabel("combined = cross · intra · area")
+        ax.set_ylabel("clusters")
+        if logy:
+            ax.set_yscale("log")
+            ax.set_title("log-y")
+        else:
+            ax.set_title("linear")
+    fig.suptitle(title or f"insid3 aggregate score distribution ({v.size} clusters)", fontsize=13)
+    fig.tight_layout()
+    return fig
+
+
+def save_combined_histogram(values, out_path: Path, *, aggregate_threshold: float | None = None,
+                            title: str = "") -> Path:
+    """Render :func:`render_combined_histogram` and save it to ``out_path``."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig = render_combined_histogram(values, aggregate_threshold=aggregate_threshold, title=title)
+    fig.savefig(out_path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
