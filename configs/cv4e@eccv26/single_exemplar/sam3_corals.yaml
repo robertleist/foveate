@@ -21,9 +21,9 @@ data:
   images_dir: images
   categories: [Coral Fragment]
   min_instances: 2
-  train_images: 10        # intra pool (same-image discovery)
+  train_images: 1         # intra pool (same-image discovery)
   interval_images: -1     # disjoint novel images for cross-image (inter) eval
-  known_ratio: 0.3        # fraction of instances used as known/prompts (intra GT = all instances)
+  known_ratio: 0          # fraction of instances used as known/prompts (intra GT = all instances)
   seed: 42
 
 method:
@@ -34,7 +34,7 @@ method:
 
 eval:
   targets: [intra, inter]         # intra = same-image; inter = cross-image (concat/text prompting)
-  max_exemplars: null
+  max_exemplars: 1
   limit: null
   visualize: 10                   # render prompt|GT|prediction overlays for the first N images
   cascade_trace: 0                # SAM 3 has no recursive cascade
@@ -46,7 +46,3 @@ mlflow:
   username: null                  # overrides MLFLOW_TRACKING_USERNAME
   password: null                  # overrides MLFLOW_TRACKING_PASSWORD
   dotenv: null                    # explicit .env path; null -> looks for ./.env
-
-sweep:
-  method.threshold: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
-  method.inter_mode: [concat, text]

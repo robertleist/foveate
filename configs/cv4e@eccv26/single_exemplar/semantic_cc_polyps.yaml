@@ -19,14 +19,14 @@ data:
   min_instances: 2
   train_images: 1        # intra pool (same-image discovery)
   interval_images: -1     # disjoint novel images for cross-image (inter) eval
-  known_ratio: 0.3        # fraction of instances used as known/prompts (intra GT = all instances)
+  known_ratio: 0.         # fraction of instances used as known/prompts (intra GT = all instances)
   seed: 42
 
 foveate:               # any foveate.Config field — SHARED WHERE params with the foveate run
   standardize: true
   foreground_extractor: insid3    # insid3 (default) | bank — "where is the class" on the image
   # --- INSID3 foreground extractor (WHERE) ---
-  insid3_tau: 0.0                 # fine-grained clustering similarity threshold
+  insid3_tau: 0.8                 # fine-grained clustering similarity threshold
   insid3_aggregate_threshold: 0.1 # alpha: min combined score to merge a cluster into the object
   insid3_crop_reference: true     # crop ref image+mask to each exemplar bbox (scale-match crops)
   cls_threshold: 0.1              # (unused here: no cascade / acceptance step in this baseline)
@@ -46,7 +46,7 @@ method:
 
 eval:
   targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (set debias: true)
-  max_exemplars: null
+  max_exemplars: 1
   limit: null
   visualize: 10                   # render prompt|GT|prediction overlays for the first N images
   cascade_trace: 0                # no cascade in this baseline — nothing to trace
@@ -58,8 +58,3 @@ mlflow:
   username: null                  # overrides MLFLOW_TRACKING_USERNAME
   password: null                  # overrides MLFLOW_TRACKING_PASSWORD
   dotenv: null                    # explicit .env path; null -> looks for ./.env
-
-
-sweep:
-  foveate.insid3_tau: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-  foveate.insid3_aggregate_threshold: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
