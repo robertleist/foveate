@@ -615,15 +615,24 @@ if run and ref_image is not None and exemplar_masks:
                 cs = ev.get("cls_score")
                 cs_txt = f"{cs:.3f}" if isinstance(cs, (int, float)) else "nan"
 
-                if ev.get("decision") == "cls-worse":
-                    # A child whose CLS fell below its parent → dropped. Shown so the cls-stop can
-                    # be verified: this is a crop the cascade *declined* to zoom into.
+                if ev.get("decision") in ("cls-worse", "below-floor"):
+                    # A dropped child. Two reasons: cls-worse = no child beat this crop's parent, so
+                    # the parent was the peak and the cascade stopped there; below-floor = a stronger
+                    # sibling confirmed the split, but this crop fell below BOTH its parent and the
+                    # class floor, so it is pruned while the sibling keeps zooming.
                     pcls = ev.get("parent_cls")
                     pcls_txt = f"{pcls:.3f}" if isinstance(pcls, (int, float)) else "?"
-                    st.image(_to_uint8_rgb(crop), caption="crop — CLS worse than parent → dropped",
-                             width="content")
-                    st.caption(f"cls_score {cs_txt} < parent {pcls_txt} → dropped; this child is "
-                               f"why the cascade stopped zooming here.")
+                    if ev.get("decision") == "below-floor":
+                        st.image(_to_uint8_rgb(crop), caption="crop — weak split sibling → pruned",
+                                 width="content")
+                        st.caption(f"cls_score {cs_txt} ≤ parent {pcls_txt} and below the class "
+                                   f"floor {cfg.cls_threshold:.3f} → pruned; a stronger sibling beat "
+                                   f"the parent and continued the split.")
+                    else:
+                        st.image(_to_uint8_rgb(crop), caption="crop — CLS worse than parent → dropped",
+                                 width="content")
+                        st.caption(f"cls_score {cs_txt} ≤ parent {pcls_txt} → dropped; no child beat "
+                                   f"this crop, so the cascade stopped zooming here.")
                     continue
 
                 st.caption(f"box {ev.get('box')}  ·  cls_score {cs_txt}")

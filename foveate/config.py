@@ -66,6 +66,11 @@ class Config:
     shrink_stop: float = 0.9             # converge when child/crop area ratio >= this
     cls_threshold: float = 0.5           # absolute class FLOOR: converged crop below this is
                                          # not the class -> reject (was the accept threshold)
+    cls_top_k: int = 0                   # crop CLS score = mean cosine to the top-K most-similar
+                                         # exemplar CLS (0 or >= S ⇒ all exemplars = the mean-over-
+                                         # bank default; 1 ⇒ max; 2 ⇒ top-2 mean). Mirrors INSID3's
+                                         # top-k exemplar selection. Only bites for multi-exemplar
+                                         # banks (S>1); with one exemplar every choice is identical.
     zoom_split_retry_eps: float = 0.01   # when a zoom peaks by only a hair (parent CLS beats the
                                          # child by less than this), the crop may be a CLUMP that
                                          # tightening onto one component can't improve — so try ONE
@@ -80,6 +85,9 @@ class Config:
     split_aggregate: str = "mean"        # DEPRECATED / unused: sub-crops are gated by the split
                                          # confirm + class floor, not pooled; kept for config compat
     cascade_min_instance_area: int = 16  # drop leaf masks smaller than this (pixels)
+    mask_upsample: str = "nearest"       # how a leaf's patch-grid mask is upsampled to pixels:
+                                         # nearest (blocky patch staircase) | bilinear (smooth the
+                                         # boundary — resize as float, re-binarize at 0.5)
     # --- deduplication (final NMS on emitted leaves) ---
     nms_iou: float = 0.5                 # suppress a lower-scored leaf overlapping a kept one above
                                          # this mask IoU (independent branches re-finding one object)

@@ -136,6 +136,7 @@ _DECISIONS = {
     "clump-split": "converged → k=2 split, CLS-gated next level",
     "discard": "converged but below class floor → discarded",
     "cls-stop": "no split/zoom child beat this crop → emit it",
+    "below-floor": "split sibling below both parent and class floor → pruned (stronger siblings continue)",
 }
 
 

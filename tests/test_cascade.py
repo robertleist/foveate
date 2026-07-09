@@ -64,6 +64,16 @@ def test_survivors_drops_below_floor_sibling():
     assert _survivors(0.85, [0.90, 0.30], cls_threshold=0.5) == [0]
 
 
+def test_survivors_keeps_improved_child_below_floor():
+    """Regression: a child that IMPROVED on its (low) parent must survive even when it is still
+    below the class floor — it found a better crop and keeps zooming toward the floor. Parent 0.081,
+    floor 0.30: the 0.154 child beat the parent, so it must be PURSUED, not pruned for being below
+    the floor (the old rule kept only ``s >= floor`` and wrongly dropped it)."""
+    assert _survivors(0.081, [0.154, 0.05], cls_threshold=0.30) == [0]   # 0.05 below both → pruned
+    # a strong sibling (0.40) confirms the split; the weaker 0.154 still improved on the parent → kept
+    assert _survivors(0.081, [0.40, 0.154], cls_threshold=0.30) == [0, 1]
+
+
 def test_survivors_rejects_fragmented_single_object():
     """Splitting a single object → every half is a weaker partial view (best <= parent) → the split
     is not confirmed → keep nothing so the caller emits the parent."""

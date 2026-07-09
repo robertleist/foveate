@@ -45,6 +45,8 @@ foveate:                  # any foveate.Config field — full algorithm knob set
   #     its best sub-crop beats the parent, then every sub-crop above cls_threshold is kept.
   #     cls_threshold is the class FLOOR (a converged crop below it is not the class). ---
   cls_threshold: 0.3              # reject floor on mean cos(crop CLS, exemplar CLS bank)
+  cls_top_k: 0                    # exemplar aggregation for the crop CLS score: 0 = mean over the
+                                  #   whole bank (default); 1 = max; 2 = top-2 mean. Swept below.
   split_mode: kmeans              # kmeans (k=2, always splits) | watershed | none
   # --- zoom-peak split retry (introduced): a zoom that peaks by < eps tries ONE k=2 split of the
   #     parent before emitting (it may be a clump). 0 disables. Swept below. ---
@@ -82,3 +84,6 @@ sweep:
   foveate.split_mode: [none]
   foveate.insid3_tau: [0.0, 0.1, 0.8]
   foveate.insid3_aggregate_threshold: [-0.025, 0.025, 0.05, 0.075]
+  foveate.cls_top_k: [0, 1, 2]    # exemplar aggregation ablation: mean-over-bank | max | top-2 mean
+  foveate.cls_threshold: [0.2, 0.3, 0.4]  # co-swept with cls_top_k: max/top-k shift scores up, so
+                                  #   the floor must be re-tuned per aggregation for a fair comparison

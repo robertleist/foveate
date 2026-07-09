@@ -89,6 +89,20 @@ def resize_mask_to_grid(mask: np.ndarray, grid_hw: tuple[int, int]) -> np.ndarra
     return resized.astype(bool)
 
 
+def upsample_mask(mask: np.ndarray, size_wh: tuple[int, int], *, bilinear: bool = False) -> np.ndarray:
+    """Upsample a coarse (patch-grid) binary ``mask`` to pixel resolution ``size_wh`` (W, H).
+
+    ``bilinear`` smooths the blocky patch boundaries: resize the {0,1} mask as float with
+    ``INTER_LINEAR`` and re-binarize at 0.5 (the level set halfway between inside and outside).
+    Nearest-neighbour (default) keeps the exact patch-grid staircase. Returns ``uint8`` {0,1}.
+    """
+    w, h = size_wh
+    if bilinear:
+        soft = cv2.resize(mask.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+        return (soft >= 0.5).astype(np.uint8)
+    return cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+
+
 def stack_exemplar_patches(
     features: torch.Tensor,
     masks: list[np.ndarray],

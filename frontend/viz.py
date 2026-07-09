@@ -51,6 +51,7 @@ _DECISIONS = {
     "discard": "converged but below class floor -> discarded",
     "cls-stop": "no split/zoom child beat this crop -> emit it",
     "cls-worse": "CLS dropped below the parent -> discarded (why the cascade stopped)",
+    "below-floor": "split sibling below both parent and class floor -> pruned (stronger siblings continue)",
 }
 
 

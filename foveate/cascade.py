@@ -44,7 +44,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import cv2
 import numpy as np
 import torch
 from scipy.ndimage import generate_binary_structure, label
@@ -248,14 +247,19 @@ def _survivors(parent_cls: float, child_scores, *, cls_threshold: float) -> list
        the parent. A single object, by contrast, only yields *partial* sub-crops that score *below*
        the whole (and flat/tied CLS never beats the parent), so its split is not confirmed → keep
        nothing and the caller emits the parent. This is what stops a uniform blob over-segmenting.
-    2. **Keep every child above the class floor.** Once confirmed, each child that independently
-       clears ``cls_threshold`` is its own instance and is pursued — the novel sibling included,
-       even though it scores below the exemplar-biased parent.
+    2. **Keep every child that improves on the parent OR clears the class floor.** A child that
+       *improved* on the parent has found a better crop and must never be discarded — even when it
+       is still below the floor (it will keep zooming and can rise above it). The floor additionally
+       rescues a genuinely novel sibling that is class-like but scores *below* the exemplar-biased
+       parent. Only a child that falls below **both** the parent and the floor is pruned.
     """
     if len(child_scores) <= 1:
         return _cls_survivors(parent_cls, child_scores)
     if max(child_scores) > parent_cls:                       # isolating a real object raised CLS
-        return [i for i, s in enumerate(child_scores) if s >= cls_threshold]
+        # Never discard a child that improved on the parent (even below the floor); additionally
+        # keep any child that clears the floor. Prune only children below BOTH parent and floor.
+        return [i for i, s in enumerate(child_scores)
+                if s > parent_cls or s >= cls_threshold]
     return []                                                # no sub-crop beat the parent → emit it
 
 
@@ -321,14 +325,24 @@ def discover_instances(
     cls_bank = extractor.cls_bank                       # (S, D) L2-normalized exemplar CLS
 
     def classify(cls: torch.Tensor) -> float:
-        """Mean cosine of the crop's CLS to all exemplar CLS — the "what is in the bbox" test."""
+        """Crop CLS recognition score — the "what is in the bbox" test.
+
+        Mean cosine of the crop's CLS to its ``cfg.cls_top_k`` most-similar exemplar CLS
+        (``<= 0`` or ``>= S`` ⇒ all exemplars, the mean-over-bank default; ``1`` ⇒ max). This
+        mirrors the top-K exemplar selection in INSID3's ``_select_reference`` so both paths
+        aggregate the exemplar bank the same way.
+        """
         gallery = cls_bank.to(cls.device, cls.dtype)
-        return float((cls @ gallery.T).mean())
+        sims = cls @ gallery.T                          # (S,) cosine to each exemplar
+        k = cfg.cls_top_k
+        if 0 < k < sims.shape[0]:
+            sims = sims.topk(k).values
+        return float(sims.mean())
 
     def emit(region, comp_grid, score):
         y0, y1, x0, x1 = region.box
-        mask_local = cv2.resize(comp_grid.astype(np.uint8), (x1 - x0, y1 - y0),
-                                interpolation=cv2.INTER_NEAREST)
+        mask_local = featlib.upsample_mask(comp_grid, (x1 - x0, y1 - y0),
+                                           bilinear=cfg.mask_upsample == "bilinear")
         if int(mask_local.sum()) < cfg.cascade_min_instance_area:
             stats.discarded += 1
             return
@@ -433,10 +447,16 @@ def discover_instances(
             # Skipped when the parent was retried: the drop is subsumed by the split, whose deferred
             # event (now ``clump-split``) is fired next level instead.
             if observer is not None and not retried:
+                # Two distinct drop reasons. If the group had survivors this was a CONFIRMED split:
+                # a dropped child fell below BOTH the parent and the class floor (anything that beat
+                # the parent survived) and is pruned while its stronger siblings keep zooming. With
+                # no survivors, no child beat the parent → the parent was the peak (``cls-worse``,
+                # why the cascade stopped here).
+                drop_decision = "below-floor" if better else "cls-worse"
                 for i in dropped:
                     dr = frontier[i]
                     observer(dict(level=level_idx, depth=dr.depth, box=dr.box,
-                                  decision="cls-worse", n_components=0, cls_score=cls_scores[i],
+                                  decision=drop_decision, n_components=0, cls_score=cls_scores[i],
                                   parent_cls=parent.cls, children=[], internals={},
                                   instance_grids=[]))
             if observer is not None and parent.event is not None and not retried:
