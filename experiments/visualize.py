@@ -121,9 +121,9 @@ def save_item_overlay(item: EvalItem, pred: ImagePrediction, out_dir: Path) -> P
 # ---------------------------------------------------------------------------
 # Cascade trace: one panel per region the recursive zoom processed.
 # ---------------------------------------------------------------------------
-# discover_instances(..., observer=cb) calls back once per region with a dict holding the
+# foveate_cascade(..., observer=cb) calls back once per region with a dict holding the
 # crop ``box``, the gate ``fg`` (patch grid), the connected-component ``comp_labels`` (patch
-# grid), the ``decision`` taken, ``cls_score``, and the child ``children`` boxes it enqueued.
+# grid), the ``decision`` taken, ``reid_score``, and the child ``children`` boxes it enqueued.
 # Collect those dicts and this turns them into a contact sheet of the foveation process.
 
 # What each decision means, for the panel titles.
@@ -133,10 +133,10 @@ _DECISIONS = {
     "zoom": "1 component, still shrinking → zoom",
     "leaf": "converged, unsplittable / splitting off → accepted instance",
     "leaf-cap": "min-crop size floor → emit components",
-    "clump-split": "converged → k=2 split, CLS-gated next level",
-    "discard": "converged but below class floor → discarded",
-    "cls-stop": "no split/zoom child beat this crop → emit it",
-    "below-floor": "split sibling below both parent and class floor → pruned (stronger siblings continue)",
+    "clump-split": "converged → k=2 split, g-gated next level",
+    "discard": "converged but below the crop similarity floor τ_C → discarded",
+    "reid-stop": "no split/zoom child beat this crop → emit it",
+    "below-floor": "split sibling below both parent and τ_C → pruned (stronger siblings continue)",
 }
 
 
@@ -152,7 +152,7 @@ def _upsample(grid: np.ndarray, hw: tuple[int, int]) -> np.ndarray:
 def render_cascade_trace(item: EvalItem, events: list[dict], *, max_panels: int = 24):
     """Contact sheet of the recursive zoom: each crop with its gate + components + children.
 
-    Reads the dicts emitted by ``discover_instances``'s ``observer`` hook. Bugs that live in
+    Reads the dicts emitted by ``foveate_cascade``'s ``observer`` hook. Bugs that live in
     the cascade rather than the final masks show up here: the root gate firing on background
     or missing objects, single instances repeatedly re-zoomed, real instances discarded as
     rejected clumps, or the budget exhausting before the frontier drains.
@@ -196,7 +196,7 @@ def render_cascade_trace(item: EvalItem, events: list[dict], *, max_panels: int 
         decision = ev.get("decision", "?")
         ax.set_title(
             f"L{ev.get('level')} d{ev.get('depth')}  {decision}\n"
-            f"n={ev.get('n_components')}  cls={ev.get('cls_score', float('nan')):.2f}\n"
+            f"n={ev.get('n_components')}  cls={ev.get('reid_score', float('nan')):.2f}\n"
             f"{_DECISIONS.get(decision, '')}",
             fontsize=8.5)
 
@@ -281,7 +281,7 @@ def save_final_crops(item: EvalItem, pred: ImagePrediction, out_dir: Path) -> Pa
 
 
 # ---------------------------------------------------------------------------
-# insid3 aggregate-score histogram: the distribution the ``insid3_aggregate_threshold``
+# insid3 aggregate-score histogram: the distribution the ``insid3_aggt``
 # (alpha) gates. ``combined = cross · intra · area`` per candidate cluster, pooled over the
 # cascade's traced regions — see experiments.run._harvest_combined.
 # ---------------------------------------------------------------------------
@@ -291,7 +291,7 @@ def render_combined_histogram(values, *, aggregate_threshold: float | None = Non
 
     The product of three sub-1 terms piles mass near 0, so the useful dynamic range is tiny —
     the log-y panel makes the small foreground lobe visible above the background spike. The
-    dashed line marks the static ``insid3_aggregate_threshold`` (alpha) for reference.
+    dashed line marks the static ``insid3_aggt`` (alpha) for reference.
     """
     v = np.asarray(values, dtype=np.float64)
     v = v[np.isfinite(v)]

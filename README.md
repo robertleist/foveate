@@ -1,17 +1,19 @@
 # foveate
 
-This is the code for the paper *"Foveate: Recursive zooming for training-free in-context
-instance segmentation"*. **Work in progress.**
+This is the code for the paper *"Foveate: A Training-Free, In-Context, Recursive Method for
+Instance Segmentation"*. **Work in progress.**
 
-**Training-free, recursive, prototype-guided instance discovery from frozen DINOv3 features.**
+**Training-free, in-context, recursive instance segmentation from frozen DINOv3 features, guided
+by as few as one exemplar.**
 
 A *foveated zoom*: starting from the whole image, the cascade recursively directs the encoder's
 fixed patch budget at candidate regions (a connected-components fixed point), re-identifies the
-prompted concept (CLS / prototype similarity), and refines each instance's border — discovering
-*every* instance of a prompted morphology within a single image, or across images.
+prompted concept against the exemplar bank (crop similarity of CLS tokens), and separates each
+instance — discovering *every* instance of a prompted concept within a single image, or across
+images.
 
-> Lineage: inspired by **INSID3** (CVPR 2026), which produces a single cross-image mask in one
-> forward pass. foveate adds recursion + individuation to turn that into instance discovery.
+> Lineage: inspired by **INSID3**, which produces a single cross-image mask in one forward pass.
+> Foveate adds the recursive cascade + splitting to turn that into instance discovery.
 
 ## Install
 
@@ -45,10 +47,10 @@ No GPU/weights needed for tests and demos — use the weightless `MockBackbone`.
 
 ```python
 import numpy as np
-from foveate import discover_instances, Config, DINOv3Backbone
+from foveate import foveate_cascade, Config, DINOv3Backbone
 
 backbone = DINOv3Backbone()                       # or MockBackbone() for a smoke test
-instances, stats = discover_instances(
+instances, stats = foveate_cascade(
     backbone, image, exemplar_masks, config=Config(gate_threshold=0.5),
 )
 for inst in instances:
@@ -93,8 +95,8 @@ Params, metrics, per-image cost (embeds, runtime) and the saved masks are logged
 
 A small Streamlit app visualizes the whole pipeline stage by stage on real DINOv3 features —
 the **WHERE** (INSID3 foreground extraction: clusters → forward/backward similarity → seed →
-aggregated foreground), the recursive **cascade trace**, and the **WHAT** (per-leaf CLS
-classification table).
+aggregated foreground), the recursive **cascade trace**, and the **WHAT** (per-leaf
+re-identification table: re-id score g against the exemplar bank).
 
 ```bash
 uv run --extra frontend --extra dino streamlit run frontend/app.py
@@ -107,7 +109,7 @@ sample or upload a reference image + mask (free-draw canvas, or a mask PNG fallb
 ## Layout
 
 ```
-foveate/        core package: cascade (discover_instances), single-pass pipeline (run),
+foveate/        core package: cascade (foveate_cascade), single-pass pipeline (run),
                 features, gate, clustering, individuation, merge, border, prototypes,
                 thresholding, debias, config, types, backbones/{dinov3,mock}
 data/           mask-based datasets: DatasetSource (coco/pannuke/synthetic), InstanceDataset,

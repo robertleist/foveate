@@ -48,7 +48,7 @@ class InSID3Extractor:
 
     def __init__(self, cfg) -> None:
         self.cfg = cfg
-        self.cls_bank: torch.Tensor | None = None
+        self.exemplar_cls: torch.Tensor | None = None
         self._B: torch.Tensor | None = None
         # Per-exemplar reference kept SEPARATE (not pooled): each entry is
         # ``(ref_deb (Rs, D), ref_fg (Rs,) bool, p_ref (D,))``. ``predict`` picks the exemplars
@@ -122,7 +122,7 @@ class InSID3Extractor:
             cls_list.append(cls)
 
         self._set_pooled(device)
-        self.cls_bank = featlib.l2_normalize(torch.stack(cls_list), dim=1).to(device)  # (S, D)
+        self.exemplar_cls = featlib.l2_normalize(torch.stack(cls_list), dim=1).to(device)  # (S, D)
 
     def _set_reference_full(self, backbone, images, valid, cfg) -> None:
         """Reference from the whole image(s) (original behaviour); CLS still per-exemplar crop.
@@ -156,7 +156,7 @@ class InSID3Extractor:
             raise ValueError("No reference patch overlaps the feature grid; image too small "
                              "or reference mask empty. Increase backbone image_size.")
         self._set_pooled(device)
-        self.cls_bank = self._build_cls_bank(backbone, images, valid, cfg).to(device)
+        self.exemplar_cls = self._build_exemplar_cls(backbone, images, valid, cfg).to(device)
 
     def _set_pooled(self, device) -> None:
         """Concatenate the per-exemplar reference into the all-exemplar pooled fallback."""
@@ -164,7 +164,7 @@ class InSID3Extractor:
         self.ref_fg = torch.cat([e[1] for e in self._ex], dim=0).to(device)
         self.p_ref = featlib.l2_normalize(self.ref_deb[self.ref_fg].mean(dim=0), dim=0)
 
-    def _build_cls_bank(self, backbone, images, valid, cfg) -> torch.Tensor:
+    def _build_exemplar_cls(self, backbone, images, valid, cfg) -> torch.Tensor:
         """Crop each exemplar bbox from its own image, embed it, stack the per-crop CLS. Padded by
         ``cfg.pad_frac`` so the bank CLS is framed like the target crops it will be matched against."""
         boxes = [_mask_bbox(m, cfg.pad_frac) for m in valid]
@@ -178,13 +178,15 @@ class InSID3Extractor:
         """Pick the exemplars to run INSID3 with, and the tau / aggregate to run it at.
 
         ``cls`` is the crop's CLS token. The top ``insid3_top_k_exemplars`` exemplars by CLS
-        cosine build the matching gallery (``k=1`` ⇒ standard single-exemplar INSID3). With
-        ``insid3_dynamic_params`` the granularity follows that similarity ``s``:
-        ``tau = insid3_tau_scale * s`` (dissimilar crops stay coarse so the cascade zooms first;
-        similar crops cluster finely — scaled because raw ``s≈1`` over-segments) and
-        ``aggregate_threshold = insid3_aggregate_scale * (1 - s)`` (similar crops aggregate freely).
-        The similarity is measured even for a single exemplar; only ``cls=None`` (the single-pass
-        ``predict`` with no crop CLS) falls back to the pooled reference and static config.
+        cosine build the matching gallery (``k=1`` ⇒ standard single-exemplar INSID3). The
+        granularity follows that similarity ``s``, each knob toggled independently: with
+        ``insid3_dynamic_tau_fg``, ``tau = insid3_tau_fg_scale * (1 - s)`` (a dissimilar crop must be
+        split into many fine clusters to find the object; a frame-filling match only needs a
+        coarse fg/bg split) and with ``insid3_dynamic_aggt``,
+        ``aggregate_threshold = insid3_aggt_scale * s`` (a dissimilar crop's many clusters
+        re-merge freely). The similarity is measured even for a single exemplar; only
+        ``cls=None`` (the single-pass ``predict`` with no crop CLS) falls back to the pooled
+        reference and static config.
         """
         cfg = self.cfg
         n = len(self._ex)
@@ -194,7 +196,7 @@ class InSID3Extractor:
             # Always measure the crop↔exemplar CLS similarity when we have a CLS — a single
             # exemplar still needs it for the dynamic tau / aggregate. Only the top-k *selection*
             # is trivial when n == 1 (sims is (1,) → sel == [0]).
-            sims = (self.cls_bank.to(cls.device, cls.dtype) @ cls).detach().cpu().numpy()  # (S,)
+            sims = (self.exemplar_cls.to(cls.device, cls.dtype) @ cls).detach().cpu().numpy()  # (S,)
             k = max(1, min(int(cfg.insid3_top_k_exemplars), n))
             sel = sorted(int(i) for i in np.argsort(-sims)[:k])
             sim = float(np.mean(sims[sel]))
@@ -204,11 +206,14 @@ class InSID3Extractor:
         p_ref = (featlib.l2_normalize(ref_deb[ref_fg].mean(dim=0), dim=0)
                  if bool(ref_fg.any()) else featlib.l2_normalize(ref_deb.mean(dim=0), dim=0))
 
-        if cfg.insid3_dynamic_params and sim is not None:
-            tau = float(np.clip(cfg.insid3_tau_scale * sim, 0.05, 0.95))
-            aggregate = float(np.clip(cfg.insid3_aggregate_scale * (1.0 - sim), 0.0, 0.95))
+        if cfg.insid3_dynamic_tau_fg and sim is not None:
+            tau = float(np.clip(cfg.insid3_tau_fg_scale * (1.0 - sim), 0.05, 0.95))
         else:
-            tau, aggregate = float(cfg.insid3_tau), float(cfg.insid3_aggregate_threshold)
+            tau = float(cfg.insid3_tau_fg)
+        if cfg.insid3_dynamic_aggt and sim is not None:
+            aggregate = float(np.clip(cfg.insid3_aggt_scale * sim, 0.0, 0.95))
+        else:
+            aggregate = float(cfg.insid3_aggt)
         return ref_deb, ref_fg, p_ref, tau, aggregate, sel, sim
 
     def _selection_internals(self, sel_ex, sim, tau, aggregate) -> dict:
@@ -224,8 +229,9 @@ class InSID3Extractor:
         """Run INSID3 on an ``(Hp, Wp, D)`` L2-normalized target grid.
 
         ``cls`` is the crop's CLS token; when given, only the ``insid3_top_k_exemplars`` exemplars
-        most similar to it build the matching gallery (and, if ``insid3_dynamic_params``, set the
-        granularity) — see :meth:`_select_reference`.
+        most similar to it build the matching gallery (and, if ``insid3_dynamic_tau_fg`` /
+        ``insid3_dynamic_aggt``, set the granularity) — see
+        :meth:`_select_reference`.
 
         Mirrors the official ``_locate_candidates`` + ``_seed_and_aggregate``: locate candidate
         patches (forward prototype prior ∧ backward nearest-neighbour vote), over-segment the
@@ -330,7 +336,7 @@ class InSID3Extractor:
         return GateResult(
             foreground=foreground,
             score_map=score_map,
-            cls_bank=self.cls_bank.cpu().numpy(),
+            exemplar_cls=self.exemplar_cls.cpu().numpy(),
             internals=internals,
         )
 

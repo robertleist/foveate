@@ -80,8 +80,8 @@ def test_mean_prob_scoring():
 def _config():
     return {
         "backbone": {"type": "mock", "image_size": 224, "patch_size": 14},
-        "foveate": {"standardize": False, "insid3_tau": 0.6,
-                    "insid3_aggregate_threshold": 0.2},
+        "foveate": {"standardize": False, "insid3_tau_fg": 0.6,
+                    "insid3_aggt": 0.2},
         "method": {"type": "semantic_cc", "min_area": 4, "connectivity": 8,
                    "score_mode": "mean_prob"},
     }

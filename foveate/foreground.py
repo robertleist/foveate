@@ -5,8 +5,8 @@ exemplar class*: a per-patch cosine to a prototype bank. We are now replacing
 that with the official INSID3 algorithm, but we want to keep the old bank gate
 around for ablations and as a cheap fallback. The clean way to do both is a
 small strategy interface: every extractor turns a frozen patch-feature grid
-into a foreground mask plus a confidence map, and exposes a per-exemplar CLS
-bank for the downstream "what is in this bbox" classification.
+into a foreground mask plus a confidence map, and exposes the exemplar bank's
+per-exemplar CLS stack for the downstream re-identification score ``g``.
 
 Everything an extractor sees is already L2-normalized, so the consumers never
 need to know whether the features were debiased, standardized or raw -- that is
@@ -34,9 +34,9 @@ class GateResult:
     score_map:
         ``(Hp, Wp)`` float in ``[0, 1]`` -- a per-patch class confidence used
         downstream for scoring and filtering.
-    cls_bank:
-        ``(S, D)`` float -- the per-exemplar CLS stack, L2-normalized. One CLS
-        per exemplar crop, the granularity the leaf classifier compares against.
+    exemplar_cls:
+        ``(S, D)`` float -- the exemplar bank's CLS stack, L2-normalized. One CLS
+        token per exemplar crop, what the re-identification score ``g`` compares against.
     internals:
         Optional viz payload (cluster maps, intermediate similarities). Empty by
         default; populated only when ``predict(..., return_internals=True)``.
@@ -44,7 +44,7 @@ class GateResult:
 
     foreground: np.ndarray
     score_map: np.ndarray
-    cls_bank: np.ndarray
+    exemplar_cls: np.ndarray
     internals: dict = field(default_factory=dict)
 
 
@@ -54,12 +54,12 @@ class ForegroundExtractor(Protocol):
 
     An extractor is configured once against a reference (the exemplar image(s) and
     their masks) via :meth:`set_reference`, then queried per target grid via
-    :meth:`predict`. After ``set_reference`` it exposes :attr:`cls_bank`, the
+    :meth:`predict`. After ``set_reference`` it exposes :attr:`exemplar_cls`, the
     ``(S, D)`` L2-normalized per-exemplar CLS stack, so the integration layer can
-    classify leaf crops without re-deriving it.
+    reidentify leaf crops without re-deriving it.
     """
 
-    cls_bank: torch.Tensor                  # (S, D) L2-normalized per-exemplar CLS
+    exemplar_cls: torch.Tensor                  # (S, D) L2-normalized per-exemplar CLS
 
     def set_reference(
         self,

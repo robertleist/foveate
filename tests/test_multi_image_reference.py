@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from foveate import Config, discover_instances
+from foveate import Config, foveate_cascade
 from foveate.foreground import build_extractor, normalize_reference
 
 
@@ -49,7 +49,7 @@ def test_normalize_reference_all_empty_raises():
 
 
 # ---------------------------------------------------------------------------
-# discover_instances with exemplars pooled across images
+# foveate_cascade with exemplars pooled across images
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("extractor", ["insid3", "bank"])
 def test_multi_image_exemplars_discover_targets(backbone, two_squares, extractor):
@@ -59,8 +59,8 @@ def test_multi_image_exemplars_discover_targets(backbone, two_squares, extractor
     ex_b, mask_b = _img((220, 30, 30), (80, 100, 80, 100))   # red square, image B
 
     cfg = Config(foreground_extractor=extractor, standardize=False, gate_threshold=0.8,
-                 min_crop=24, cascade_min_instance_area=4, cls_threshold=0.0)
-    instances, stats = discover_instances(
+                 min_crop=24, cascade_min_instance_area=4, crop_sim_floor=0.0)
+    instances, stats = foveate_cascade(
         backbone, target, [mask_a, mask_b], config=cfg,
         exemplar_images=[ex_a, ex_b],
     )
@@ -74,7 +74,7 @@ def test_multi_image_exemplars_discover_targets(backbone, two_squares, extractor
 def test_exemplar_image_and_images_are_mutually_exclusive(backbone, two_squares):
     target, ex = two_squares
     with pytest.raises(ValueError):
-        discover_instances(backbone, target, ex, config=Config(),
+        foveate_cascade(backbone, target, ex, config=Config(),
                            exemplar_image=target, exemplar_images=[target])
 
 
@@ -99,7 +99,7 @@ def test_selection_picks_the_most_similar_exemplar(backbone):
     _, _, _, _, _, sel, _ = ext._select_reference(cls, feat.device)
     # The reference embeds a red and a blue exemplar crop; a red crop must select the red one.
     assert len(sel) == 1
-    red_idx = int(np.argmax((ext.cls_bank @ cls).detach().cpu().numpy()))
+    red_idx = int(np.argmax((ext.exemplar_cls @ cls).detach().cpu().numpy()))
     assert sel == [red_idx]
 
 
@@ -122,36 +122,58 @@ def test_top_k_and_pooled_fallback(backbone):
 def test_dynamic_params_set_tau_and_aggregate_from_similarity(backbone):
     a, ma = _img((220, 30, 30), (20, 60, 20, 60))
     b, mb = _img((30, 30, 220), (20, 60, 20, 60))
-    cfg = Config(standardize=False, insid3_top_k_exemplars=1, insid3_dynamic_params=True)
+    cfg = Config(standardize=False, insid3_top_k_exemplars=1,
+                 insid3_dynamic_tau_fg=True, insid3_dynamic_aggt=True)
     ext = _insid3_reference(backbone, cfg, [a, b], [ma, mb])
 
     import foveate.features as featlib
     (feat, cls) = featlib.embed_batch(backbone, [a], standardize=False)[0]
     _, _, _, tau, aggregate, _, sim = ext._select_reference(cls, feat.device)
-    assert abs(tau - float(np.clip(cfg.insid3_tau_scale * sim, 0.05, 0.95))) < 1e-6
-    assert abs(aggregate - float(np.clip(cfg.insid3_aggregate_scale * (1.0 - sim), 0.0, 0.95))) < 1e-6
+    # Inverse coupling: a dissimilar crop splits finely (high tau) and re-merges freely
+    # (low aggregate); a frame-filling match splits coarsely.
+    assert abs(tau - float(np.clip(cfg.insid3_tau_fg_scale * (1.0 - sim), 0.05, 0.95))) < 1e-6
+    assert abs(aggregate - float(np.clip(cfg.insid3_aggt_scale * sim, 0.0, 0.95))) < 1e-6
+
+
+def test_dynamic_tau_and_aggregate_toggle_independently(backbone):
+    a, ma = _img((220, 30, 30), (20, 60, 20, 60))
+    cfg = Config(standardize=False, insid3_dynamic_tau_fg=True)  # aggregate stays static
+    ext = _insid3_reference(backbone, cfg, [a], [ma])
+
+    import foveate.features as featlib
+    (feat, cls) = featlib.embed_batch(backbone, [a], standardize=False)[0]
+    _, _, _, tau, aggregate, _, sim = ext._select_reference(cls, feat.device)
+    assert abs(tau - float(np.clip(cfg.insid3_tau_fg_scale * (1.0 - sim), 0.05, 0.95))) < 1e-6
+    assert aggregate == cfg.insid3_aggt
+
+    ext.cfg.insid3_dynamic_tau_fg = False
+    ext.cfg.insid3_dynamic_aggt = True     # now only aggregate is dynamic
+    _, _, _, tau, aggregate, _, sim = ext._select_reference(cls, feat.device)
+    assert tau == ext.cfg.insid3_tau_fg
+    assert abs(aggregate - float(np.clip(ext.cfg.insid3_aggt_scale * sim, 0.0, 0.95))) < 1e-6
 
 
 def test_single_exemplar_still_uses_dynamic_params(backbone):
     """Regression: with ONE exemplar, dynamic tau/aggregate must still derive from the CLS sim
     (the similarity is computed even though top-k selection is trivial)."""
     a, ma = _img((220, 30, 30), (20, 60, 20, 60))
-    cfg = Config(standardize=False, insid3_dynamic_params=True)
+    cfg = Config(standardize=False,
+                 insid3_dynamic_tau_fg=True, insid3_dynamic_aggt=True)
     ext = _insid3_reference(backbone, cfg, [a], [ma])         # single exemplar
 
     import foveate.features as featlib
     (feat, cls) = featlib.embed_batch(backbone, [a], standardize=False)[0]
     _, _, _, tau, aggregate, sel, sim = ext._select_reference(cls, feat.device)
     assert sel == [0] and sim is not None                    # sim measured for the lone exemplar
-    assert abs(tau - float(np.clip(cfg.insid3_tau_scale * sim, 0.05, 0.95))) < 1e-6
-    assert abs(aggregate - float(np.clip(cfg.insid3_aggregate_scale * (1.0 - sim), 0.0, 0.95))) < 1e-6
+    assert abs(tau - float(np.clip(cfg.insid3_tau_fg_scale * (1.0 - sim), 0.05, 0.95))) < 1e-6
+    assert abs(aggregate - float(np.clip(cfg.insid3_aggt_scale * sim, 0.0, 0.95))) < 1e-6
     # and it is NOT the static default
-    assert tau != cfg.insid3_tau or aggregate != cfg.insid3_aggregate_threshold
+    assert tau != cfg.insid3_tau_fg or aggregate != cfg.insid3_aggt
 
 
 def test_default_k1_single_exemplar_matches_pooled(backbone, two_squares):
     """With one exemplar, selection is a no-op — same reference as the pooled path."""
     target, ex = two_squares
-    cfg = Config(standardize=False, min_crop=24, cascade_min_instance_area=4, cls_threshold=0.0)
-    instances, _ = discover_instances(backbone, target, ex, config=cfg)
+    cfg = Config(standardize=False, min_crop=24, cascade_min_instance_area=4, crop_sim_floor=0.0)
+    instances, _ = foveate_cascade(backbone, target, ex, config=cfg)
     assert instances

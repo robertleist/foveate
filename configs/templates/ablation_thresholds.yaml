@@ -29,14 +29,15 @@ foveate:                    # full algorithm knob set (mirrors frontend/app.py)
   insid3_crop_reference: true
   insid3_top_k_exemplars: 1    # per-crop pooling from the bank (1 = standard INSID3);
                                #   eval.max_exemplars sizes the bank itself
-  insid3_dynamic_params: false # derive tau/aggregate from crop↔exemplar CLS sim (overrides sweep)
-  insid3_tau_scale: 0.7
-  insid3_aggregate_scale: 0.3
+  insid3_dynamic_tau_fg: false       # tau = tau_scale * (1 - CLS sim s): dissimilar crop -> fine split
+  insid3_dynamic_aggt: false  # aggregate_threshold = aggregate_scale * s: dissimilar crop -> merge freely
+  insid3_tau_fg_scale: 0.7
+  insid3_aggt_scale: 0.3
   # --- positional debiasing ---
   debias: false             # mock features carry no DINOv3 positional bias
   debias_subspace_dim: 8
   # --- acceptance & splitting (WHAT), held at defaults to isolate the WHERE ablation ---
-  cls_threshold: 0.0        # class FLOOR = 0 to isolate the foreground-extraction ablation
+  crop_sim_floor: 0.0        # class FLOOR = 0 to isolate the foreground-extraction ablation
   split_mode: kmeans        # kmeans (k=2, always splits) | watershed | none
   zoom_split_retry_eps: 0.01  # near-flat zoom peak retries ONE k=2 split; 0 disables
   boundary_smooth_sigma: 0.0  # Gaussian (patches) on watershed maps (split_mode: watershed only)
@@ -58,5 +59,5 @@ mlflow:
   experiment_name: foveate-ablations
 
 sweep:
-  foveate.insid3_tau: [0.5, 0.6, 0.7]
-  foveate.insid3_aggregate_threshold: [0.1, 0.2, 0.3]
+  foveate.insid3_tau_fg: [0.5, 0.6, 0.7]
+  foveate.insid3_aggt: [0.1, 0.2, 0.3]

@@ -291,7 +291,7 @@ def _harvest_combined(events: list[dict]) -> list[float]:
 
     Each region event carries ``internals["cluster_scores"][k]["combined"]`` when the gate ran
     with ``return_internals`` (true whenever an observer is attached); non-insid3 regions and the
-    synthetic ``cls-worse`` drop events have no cluster scores and are skipped.
+    synthetic ``reid-worse`` drop events have no cluster scores and are skipped.
     """
     vals: list[float] = []
     for ev in events:
@@ -304,9 +304,9 @@ def _harvest_combined(events: list[dict]) -> list[float]:
 
 
 def _aggregate_threshold(method: Method) -> float | None:
-    """The static ``insid3_aggregate_threshold`` (alpha) for foveate, else None."""
+    """The static ``insid3_aggt`` (alpha) for foveate, else None."""
     cfg = getattr(method, "foveate_config", None)
-    return getattr(cfg, "insid3_aggregate_threshold", None) if cfg is not None else None
+    return getattr(cfg, "insid3_aggt", None) if cfg is not None else None
 
 
 def _evaluate(method: Method, items, output_dir: Path, prefix: str,
@@ -371,7 +371,7 @@ def _evaluate(method: Method, items, output_dir: Path, prefix: str,
             from experiments.trajectories import save_cls_trajectory
             save_cascade_trace(item, trace, trace_dir)
             save_cls_trajectory(item, trace, traj_dir,
-                                cls_threshold=getattr(method, "cls_threshold", 0.5))
+                                crop_sim_floor=getattr(method, "crop_sim_floor", 0.5))
         # Live cost readout on the bar: predictions/image, embeds/image, sec/image.
         if hasattr(bar, "set_postfix"):
             bar.set_postfix(pred=f"{total_pred / n_items:.1f}",
@@ -391,7 +391,7 @@ def _evaluate(method: Method, items, output_dir: Path, prefix: str,
     out[f"{prefix}_n_images"] = n_items
 
     # insid3 aggregate-score distribution: histogram artifact + summary stats. The percentiles
-    # show where the `combined` mass actually sits so the `insid3_aggregate_threshold` sweep can be
+    # show where the `combined` mass actually sits so the `insid3_aggt` sweep can be
     # ranged sensibly (most of it clusters near 0). Empty for non-insid3 methods (no cluster scores).
     if gate_combined:
         from experiments.visualize import save_combined_histogram
