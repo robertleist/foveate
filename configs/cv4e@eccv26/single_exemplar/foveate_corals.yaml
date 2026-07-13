@@ -28,8 +28,8 @@ foveate:                  # any foveate.Config field — full algorithm knob set
   standardize: true               # z-score feature dims before L2-norm
   # --- INSID3 foreground extractor (WHERE is the concept on a crop) ---
   foreground_extractor: insid3    # insid3 (default) | bank — "where is the class" on a crop
-  insid3_tau: 0.2                 # fine-grained clustering similarity threshold; swept below
-  insid3_aggregate_threshold: 0.2 # alpha: min combined score to merge a cluster; swept below
+  insid3_tau: 0.3                 # fine-grained clustering similarity threshold; swept below
+  insid3_aggregate_threshold: 0.4 # alpha: min combined score to merge a cluster; swept below
   insid3_crop_reference: true     # crop ref image+mask to each exemplar bbox (scale-match crops)
   insid3_top_k_exemplars: 1       # per crop, run INSID3 on the K bank exemplars most CLS-similar
                                   #   to it (1 = standard single-exemplar INSID3). This is the
