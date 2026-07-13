@@ -2,9 +2,38 @@ import numpy as np
 
 import torch
 
-from foveate import Config, foveate_cascade
-from foveate.cascade import _reid_survivors, _mask_overlap, _nms, _split_kmeans, _survivors
+from foveate import Config, cascade
+from foveate.cascade import (
+    _CONN4, _CONN8, _extract_structure, _reid_survivors, _mask_overlap, _nms, _split_kmeans,
+    _survivors,
+)
 from foveate.types import Instance
+
+
+def test_extract_structure_selects_connectivity():
+    """The Extract stage maps connectivity 4/8 to the right structuring element."""
+    assert _extract_structure(4) is _CONN4
+    assert _extract_structure(8) is _CONN8
+    assert _extract_structure(99) is _CONN8              # anything else → 8-connectivity default
+
+
+def test_cascade_runs_with_otsu_where(backbone, two_squares):
+    """The Otsu Where extractor drives the full cascade end-to-end."""
+    img, ex = two_squares
+    cfg = Config(foreground_extractor="otsu", debias=False, min_crop=24,
+                 cascade_min_instance_area=4)
+    instances, stats = cascade(backbone, img, ex, config=cfg)
+    assert stats.n_embeds > 0
+    assert all(inst.mask.shape == img.shape[:2] for inst in instances)
+
+
+def test_cascade_runs_with_both_connectivities(backbone, two_squares):
+    """Extract connectivity is an ablatable axis: 4 and 8 both run the cascade."""
+    img, ex = two_squares
+    for conn in (4, 8):
+        cfg = Config(extract_connectivity=conn, min_crop=24, cascade_min_instance_area=4)
+        instances, stats = cascade(backbone, img, ex, config=cfg)
+        assert stats.n_embeds > 0
 
 
 def _inst(mask: np.ndarray, score: float) -> Instance:
@@ -84,16 +113,18 @@ def test_survivors_rejects_fragmented_single_object():
 def test_cls_worse_children_are_traced(backbone, two_squares, monkeypatch):
     """Dropped (reid-worse) children must be emitted as terminal ``reid-worse`` events so the
     trajectory / tool can show why the cascade stopped."""
-    import foveate.cascade as C
+    import importlib
+    C = importlib.import_module("foveate.cascade")  # module handle (the `cascade` attr on the
+                                                    # package is the function, so fetch the module)
 
     # Force "no child ever survives" → the reid-stop path fires and every child is dropped.
     monkeypatch.setattr(C, "_survivors",
                         lambda parent_reid, child_scores, *, crop_sim_floor: [])
     img, ex = two_squares
     events = []
-    C.foveate_cascade(backbone, img, ex,
-                         config=Config(min_crop=24, cascade_min_instance_area=4),
-                         observer=events.append)
+    C.cascade(backbone, img, ex,
+              config=Config(min_crop=24, cascade_min_instance_area=4),
+              observer=events.append)
     worse = [e for e in events if e["decision"] == "reid-worse"]
     assert worse, "expected reid-worse events for dropped children"
     for e in worse:                                          # well-formed terminal trace nodes
@@ -138,8 +169,8 @@ def test_nms_keeps_distinct_instances():
 def test_nms_disabled_when_thresholds_are_one(backbone, two_squares):
     """Both thresholds at 1.0 turns NMS off — no leaf is suppressed."""
     img, ex = two_squares
-    _, stats = foveate_cascade(backbone, img, ex,
-                                  config=Config(min_crop=24, cascade_min_instance_area=4,
+    _, stats = cascade(backbone, img, ex,
+                       config=Config(min_crop=24, cascade_min_instance_area=4,
                                                 nms_iou=1.0, nms_containment=1.0))
     assert stats.suppressed == 0
 
@@ -156,7 +187,7 @@ def test_converged_split_does_not_regress_two_instances(backbone, two_squares):
     two-instance case (the two squares are separate components, so they split cleanly)."""
     img, ex = two_squares
     cfg = Config(min_crop=24, cascade_min_instance_area=4)
-    instances, stats = foveate_cascade(backbone, img, ex, config=cfg)
+    instances, stats = cascade(backbone, img, ex, config=cfg)
     assert len(instances) == 2
 
 
@@ -166,9 +197,9 @@ def test_zoom_split_retry_attempts_split_on_marginal_peak(backbone, two_squares)
     strict split-confirm still falls back to emitting the parent — so no over-split / duplicates."""
     img, ex = two_squares
     off = Config(min_crop=24, cascade_min_instance_area=4, zoom_split_retry_eps=0.0)
-    ev0 = []; inst0, st0 = foveate_cascade(backbone, img, ex, config=off, observer=ev0.append)
+    ev0 = []; inst0, st0 = cascade(backbone, img, ex, config=off, observer=ev0.append)
     on = Config(min_crop=24, cascade_min_instance_area=4, zoom_split_retry_eps=1.0)
-    ev1 = []; inst1, st1 = foveate_cascade(backbone, img, ex, config=on, observer=ev1.append)
+    ev1 = []; inst1, st1 = cascade(backbone, img, ex, config=on, observer=ev1.append)
 
     assert not any(e["decision"] == "clump-split" for e in ev0)   # disabled → no retry split
     assert any(e["decision"] == "clump-split" for e in ev1)       # enabled → a marginal peak retried
@@ -176,14 +207,29 @@ def test_zoom_split_retry_attempts_split_on_marginal_peak(backbone, two_squares)
     assert len(inst0) == 2 and len(inst1) == 2                    # correctness preserved either way
 
 
+def test_emit_components_splits_multi_component_parent(backbone, two_squares):
+    """``emit_components`` splits an emitted parent's OR-merged foreground into connected
+    components. Here the embed budget is cut off (``max_total_embeds=2``) right after the root
+    splits into the two red squares but before their child crops are processed, so the flush
+    falls back to emitting the parent — whose two components don't touch. Default fuses them into
+    one instance; ``emit_components`` recovers both."""
+    img, ex = two_squares
+    # crop_sim_floor=-1 so the parent always clears the floor regardless of MockBackbone cosines.
+    base = dict(min_crop=24, cascade_min_instance_area=4, crop_sim_floor=-1.0, max_total_embeds=2)
+    merged, _ = cascade(backbone, img, ex, config=Config(emit_components=False, **base))
+    split, _ = cascade(backbone, img, ex, config=Config(emit_components=True, **base))
+    assert len(merged) == 1                      # two non-touching squares OR-merged into one
+    assert len(split) == 2                       # ... recovered as two separate instances
+
+
 def test_max_depth_is_not_a_stopping_signal(backbone, two_squares):
     """Depth is no longer a stopping signal — even ``max_depth=0`` must not force a leaf-cap at
     the root; only ``min_crop`` (size) and CLS halt the cascade, so the zoom goes past depth 0."""
     img, ex = two_squares
     events = []
-    foveate_cascade(backbone, img, ex,
-                       config=Config(max_depth=0, min_crop=24, cascade_min_instance_area=4),
-                       observer=events.append)
+    cascade(backbone, img, ex,
+            config=Config(max_depth=0, min_crop=24, cascade_min_instance_area=4),
+            observer=events.append)
     assert max(e["depth"] for e in events) > 0, "max_depth=0 stopped the cascade at the root"
 
 
@@ -193,7 +239,7 @@ def test_discovers_both_targets_not_distractor(backbone, two_squares):
     # standardize=True (default): MockBackbone black-background patches become non-zero,
     # so INSID3's cluster_all over the full grid stays well-defined.
     cfg = Config(min_crop=24, cascade_min_instance_area=4)
-    instances, stats = foveate_cascade(backbone, img, ex, config=cfg)
+    instances, stats = cascade(backbone, img, ex, config=cfg)
 
     assert len(instances) == 2
     assert stats.leaves == 2
@@ -209,7 +255,7 @@ def test_bank_extractor_discovers_both_targets(backbone, two_squares):
     img, ex = two_squares
     cfg = Config(foreground_extractor="bank", gate_threshold=0.8,
                  min_crop=24, cascade_min_instance_area=4)
-    instances, stats = foveate_cascade(backbone, img, ex, config=cfg)
+    instances, stats = cascade(backbone, img, ex, config=cfg)
 
     assert len(instances) == 2
     assert stats.leaves == 2
@@ -230,7 +276,7 @@ def test_empty_exemplar_raises(backbone, two_squares):
     img, _ = two_squares
     empty = [np.zeros((128, 128), np.uint8)]
     try:
-        foveate_cascade(backbone, img, empty, config=Config())
+        cascade(backbone, img, empty, config=Config())
     except ValueError:
         return
     raise AssertionError("expected ValueError for empty exemplar masks")
@@ -239,17 +285,17 @@ def test_empty_exemplar_raises(backbone, two_squares):
 def test_observer_is_called(backbone, two_squares):
     img, ex = two_squares
     seen = []
-    foveate_cascade(backbone, img, ex, config=Config(gate_threshold=0.4, min_crop=24),
-                       observer=lambda info: seen.append(info["decision"]))
+    cascade(backbone, img, ex, config=Config(gate_threshold=0.4, min_crop=24),
+            observer=lambda info: seen.append(info["decision"]))
     assert seen and all("decision" for _ in seen)
 
 
 def test_observer_events_carry_internals_and_instance_grids(backbone, two_squares):
     img, ex = two_squares
     events = []
-    foveate_cascade(backbone, img, ex,
-                       config=Config(min_crop=24, cascade_min_instance_area=4),
-                       observer=events.append)
+    cascade(backbone, img, ex,
+            config=Config(min_crop=24, cascade_min_instance_area=4),
+            observer=events.append)
     assert events
     for e in events:
         assert "internals" in e and isinstance(e["internals"], dict)

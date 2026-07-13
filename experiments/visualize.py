@@ -121,7 +121,7 @@ def save_item_overlay(item: EvalItem, pred: ImagePrediction, out_dir: Path) -> P
 # ---------------------------------------------------------------------------
 # Cascade trace: one panel per region the recursive zoom processed.
 # ---------------------------------------------------------------------------
-# foveate_cascade(..., observer=cb) calls back once per region with a dict holding the
+# cascade(..., observer=cb) calls back once per region with a dict holding the
 # crop ``box``, the gate ``fg`` (patch grid), the connected-component ``comp_labels`` (patch
 # grid), the ``decision`` taken, ``reid_score``, and the child ``children`` boxes it enqueued.
 # Collect those dicts and this turns them into a contact sheet of the foveation process.
@@ -152,7 +152,7 @@ def _upsample(grid: np.ndarray, hw: tuple[int, int]) -> np.ndarray:
 def render_cascade_trace(item: EvalItem, events: list[dict], *, max_panels: int = 24):
     """Contact sheet of the recursive zoom: each crop with its gate + components + children.
 
-    Reads the dicts emitted by ``foveate_cascade``'s ``observer`` hook. Bugs that live in
+    Reads the dicts emitted by ``cascade``'s ``observer`` hook. Bugs that live in
     the cascade rather than the final masks show up here: the root gate firing on background
     or missing objects, single instances repeatedly re-zoomed, real instances discarded as
     rejected clumps, or the budget exhausting before the frontier drains.

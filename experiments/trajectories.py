@@ -1,6 +1,6 @@
 """Reconstruct and plot the re-identification-score (g) trajectory of the recursive zoom.
 
-Step 1 of the g-peak investigation — **no algorithm change**. ``foveate_cascade``
+Step 1 of the g-peak investigation — **no algorithm change**. ``cascade``
 already computes the crop's re-id score g at every region (``reid_score``) and hands it to the
 ``observer`` hook, together with the crop ``box`` and the child ``children`` boxes it enqueues.
 Because a child's box becomes *exactly* the box of its child region, the parent->child zoom
@@ -95,12 +95,12 @@ def recording_observer() -> tuple[list[dict], callable]:
 
 
 def trace_discovery(backbone, image, exemplar_masks, **kwargs):
-    """Run :func:`foveate.foveate_cascade` with a recording observer attached.
+    """Run :func:`foveate.cascade` with a recording observer attached.
 
     Returns ``(instances, stats, events)``. Any ``observer=`` passed in ``kwargs`` is chained,
     so an existing trace hook still fires.
     """
-    from foveate import foveate_cascade
+    from foveate import cascade
 
     events, record = recording_observer()
     user_observer = kwargs.pop("observer", None)
@@ -110,7 +110,7 @@ def trace_discovery(backbone, image, exemplar_masks, **kwargs):
         if user_observer is not None:
             user_observer(info)
 
-    instances, stats = foveate_cascade(
+    instances, stats = cascade(
         backbone, image, exemplar_masks, observer=observer, **kwargs
     )
     return instances, stats, events

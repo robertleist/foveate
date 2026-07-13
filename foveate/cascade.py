@@ -57,6 +57,12 @@ from foveate.foreground import build_extractor
 from foveate.types import Instance, Stats
 
 _CONN8 = generate_binary_structure(2, 2)   # 8-connectivity: don't over-split single instances
+_CONN4 = generate_binary_structure(2, 1)   # 4-connectivity: split diagonally-touching blobs
+
+
+def _extract_structure(connectivity: int):
+    """Connectivity structuring element for the Extract (connected-components) stage."""
+    return _CONN4 if int(connectivity) == 4 else _CONN8
 
 
 @dataclass
@@ -285,7 +291,7 @@ def _survivors(parent_reid: float, child_scores, *, crop_sim_floor: float) -> li
     return []                                                # no sub-crop beat the parent → emit it
 
 
-def foveate_cascade(
+def cascade(
     backbone,
     image: np.ndarray,
     exemplar_masks: list[np.ndarray],
@@ -345,6 +351,7 @@ def foveate_cascade(
         extractor.set_reference(backbone, ref_image, exemplar_masks, negative_masks, cfg)
         stats.n_embeds += 1
     exemplar_cls = extractor.exemplar_cls                       # (S, D) L2-normalized exemplar CLS
+    extract_struct = _extract_structure(cfg.extract_connectivity)   # Extract: CC connectivity
 
     def reidentify(cls: torch.Tensor) -> float:
         """Re-identification score ``g(c)`` (paper Eq. 2) — the "is this the concept" test.
@@ -377,15 +384,24 @@ def foveate_cascade(
     def emit_parent(parent: _Parent) -> None:
         """Fall back to the crop the (now worse) children were zoomed out of.
 
-        Emitted as ONE instance (components OR-merged) iff the predecessor clears the class
-        floor; a predecessor that is itself below ``crop_sim_floor`` is not the class → drop.
-        The observer event is finalized by the caller (decision ``reid-stop``).
+        Emitted iff the predecessor clears the class floor; a predecessor that is itself below
+        ``crop_sim_floor`` is not the class → drop. The observer event is finalized by the caller
+        (decision ``reid-stop``). By default the components are OR-merged into ONE instance (a
+        converged ``g`` says "the object is in here"); with ``cfg.emit_components`` the merged
+        foreground is instead split into connected components and each emitted separately — so a
+        rejected split whose instances don't touch is recovered as several instances.
         """
         if parent.reid < cfg.crop_sim_floor:
             stats.discarded += 1
             return
         pr = _Region(parent.box, parent.depth)
-        emit(pr, np.logical_or.reduce(parent.comps), parent.reid)
+        merged = np.logical_or.reduce(parent.comps)
+        if cfg.emit_components:
+            labels, n = label(merged, structure=extract_struct)
+            for cid in range(1, n + 1):
+                emit(pr, labels == cid, parent.reid)
+        else:
+            emit(pr, merged, parent.reid)
 
     frontier = [_Region((0, H, 0, W), 0)]
     level_idx = 0
@@ -495,7 +511,7 @@ def foveate_cascade(
 
             gr = extractor.predict(feat, cls=cls, return_internals=observer is not None)
             fg = gr.foreground
-            labels, n = (label(fg, structure=_CONN8) if fg.any()
+            labels, n = (label(fg, structure=extract_struct) if fg.any()
                          else (np.zeros_like(fg, dtype=int), 0))
 
             floor = (r.box[1] - r.box[0]) <= cfg.min_crop or (r.box[3] - r.box[2]) <= cfg.min_crop
@@ -625,4 +641,4 @@ def foveate_cascade(
 
 
 # Backward-compatible alias: the cascade entry point used to be ``discover_instances``.
-discover_instances = foveate_cascade
+discover_instances = cascade

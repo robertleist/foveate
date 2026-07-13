@@ -47,15 +47,15 @@ No GPU/weights needed for tests and demos — use the weightless `MockBackbone`.
 
 ```python
 import numpy as np
-from foveate import foveate_cascade, Config, DINOv3Backbone
+from foveate import cascade, Config, DINOv3Backbone
 
-backbone = DINOv3Backbone()                       # or MockBackbone() for a smoke test
-instances, stats = foveate_cascade(
+backbone = DINOv3Backbone()  # or MockBackbone() for a smoke test
+instances, stats = cascade(
     backbone, image, exemplar_masks, config=Config(gate_threshold=0.5),
 )
 for inst in instances:
-    inst.mask     # (H, W) uint8 in original image coordinates
-    inst.score    # re-identification confidence
+    inst.mask  # (H, W) uint8 in original image coordinates
+    inst.score  # re-identification confidence
 ```
 
 Every knob lives in one `Config` (`from_dict` / `from_request`), threaded through every stage —
@@ -109,7 +109,7 @@ sample or upload a reference image + mask (free-draw canvas, or a mask PNG fallb
 ## Layout
 
 ```
-foveate/        core package: cascade (foveate_cascade), single-pass pipeline (run),
+foveate/        core package: cascade (the `cascade` entry point), single-pass pipeline (run),
                 features, gate, clustering, individuation, merge, border, prototypes,
                 thresholding, debias, config, types, backbones/{dinov3,mock}
 data/           mask-based datasets: DatasetSource (coco/pannuke/synthetic), InstanceDataset,

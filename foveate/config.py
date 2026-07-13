@@ -1,7 +1,7 @@
 """Unified :class:`Config` — every tunable knob in one place.
 
 This collapses the old ``InSID3Params`` (gate / cluster / split stage params) and the
-loose ``foveate_cascade`` keyword arguments into a single dataclass that is threaded
+loose ``cascade`` keyword arguments into a single dataclass that is threaded
 through every stage, so the notebook, the experiments and any service wrapper share one
 source of truth (no more parameter drift).
 
@@ -20,8 +20,18 @@ class Config:
     # --- features ---
     standardize: bool = True              # z-score feature dims before L2-norm
 
-    # --- foreground extraction strategy ---
-    foreground_extractor: str = "insid3"  # insid3 | bank — how "where is the class" is decided
+    # --- WHERE: foreground extraction strategy ---
+    foreground_extractor: str = "insid3"  # insid3 | otsu | bank — how "where is the concept" is decided
+
+    # --- WHERE: Otsu extractor (cheap baseline; paper Sec. 3 "Where") ---
+    otsu_top_k: int = 1                   # per crop, build the similarity map from the K exemplars
+                                          # whose CLS is most cosine-similar to the crop
+    otsu_reduce: str = "mean"             # reduce the per-patch similarity over the K exemplars:
+                                          # mean | max
+
+    # --- EXTRACT: connected components that propose tighter crops ---
+    extract_connectivity: int = 8         # 4 | 8 pixel/patch connectivity for the CC on the
+                                          # foreground grid (8 = don't over-split single instances)
 
     # --- INSID3 foreground extractor (official algorithm; paper Sec. 3, Tab. 1) ---
     insid3_tau_fg: float = 0.6            # tau_fg: INSID3 foreground-granularity threshold (paper
@@ -129,6 +139,10 @@ class Config:
     # crop_sim_floor (above, recursion bounds) is the sole acceptance test: mean cosine of the
     # target CLS to all exemplar CLS must clear it for a converged crop to be kept.
     discard_rejected: bool = False       # drop (vs keep) converged crops that fail acceptance
+    emit_components: bool = False         # when a parent is emitted (reid-stop fallback), split its
+                                         # OR-merged foreground into connected components and emit
+                                         # each separately, instead of one merged mask. Recovers
+                                         # non-touching instances a rejected split would otherwise fuse.
 
     #: Pre-rename config keys → their paper-aligned attribute names. Old YAMLs / notebooks that
     #: still use the legacy keys keep working; :meth:`from_dict` maps them transparently.

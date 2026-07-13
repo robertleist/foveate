@@ -12,25 +12,25 @@ adds the recursive cascade + splitting to turn that into instance discovery.
 
 Quickstart
 ----------
->>> from foveate import foveate_cascade, Config, DINOv3Backbone
+>>> from foveate import cascade, Config, DINOv3Backbone
 >>> backbone = DINOv3Backbone()
->>> instances, stats = foveate_cascade(backbone, image, exemplar_masks, Config())
+>>> instances, stats = cascade(backbone, image, exemplar_masks, Config())
 
-The recursive entry point is :func:`foveate_cascade` (the Foveate cascade of Algorithm 1). A
+The recursive entry point is :func:`cascade` (the Foveate cascade of Algorithm 1). A
 single-pass :func:`run` pipeline (features → gate → clustering → individuation → merge) is kept
 for the notebooks / ablations.
 """
 
-from foveate.cascade import foveate_cascade
+from foveate.cascade import cascade
 from foveate.config import Config, InSID3Params
 from foveate.pipeline import InSID3Result, run
 from foveate.types import Backbone, CascadeStats, DiscoveredInstance, Instance, Stats
 
 # Pre-rename public name (the cascade entry point used to be ``discover_instances``).
-discover_instances = foveate_cascade
+discover_instances = cascade
 
 __all__ = [
-    "foveate_cascade",
+    "cascade",
     "Config",
     "Instance",
     "Stats",

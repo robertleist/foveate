@@ -275,7 +275,7 @@ def render_trace(
     Adapted from ``experiments.visualize.render_cascade_trace`` but takes a plain
     ``image`` + ``image_id`` instead of an ``EvalItem`` (the original only used
     ``item.image`` and ``item.image_id``). Reads the dicts emitted by
-    ``foveate_cascade``'s ``observer`` hook: ``box``, ``fg`` (patch grid),
+    ``cascade``'s ``observer`` hook: ``box``, ``fg`` (patch grid),
     ``decision``, ``reid_score``, ``children`` boxes. Returns a matplotlib Figure.
     """
     import matplotlib.patches as mpatches

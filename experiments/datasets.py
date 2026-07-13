@@ -11,7 +11,7 @@ Two evaluation protocols, both yielding :class:`EvalItem`s:
   bias).
 
 Tensors from the dataset are converted to the ``HxWx3`` uint8 image and ``HxW`` boolean masks that
-:func:`foveate.foveate_cascade` expects.
+:func:`foveate.cascade` expects.
 """
 
 from __future__ import annotations

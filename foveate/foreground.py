@@ -115,17 +115,22 @@ def normalize_reference(
 
 
 def build_extractor(cfg) -> ForegroundExtractor:
-    """Instantiate the extractor selected by ``cfg.foreground_extractor``.
+    """Instantiate the **Where** extractor selected by ``cfg.foreground_extractor``.
 
-    ``"insid3"`` -> the official INSID3 algorithm; ``"bank"`` -> the legacy
-    per-patch bank gate. Imports are deferred so picking one strategy never pulls
-    the other's dependencies.
+    ``"insid3"`` -> the official INSID3 algorithm (clusters + forward/backward matching);
+    ``"otsu"`` -> Otsu on the similarity map to the top-k exemplars (the cheap Where baseline);
+    ``"bank"`` -> the legacy per-patch bank gate. Imports are deferred so picking one strategy
+    never pulls the others' dependencies.
     """
     name = cfg.foreground_extractor
     if name == "insid3":
         from foveate.insid3 import InSID3Extractor
 
         return InSID3Extractor(cfg)
+    if name == "otsu":
+        from foveate.otsu import OtsuExtractor
+
+        return OtsuExtractor(cfg)
     if name == "bank":
         from foveate.gate import BankExtractor
 

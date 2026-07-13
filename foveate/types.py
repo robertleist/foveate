@@ -51,7 +51,7 @@ DiscoveredInstance = Instance
 
 @dataclass
 class Stats:
-    """Cost + structure accounting for one :func:`foveate_cascade` call."""
+    """Cost + structure accounting for one :func:`cascade` call."""
 
     n_embeds: int = 0
     max_depth: int = 0

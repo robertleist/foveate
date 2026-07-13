@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from foveate import Config, foveate_cascade
+from foveate import Config, cascade
 from foveate.foreground import build_extractor, normalize_reference
 
 
@@ -49,7 +49,7 @@ def test_normalize_reference_all_empty_raises():
 
 
 # ---------------------------------------------------------------------------
-# foveate_cascade with exemplars pooled across images
+# cascade with exemplars pooled across images
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("extractor", ["insid3", "bank"])
 def test_multi_image_exemplars_discover_targets(backbone, two_squares, extractor):
@@ -60,7 +60,7 @@ def test_multi_image_exemplars_discover_targets(backbone, two_squares, extractor
 
     cfg = Config(foreground_extractor=extractor, standardize=False, gate_threshold=0.8,
                  min_crop=24, cascade_min_instance_area=4, crop_sim_floor=0.0)
-    instances, stats = foveate_cascade(
+    instances, stats = cascade(
         backbone, target, [mask_a, mask_b], config=cfg,
         exemplar_images=[ex_a, ex_b],
     )
@@ -74,8 +74,8 @@ def test_multi_image_exemplars_discover_targets(backbone, two_squares, extractor
 def test_exemplar_image_and_images_are_mutually_exclusive(backbone, two_squares):
     target, ex = two_squares
     with pytest.raises(ValueError):
-        foveate_cascade(backbone, target, ex, config=Config(),
-                           exemplar_image=target, exemplar_images=[target])
+        cascade(backbone, target, ex, config=Config(),
+                exemplar_image=target, exemplar_images=[target])
 
 
 # ---------------------------------------------------------------------------
@@ -175,5 +175,5 @@ def test_default_k1_single_exemplar_matches_pooled(backbone, two_squares):
     """With one exemplar, selection is a no-op — same reference as the pooled path."""
     target, ex = two_squares
     cfg = Config(standardize=False, min_crop=24, cascade_min_instance_area=4, crop_sim_floor=0.0)
-    instances, _ = foveate_cascade(backbone, target, ex, config=cfg)
+    instances, _ = cascade(backbone, target, ex, config=cfg)
     assert instances

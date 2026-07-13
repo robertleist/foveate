@@ -1,6 +1,6 @@
 """FoveateMethod — the default method: recursive foveated instance discovery.
 
-Wraps :func:`foveate.foveate_cascade` behind the :class:`~experiments.methods.base.Method`
+Wraps :func:`foveate.cascade` behind the :class:`~experiments.methods.base.Method`
 interface exactly as the pre-abstraction runner did: the ``backbone:`` block builds the
 encoder, the ``foveate:`` block resolves into one :class:`foveate.Config`, and the observer
 callback is threaded through so the runner's cascade-trace rendering keeps working.
@@ -19,7 +19,7 @@ from experiments.methods.base import (
     build_backbone,
     register_method,
 )
-from foveate import Config, foveate_cascade
+from foveate import Config, cascade
 from foveate.foreground import build_extractor
 
 
@@ -58,7 +58,7 @@ class FoveateMethod(Method):
     def predict(
         self, item: EvalItem, observer: Callable[[dict], None] | None = None
     ) -> MethodPrediction:
-        instances, stats = foveate_cascade(
+        instances, stats = cascade(
             self.backbone, item.image, item.exemplar_masks, config=self.foveate_config,
             exemplar_image=item.exemplar_image, extractor=self._cached_extractor(item),
             observer=observer,
