@@ -1,7 +1,7 @@
-"""Reconstruct and plot the CLS-similarity trajectory of the recursive zoom.
+"""Reconstruct and plot the re-identification-score (g) trajectory of the recursive zoom.
 
-Step 1 of the CLS-peak investigation — **no algorithm change**. ``discover_instances``
-already computes the crop's CLS score at every region (``cls_score``) and hands it to the
+Step 1 of the g-peak investigation — **no algorithm change**. ``cascade``
+already computes the crop's re-id score g at every region (``reid_score``) and hands it to the
 ``observer`` hook, together with the crop ``box`` and the child ``children`` boxes it enqueues.
 Because a child's box becomes *exactly* the box of its child region, the parent->child zoom
 tree can be rebuilt from the events alone, with nothing added to the cascade.
@@ -23,7 +23,7 @@ Quickstart
 ----------
 >>> from experiments.trajectories import trace_discovery, plot_cls_trajectories
 >>> instances, stats, events = trace_discovery(backbone, image, exemplar_masks, config=cfg)
->>> fig = plot_cls_trajectories(events, cls_threshold=cfg.cls_threshold)
+>>> fig = plot_cls_trajectories(events, crop_sim_floor=cfg.crop_sim_floor)
 >>> print(trajectory_report(events))
 """
 
@@ -47,7 +47,7 @@ class TraceNode:
 
     box: tuple[int, int, int, int]
     depth: int
-    cls_score: float
+    reid_score: float
     decision: str
     n_components: int
     children: list[tuple[int, int, int, int]]
@@ -69,15 +69,15 @@ class SegmentSummary:
 
     @property
     def scores(self) -> list[float]:
-        return [n.cls_score for n in self.nodes]
+        return [n.reid_score for n in self.nodes]
 
     @property
     def peak_cls(self) -> float:
-        return self.nodes[self.peak_index].cls_score
+        return self.nodes[self.peak_index].reid_score
 
     @property
     def stop_cls(self) -> float:
-        return self.nodes[-1].cls_score
+        return self.nodes[-1].reid_score
 
     @property
     def overshoot(self) -> float:
@@ -95,12 +95,12 @@ def recording_observer() -> tuple[list[dict], callable]:
 
 
 def trace_discovery(backbone, image, exemplar_masks, **kwargs):
-    """Run :func:`foveate.discover_instances` with a recording observer attached.
+    """Run :func:`foveate.cascade` with a recording observer attached.
 
     Returns ``(instances, stats, events)``. Any ``observer=`` passed in ``kwargs`` is chained,
     so an existing trace hook still fires.
     """
-    from foveate import discover_instances
+    from foveate import cascade
 
     events, record = recording_observer()
     user_observer = kwargs.pop("observer", None)
@@ -110,7 +110,7 @@ def trace_discovery(backbone, image, exemplar_masks, **kwargs):
         if user_observer is not None:
             user_observer(info)
 
-    instances, stats = discover_instances(
+    instances, stats = cascade(
         backbone, image, exemplar_masks, observer=observer, **kwargs
     )
     return instances, stats, events
@@ -123,7 +123,7 @@ def _node(ev: dict) -> TraceNode:
     return TraceNode(
         box=tuple(ev["box"]),
         depth=int(ev["depth"]),
-        cls_score=float(ev.get("cls_score", float("nan"))),
+        reid_score=float(ev.get("reid_score", float("nan"))),
         decision=ev.get("decision", "?"),
         n_components=int(ev.get("n_components", 0)),
         children=[tuple(c) for c in ev.get("children", [])],
@@ -223,7 +223,7 @@ def _is_unimodal(vals: list[float], tol: float) -> bool:
 
 
 def summarize_segment(nodes: list[TraceNode], *, tol: float = 1e-3) -> SegmentSummary:
-    scores = [n.cls_score for n in nodes]
+    scores = [n.reid_score for n in nodes]
     # Peak = the *deepest* crop achieving the max, so a flat/tied curve peaks at the stop and
     # is never mis-read as overshoot; only a strictly-better shallower crop counts.
     peak_index = len(scores) - 1 - int(np.argmax(scores[::-1]))
@@ -236,7 +236,7 @@ def summarize_segment(nodes: list[TraceNode], *, tol: float = 1e-3) -> SegmentSu
     elif overshoot > tol:
         # CLS fell meaningfully after the peak: a shallower ancestor crop scored higher.
         kind = "overshoot"
-    elif stop_decision == "cls-stop":
+    elif stop_decision == "reid-stop":
         # The cascade stopped here *because* the next zoom scored lower — a clean peak by design.
         kind = "peaked"
     elif stop_decision in ("zoom", "empty"):
@@ -300,7 +300,7 @@ _KIND_STYLE = {
 def plot_cls_trajectories(
     events: list[dict],
     *,
-    cls_threshold: float | None = None,
+    crop_sim_floor: float | None = None,
     min_len: int = 1,
     ax=None,
     title: str | None = None,
@@ -308,7 +308,7 @@ def plot_cls_trajectories(
 ):
     """Plot CLS-vs-depth for every single-component segment; star the peak, flag the stop.
 
-    Colour encodes the stop diagnosis (see ``_KIND_STYLE``). The acceptance ``cls_threshold``,
+    Colour encodes the stop diagnosis (see ``_KIND_STYLE``). The acceptance ``crop_sim_floor``,
     if given, is drawn as a dashed reference line — leaves are only accepted above it today.
     """
     import matplotlib.pyplot as plt
@@ -331,9 +331,9 @@ def plot_cls_trajectories(
         ax.plot(pk_d, pk_v, marker="*", ms=13, color=color,
                 mec="red" if s.overshoot > tol else "none", mew=1.5, zorder=5)
 
-    if cls_threshold is not None:
-        ax.axhline(cls_threshold, ls="--", color="0.5", lw=1,
-                   label=f"cls_threshold={cls_threshold:g}")
+    if crop_sim_floor is not None:
+        ax.axhline(crop_sim_floor, ls="--", color="0.5", lw=1,
+                   label=f"crop_sim_floor={crop_sim_floor:g}")
 
     multi = [s for s in segs if len(s.nodes) >= 2]
     uni = sum(s.unimodal for s in multi)
@@ -342,7 +342,7 @@ def plot_cls_trajectories(
     ax.set_title(title or f"CLS trajectory per single-component segment  "
                  f"(unimodal {uni}/{len(multi)})")
     ax.grid(True, alpha=0.3)
-    if seen_kinds or cls_threshold is not None:
+    if seen_kinds or crop_sim_floor is not None:
         ax.legend(fontsize=8, loc="best")
     return ax.figure
 
@@ -354,7 +354,7 @@ _KIND_ORDER = {"overshoot": 0, "rising": 1, "truncated": 2, "peaked": 3, "single
 def plot_cls_tree(
     events: list[dict],
     *,
-    cls_threshold: float | None = None,
+    crop_sim_floor: float | None = None,
     ax=None,
     tol: float = 1e-3,
     title: str | None = None,
@@ -390,7 +390,7 @@ def plot_cls_tree(
             if ch is None:
                 continue  # child enqueued but never processed (budget) — no node to draw
             lw = 0.8 + 1.3 * np.log2(1 + edge_leaves[(nd.box, ch.box)])
-            ax.plot([nd.depth, ch.depth], [nd.cls_score, ch.cls_score],
+            ax.plot([nd.depth, ch.depth], [nd.reid_score, ch.reid_score],
                     color="0.78", lw=lw, solid_capstyle="round", zorder=1)
 
     # 2) Each leaf's single-component tail coloured by its diagnosis, on top of the trunk.
@@ -405,21 +405,21 @@ def plot_cls_tree(
         if summ.kind not in seen:
             label = _KIND_STYLE.get(summ.kind, (None, summ.kind))[1]
             seen.add(summ.kind)
-        ax.plot([n.depth for n in tail], [n.cls_score for n in tail],
+        ax.plot([n.depth for n in tail], [n.reid_score for n in tail],
                 color=color, lw=2.0, solid_capstyle="round", zorder=3, label=label)
         pk = tail[summ.peak_index]
-        ax.plot(pk.depth, pk.cls_score, "*", ms=12, color=color, zorder=5,
+        ax.plot(pk.depth, pk.reid_score, "*", ms=12, color=color, zorder=5,
                 mec="red" if summ.overshoot > tol else "none", mew=1.2)
         leaf = path[-1]
-        ax.plot(leaf.depth, leaf.cls_score, "o", ms=6.5, mfc="white", mec=color, mew=1.8, zorder=5)
+        ax.plot(leaf.depth, leaf.reid_score, "o", ms=6.5, mfc="white", mec=color, mew=1.8, zorder=5)
 
     # 3) Fork nodes as open squares (where the single-component reasoning resets).
     for nd in nodes.values():
         if sum(c in nodes for c in nd.children) >= 2:
-            ax.plot(nd.depth, nd.cls_score, "s", mfc="none", mec="0.35", ms=7, mew=1.3, zorder=4)
+            ax.plot(nd.depth, nd.reid_score, "s", mfc="none", mec="0.35", ms=7, mew=1.3, zorder=4)
 
-    if cls_threshold is not None:
-        ax.axhline(cls_threshold, ls="--", color="0.5", lw=1, label=f"cls_threshold={cls_threshold:g}")
+    if crop_sim_floor is not None:
+        ax.axhline(crop_sim_floor, ls="--", color="0.5", lw=1, label=f"crop_sim_floor={crop_sim_floor:g}")
 
     kinds_str = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
     ax.set_xlabel("zoom depth")
@@ -427,7 +427,7 @@ def plot_cls_tree(
     ax.set_title(title or f"CLS zoom tree  ·  {len(paths)} leaves  ·  {kinds_str}")
     ax.margins(x=0.04)
     ax.grid(True, alpha=0.3)
-    if seen or cls_threshold is not None:
+    if seen or crop_sim_floor is not None:
         ax.legend(fontsize=8, loc="best")
     return ax.figure
 
@@ -435,7 +435,7 @@ def plot_cls_tree(
 def plot_leaf_paths(
     events: list[dict],
     *,
-    cls_threshold: float | None = None,
+    crop_sim_floor: float | None = None,
     max_panels: int = 24,
     ncols: int = 4,
     tol: float = 1e-3,
@@ -472,23 +472,23 @@ def plot_leaf_paths(
             continue
         path, summ = shown[k]
         depths = [nd.depth for nd in path]
-        scores = [nd.cls_score for nd in path]
+        scores = [nd.reid_score for nd in path]
         color = _KIND_STYLE.get(summ.kind, ("0.4", ""))[0]
 
         ax.plot(depths, scores, "-o", color="0.6", ms=3, lw=1.1, zorder=2)  # full path (grey)
         tail = _terminal_segment(path)
-        ax.plot([nd.depth for nd in tail], [nd.cls_score for nd in tail],
+        ax.plot([nd.depth for nd in tail], [nd.reid_score for nd in tail],
                 "-o", color=color, ms=4, lw=2.2, zorder=3)                  # single-component tail
         for nd in path[:-1]:                                               # forks
             if len(nd.children) >= 2:
                 ax.axvline(nd.depth, color="0.8", ls=":", lw=1, zorder=1)
-                ax.plot(nd.depth, nd.cls_score, "s", mfc="none", mec="0.4", ms=8, zorder=4)
+                ax.plot(nd.depth, nd.reid_score, "s", mfc="none", mec="0.4", ms=8, zorder=4)
         pk_d, pk_v = tail[summ.peak_index].depth, summ.peak_cls
         ax.plot(pk_d, pk_v, "*", ms=14, color=color, zorder=5,
                 mec="red" if summ.overshoot > tol else "none", mew=1.5)
         ax.plot(depths[-1], scores[-1], "o", ms=9, mfc="none", mec=color, mew=2, zorder=5)  # leaf
-        if cls_threshold is not None:
-            ax.axhline(cls_threshold, ls="--", color="0.5", lw=0.8)
+        if crop_sim_floor is not None:
+            ax.axhline(crop_sim_floor, ls="--", color="0.5", lw=0.8)
         ax.set_title(f"leaf d{depths[-1]} · {summ.kind}\n"
                      f"stop={summ.stop_decision} · peak@d{pk_d} · over={summ.overshoot:+.2f}",
                      fontsize=8)
@@ -506,7 +506,7 @@ def plot_leaf_paths(
 
 
 def save_cls_trajectory(item, events: list[dict], out_dir, *,
-                        cls_threshold: float | None = None) -> Path:
+                        crop_sim_floor: float | None = None) -> Path:
     """Render :func:`plot_cls_tree` for one image and save ``<out_dir>/<image_id>.png``.
 
     Mirrors ``experiments.visualize.save_cascade_trace`` so :mod:`experiments.run` can dump the
@@ -520,7 +520,7 @@ def save_cls_trajectory(item, events: list[dict], out_dir, *,
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    fig = plot_cls_tree(events, cls_threshold=cls_threshold,
+    fig = plot_cls_tree(events, crop_sim_floor=crop_sim_floor,
                         title=f"{item.image_id}  CLS zoom tree")
     path = out_dir / f"{item.image_id}.png"
     fig.savefig(path, dpi=110, bbox_inches="tight")

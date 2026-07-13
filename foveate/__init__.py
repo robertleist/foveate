@@ -1,31 +1,36 @@
-"""foveate — training-free, recursive, prototype-guided instance discovery from frozen
-DINOv3 features.
+"""foveate — Foveate: a training-free, in-context, recursive method for instance segmentation
+from frozen DINOv3 features (paper: *Foveate*, CV4E @ ECCV 2026).
 
 A foveated zoom: starting from the whole image, the cascade recursively directs the encoder's
 fixed patch budget at candidate regions (a connected-components fixed point), re-identifies the
-exemplar concept (CLS / prototype similarity), and refines each instance's border — discovering
-*every* instance of a prompted morphology within a single image (or across images).
+exemplar concept against the exemplar bank (crop similarity of CLS tokens), and separates each
+instance — discovering *every* instance of a prompted concept within a single image (or across
+images).
 
-Lineage: inspired by INSID3 (CVPR 2026), which produces a single cross-image mask in one
-forward; foveate adds recursion + individuation to turn that into instance discovery.
+Lineage: inspired by INSID3, which produces a single cross-image mask in one forward; Foveate
+adds the recursive cascade + splitting to turn that into instance discovery.
 
 Quickstart
 ----------
->>> from foveate import discover_instances, Config, DINOv3Backbone
+>>> from foveate import cascade, Config, DINOv3Backbone
 >>> backbone = DINOv3Backbone()
->>> instances, stats = discover_instances(backbone, image, exemplar_masks, Config())
+>>> instances, stats = cascade(backbone, image, exemplar_masks, Config())
 
-Stages (single-pass :func:`run` pipeline, exposed for the notebooks): features → gate →
-clustering → individuation → merge. The recursive entry point is :func:`discover_instances`.
+The recursive entry point is :func:`cascade` (the Foveate cascade of Algorithm 1). A
+single-pass :func:`run` pipeline (features → gate → clustering → individuation → merge) is kept
+for the notebooks / ablations.
 """
 
-from foveate.cascade import discover_instances
+from foveate.cascade import cascade
 from foveate.config import Config, InSID3Params
 from foveate.pipeline import InSID3Result, run
 from foveate.types import Backbone, CascadeStats, DiscoveredInstance, Instance, Stats
 
+# Pre-rename public name (the cascade entry point used to be ``discover_instances``).
+discover_instances = cascade
+
 __all__ = [
-    "discover_instances",
+    "cascade",
     "Config",
     "Instance",
     "Stats",
@@ -33,6 +38,7 @@ __all__ = [
     "run",
     "InSID3Result",
     # Backward-compatible aliases.
+    "discover_instances",
     "InSID3Params",
     "DiscoveredInstance",
     "CascadeStats",

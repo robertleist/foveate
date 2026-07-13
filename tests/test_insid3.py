@@ -19,14 +19,14 @@ def _reference(backbone, two_squares, cfg):
     return extr, img
 
 
-def test_build_extractor_and_cls_bank(backbone, two_squares):
+def test_build_extractor_and_exemplar_cls(backbone, two_squares):
     cfg = Config(foreground_extractor="insid3", standardize=True)
     extr, _ = _reference(backbone, two_squares, cfg)
 
-    assert extr.cls_bank is not None
-    assert extr.cls_bank.ndim == 2                       # (S, D)
-    assert extr.cls_bank.shape[0] == 1                   # one exemplar mask
-    norms = extr.cls_bank.norm(dim=1)
+    assert extr.exemplar_cls is not None
+    assert extr.exemplar_cls.ndim == 2                       # (S, D)
+    assert extr.exemplar_cls.shape[0] == 1                   # one exemplar mask
+    norms = extr.exemplar_cls.norm(dim=1)
     assert torch.allclose(norms, torch.ones_like(norms), atol=1e-4)
 
 

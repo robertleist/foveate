@@ -1,7 +1,7 @@
 """Unified :class:`Config` — every tunable knob in one place.
 
 This collapses the old ``InSID3Params`` (gate / cluster / split stage params) and the
-loose ``discover_instances`` keyword arguments into a single dataclass that is threaded
+loose ``cascade`` keyword arguments into a single dataclass that is threaded
 through every stage, so the notebook, the experiments and any service wrapper share one
 source of truth (no more parameter drift).
 
@@ -20,12 +20,24 @@ class Config:
     # --- features ---
     standardize: bool = True              # z-score feature dims before L2-norm
 
-    # --- foreground extraction strategy ---
-    foreground_extractor: str = "insid3"  # insid3 | bank — how "where is the class" is decided
+    # --- WHERE: foreground extraction strategy ---
+    foreground_extractor: str = "insid3"  # insid3 | otsu | bank — how "where is the concept" is decided
 
-    # --- INSID3 foreground extractor (official algorithm) ---
-    insid3_tau: float = 0.6               # fine-grained clustering similarity threshold
-    insid3_aggregate_threshold: float = 0.2  # alpha: min combined score to merge a cluster
+    # --- WHERE: Otsu extractor (cheap baseline; paper Sec. 3 "Where") ---
+    otsu_top_k: int = 1                   # per crop, build the similarity map from the K exemplars
+                                          # whose CLS is most cosine-similar to the crop
+    otsu_reduce: str = "mean"             # reduce the per-patch similarity over the K exemplars:
+                                          # mean | max
+
+    # --- EXTRACT: connected components that propose tighter crops ---
+    extract_connectivity: int = 8         # 4 | 8 pixel/patch connectivity for the CC on the
+                                          # foreground grid (8 = don't over-split single instances)
+
+    # --- INSID3 foreground extractor (official algorithm; paper Sec. 3, Tab. 1) ---
+    insid3_tau_fg: float = 0.6            # tau_fg: INSID3 foreground-granularity threshold (paper
+                                          # Tab. 1) — fine-grained clustering similarity threshold
+    insid3_aggt: float = 0.2             # AggT: INSID3 aggregation threshold (paper Tab. 1) — min
+                                          # combined score to merge a candidate cluster with the seed
     insid3_linkage: str = "average"       # agglomerative linkage for INSID3 clustering (no graph)
     insid3_crop_reference: bool = True    # crop ref image+mask to each exemplar bbox before
                                           # embedding, so the reference scale matches zoomed crops
@@ -35,11 +47,14 @@ class Config:
                                           # apples. Kept for config compat.
     insid3_top_k_exemplars: int = 1       # per crop, run INSID3 on the K exemplars whose CLS is
                                           # most cosine-similar to the crop (1 = standard INSID3)
-    insid3_dynamic_params: bool = False   # derive tau / aggregate_threshold from the crop↔exemplar
-                                          # CLS similarity s (overrides the static values above):
-    insid3_tau_scale: float = 0.7         #   tau = tau_scale * s  (raw s≈1 over-segments; scale it)
-    insid3_aggregate_scale: float = 0.3   #   aggregate_threshold = aggregate_scale * (1 - s)
-                                          #   (similar crop → low threshold → aggregate freely)
+    insid3_dynamic_tau_fg: bool = False   # derive tau_fg from the crop↔exemplar CLS similarity s
+                                          # (overrides insid3_tau_fg above)
+    insid3_dynamic_aggt: bool = False     # derive AggT from s (overrides insid3_aggt above)
+    insid3_tau_fg_scale: float = 0.7      #   tau_fg = tau_fg_scale * (1 - s): a dissimilar crop must
+                                          #   be split into many fine clusters to find the object; a
+                                          #   frame-filling match only needs a coarse fg/bg split
+    insid3_aggt_scale: float = 0.3        #   AggT = aggt_scale * s: a dissimilar crop's many
+                                          #   clusters re-merge freely
 
     # --- semantic gate / clustering / individuation / merge (single-pass pipeline) ---
     gate_threshold: float = 0.55          # absolute cosine to keep a patch as the class
@@ -57,21 +72,23 @@ class Config:
     score_threshold: float = 0.0          # drop instances with mean gate score below this
 
     # --- recursion bounds (cascade) ---
-    # The ONLY stopping signals are CLS re-identification (a child must beat the crop it came from)
-    # and crop SIZE (``min_crop``). There is no depth cap and no split margin.
+    # The ONLY stopping signals are re-identification (a child's re-id score g must beat the crop it
+    # came from) and crop SIZE (the size floor rho, ``min_crop``). No depth cap, no split margin.
     max_depth: int = 8                    # DEPRECATED / unused: depth is no longer a stopping
-                                          # signal (CLS + min_crop are); kept for config compat
-    min_crop: int = 64                    # resolution floor (px) — stop zooming/splitting below this
+                                          # signal (re-id + min_crop are); kept for config compat
+    min_crop: int = 64                    # rho: size floor (px) — a crop at or below this is emitted
+                                          # without splitting further (paper Sec. 3, Algorithm 1)
     pad_frac: float = 0.08               # padding fraction around child crops
     shrink_stop: float = 0.9             # converge when child/crop area ratio >= this
-    cls_threshold: float = 0.5           # absolute class FLOOR: converged crop below this is
-                                         # not the class -> reject (was the accept threshold)
-    cls_top_k: int = 0                   # crop CLS score = mean cosine to the top-K most-similar
-                                         # exemplar CLS (0 or >= S ⇒ all exemplars = the mean-over-
-                                         # bank default; 1 ⇒ max; 2 ⇒ top-2 mean). Mirrors INSID3's
-                                         # top-k exemplar selection. Only bites for multi-exemplar
-                                         # banks (S>1); with one exemplar every choice is identical.
-    zoom_split_retry_eps: float = 0.01   # when a zoom peaks by only a hair (parent CLS beats the
+    crop_sim_floor: float = 0.5           # tau_C: crop similarity floor (paper Sec. 3). A converged
+                                         # crop whose re-id score g is below this is not the concept
+                                         # -> reject; split children are kept only if g >= tau_C.
+    reid_top_k: int = 0                   # re-identification score g(c) = mean crop similarity to the
+                                         # top-K most-similar exemplar CLS in the bank (0 or >= S ⇒
+                                         # all exemplars = the mean-over-bank default of Eq. 2; 1 ⇒
+                                         # max; 2 ⇒ top-2 mean). Mirrors INSID3's top-k exemplar
+                                         # selection. Only bites for multi-exemplar banks (S>1).
+    zoom_split_retry_eps: float = 0.01   # when a zoom peaks by only a hair (parent g beats the
                                          # child by less than this), the crop may be a CLUMP that
                                          # tightening onto one component can't improve — so try ONE
                                          # k=2 split of the parent before emitting it. If the split
@@ -98,7 +115,9 @@ class Config:
     embed_batch_size: int = 8            # crops per backbone forward
     max_total_embeds: int = 512          # global embed budget (safety cap)
     split_mode: str = "kmeans"           # how a converged clump is split: kmeans (k=2 on features,
-                                         # always splits) | watershed (marker-controlled) | none
+                                         # always splits) | watershed (marker-controlled) |
+                                         # agglomerative (cluster foreground patches at cluster_tau) |
+                                         # none
 
     # --- prototype bank ---
     prototype_reduction: str = "all"     # all | mean | cluster | kmeans
@@ -117,20 +136,39 @@ class Config:
     debias_seed: int = 0
 
     # --- leaf classification / acceptance ---
-    # cls_threshold (above, recursion bounds) is the sole acceptance test: mean cosine of the
+    # crop_sim_floor (above, recursion bounds) is the sole acceptance test: mean cosine of the
     # target CLS to all exemplar CLS must clear it for a converged crop to be kept.
     discard_rejected: bool = False       # drop (vs keep) converged crops that fail acceptance
+    emit_components: bool = False         # when a parent is emitted (reid-stop fallback), split its
+                                         # OR-merged foreground into connected components and emit
+                                         # each separately, instead of one merged mask. Recovers
+                                         # non-touching instances a rejected split would otherwise fuse.
+
+    #: Pre-rename config keys → their paper-aligned attribute names. Old YAMLs / notebooks that
+    #: still use the legacy keys keep working; :meth:`from_dict` maps them transparently.
+    _ALIASES = {
+        "cls_threshold": "crop_sim_floor",          # tau_C, crop similarity floor
+        "cls_top_k": "reid_top_k",                  # re-identification score g top-k
+        "insid3_tau": "insid3_tau_fg",              # tau_fg
+        "insid3_aggregate_threshold": "insid3_aggt",  # AggT
+        "insid3_dynamic_tau": "insid3_dynamic_tau_fg",
+        "insid3_tau_scale": "insid3_tau_fg_scale",
+        "insid3_dynamic_aggregate_threshold": "insid3_dynamic_aggt",
+        "insid3_aggregate_scale": "insid3_aggt_scale",
+    }
 
     @classmethod
     def from_dict(cls, params: dict[str, Any] | None) -> "Config":
         """Build a Config, overriding defaults with non-None values in ``params``.
 
-        Unknown keys are ignored (so a request can carry extra metadata harmlessly).
+        Legacy key names (see :attr:`_ALIASES`) are accepted and mapped to their current
+        attribute. Unknown keys are ignored (so a request can carry extra metadata harmlessly).
         """
         base = cls()
         if not params:
             return base
         for key, value in params.items():
+            key = cls._ALIASES.get(key, key)
             if hasattr(base, key) and value is not None:
                 setattr(base, key, value)
         return base

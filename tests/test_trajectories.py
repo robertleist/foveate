@@ -75,7 +75,7 @@ def test_overshoot_and_rising_detection():
 
     def node(depth, score, decision="zoom"):
         box = (0, 100 - depth, 0, 100 - depth)
-        return TraceNode(box=box, depth=depth, cls_score=score, decision=decision,
+        return TraceNode(box=box, depth=depth, reid_score=score, decision=decision,
                          n_components=1, children=[])
 
     rising = [node(0, 0.40), node(1, 0.55), node(2, 0.70, decision="leaf")]
@@ -103,7 +103,7 @@ def test_tree_plot_renders(backbone, two_squares):
     img, ex = two_squares
     _, _, events = trace_discovery(backbone, img, ex, config=Config(min_crop=24,
                                                                     cascade_min_instance_area=4))
-    fig = plot_cls_tree(events, cls_threshold=0.5)
+    fig = plot_cls_tree(events, crop_sim_floor=0.5)
     # One axes; at least the leaves are drawn (leaf marker per path).
     assert fig.axes
     assert len(build_paths(events)) >= 1

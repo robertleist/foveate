@@ -28,7 +28,7 @@ class BankExtractor:
 
     def __init__(self, cfg) -> None:
         self.cfg = cfg
-        self.cls_bank: torch.Tensor | None = None
+        self.exemplar_cls: torch.Tensor | None = None
         self.prototypes: torch.Tensor | None = None
         self._B: torch.Tensor | None = None
 
@@ -57,7 +57,7 @@ class BankExtractor:
             standardize=cfg.standardize, debias_B=self._B,
         )
         self.prototypes = bank.prototypes
-        self.cls_bank = bank.cls_bank
+        self.exemplar_cls = bank.exemplar_cls
 
     def predict(
         self, target_feat: torch.Tensor, *, cls: torch.Tensor | None = None,
@@ -83,7 +83,7 @@ class BankExtractor:
         internals = {"sims": sims} if return_internals else {}
         return GateResult(
             foreground=foreground, score_map=score_map,
-            cls_bank=self.cls_bank.cpu().numpy(), internals=internals,
+            exemplar_cls=self.exemplar_cls.cpu().numpy(), internals=internals,
         )
 
 

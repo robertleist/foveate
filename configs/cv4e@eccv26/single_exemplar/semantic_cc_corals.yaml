@@ -26,10 +26,10 @@ foveate:               # any foveate.Config field — SHARED WHERE params with t
   standardize: true
   foreground_extractor: insid3    # insid3 (default) | bank — "where is the class" on the image
   # --- INSID3 foreground extractor (WHERE) ---
-  insid3_tau: 0.4                 # fine-grained clustering similarity threshold
-  insid3_aggregate_threshold: 0.3 # alpha: min combined score to merge a cluster into the object
+  insid3_tau_fg: 0.4                 # fine-grained clustering similarity threshold
+  insid3_aggt: 0.3 # alpha: min combined score to merge a cluster into the object
   insid3_crop_reference: true     # crop ref image+mask to each exemplar bbox (scale-match crops)
-  cls_threshold: 0.1              # (unused here: no cascade / acceptance step in this baseline)
+  crop_sim_floor: 0.1              # (unused here: no cascade / acceptance step in this baseline)
   boundary_smooth_sigma: 0.0
   debias: true                   # project out DINOv3 positional bias; enable for cross-image
   # --- bank extractor only (used when foreground_extractor: bank) ---

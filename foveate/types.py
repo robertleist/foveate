@@ -42,7 +42,7 @@ class Instance:
     mask: np.ndarray                       # (H, W) uint8, ORIGINAL image coordinates
     box: tuple[int, int, int, int]         # (y0, y1, x0, x1) crop that isolated it
     depth: int                             # BFS level at which it converged
-    score: float                           # re-identification score (CLS / proto / combined)
+    score: float                           # re-identification score g(c) of the crop (paper Eq. 2)
 
 
 # Backward-compatible alias: the cascade historically returned ``DiscoveredInstance``.
@@ -51,7 +51,7 @@ DiscoveredInstance = Instance
 
 @dataclass
 class Stats:
-    """Cost + structure accounting for one :func:`discover_instances` call."""
+    """Cost + structure accounting for one :func:`cascade` call."""
 
     n_embeds: int = 0
     max_depth: int = 0

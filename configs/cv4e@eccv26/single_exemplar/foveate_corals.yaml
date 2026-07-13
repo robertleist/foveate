@@ -1,6 +1,6 @@
 # Comprehensive foveate sweep on the HIFMB corals COCO dataset.
 # Emphasis: TRAINING configs (image count, known ratio, #exemplars pooled) x the core quality
-# knobs (cls_threshold, zoom_split_retry_eps). The introduced dedup/retry params are explored in
+# knobs (crop_sim_floor, zoom_split_retry_eps). The introduced dedup/retry params are explored in
 # depth on polyps (run_polyps.yaml) — together the two configs form one comprehensive study.
 # Requires the [dino] extra + the downloaded dataset; DINOv3 weights are HF-gated.
 run_name: corals
@@ -34,17 +34,18 @@ foveate:                  # any foveate.Config field — full algorithm knob set
   insid3_top_k_exemplars: 1       # per crop, run INSID3 on the K bank exemplars most CLS-similar
                                   #   to it (1 = standard single-exemplar INSID3). This is the
                                   #   ALGORITHM's pooling knob; eval.max_exemplars sizes the bank.
-  insid3_dynamic_params: false    # derive tau/aggregate from the crop↔exemplar CLS sim s
+  insid3_dynamic_tau_fg: true        # tau = tau_scale * (1 - CLS sim s): dissimilar crop -> fine split
+  insid3_dynamic_aggt: false  # aggregate_threshold = aggregate_scale * s: dissimilar crop -> merge freely
                                   #   (overrides the two static values above)
-  insid3_tau_scale: 0.7           #   dynamic: tau = tau_scale * s (raw s≈1 over-segments)
-  insid3_aggregate_scale: 0.3     #   dynamic: aggregate_threshold = aggregate_scale * (1 - s)
+  insid3_tau_fg_scale: 1.3           #   dynamic: tau = tau_scale * (1 - s) (dissimilar -> split fine)
+  insid3_aggt_scale: 0.3     #   dynamic: aggregate_threshold = aggregate_scale * s (dissimilar -> merge freely)
   # --- positional debiasing (cross-image matching) ---
   debias: true                    # project out DINOv3 positional bias; required for cross-image
   debias_subspace_dim: 8          # rank of the positional subspace projected out
   # --- acceptance & splitting (WHAT). A converged crop is ALWAYS split k=2; the split is kept when
-  #     its best sub-crop beats the parent, then every sub-crop above cls_threshold is kept.
-  #     cls_threshold is the class FLOOR (a converged crop below it is not the class). ---
-  cls_threshold: 0.3              # reject floor on mean cos(crop CLS, exemplar CLS bank)
+  #     its best sub-crop beats the parent, then every sub-crop above crop_sim_floor is kept.
+  #     crop_sim_floor is the class FLOOR (a converged crop below it is not the class). ---
+  crop_sim_floor: 0.3              # reject floor on mean cos(crop CLS, exemplar CLS bank)
   split_mode: none              # kmeans (k=2, always splits) | watershed | none
   # --- zoom-peak split retry (introduced): a zoom that peaks by < eps tries ONE k=2 split of the
   #     parent before emitting (it may be a clump). 0 disables. Swept below. ---

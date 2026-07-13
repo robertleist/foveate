@@ -9,7 +9,7 @@ baseline would match it, so it must be a faithful single-pass version of the sam
 
 WHERE step (shared with the main method for a fair ablation):
     We reuse foveate's INSID3 foreground extractor directly — the exact three lines that both
-    :func:`foveate.pipeline.run` and the root of :func:`foveate.cascade.discover_instances` use to
+    :func:`foveate.pipeline.run` and the root of :func:`foveate.cascade.cascade` use to
     get the class region on a grid, minus everything after it:
 
         feats = foveate.features.embed_image(backbone, image, standardize=cfg.standardize)
@@ -20,7 +20,7 @@ WHERE step (shared with the main method for a fair ablation):
     ``gate.foreground`` is the ``(Hp, Wp)`` boolean class region *before* any individuation, and
     ``gate.score_map`` is the ``(Hp, Wp)`` soft per-patch class confidence in ``[0, 1]``. We take
     those and stop — we do NOT call :func:`foveate.pipeline.run` (it runs clustering /
-    individuation / merge / watershed after the gate) and we do NOT call ``discover_instances``
+    individuation / merge / watershed after the gate) and we do NOT call ``cascade``
     (recursive zoom). Calling the extractor's ``predict`` once, on the full image, is the cleanest
     way to obtain a single-pass class foreground with no recursion.
 

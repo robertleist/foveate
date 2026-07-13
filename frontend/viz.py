@@ -47,11 +47,11 @@ _DECISIONS = {
     "zoom": "1 component, still shrinking -> zoom",
     "leaf": "converged, unsplittable / splitting off -> accepted instance",
     "leaf-cap": "min-crop size floor -> emit components",
-    "clump-split": "converged -> k=2 split, CLS-gated next level",
-    "discard": "converged but below class floor -> discarded",
-    "cls-stop": "no split/zoom child beat this crop -> emit it",
-    "cls-worse": "CLS dropped below the parent -> discarded (why the cascade stopped)",
-    "below-floor": "split sibling below both parent and class floor -> pruned (stronger siblings continue)",
+    "clump-split": "converged -> k=2 split, g-gated next level",
+    "discard": "converged but below the crop similarity floor tau_C -> discarded",
+    "reid-stop": "no split/zoom child beat this crop -> emit it",
+    "reid-worse": "re-id score g dropped below the parent -> discarded (why the cascade stopped)",
+    "below-floor": "split sibling below both parent and tau_C -> pruned (stronger siblings continue)",
 }
 
 
@@ -275,8 +275,8 @@ def render_trace(
     Adapted from ``experiments.visualize.render_cascade_trace`` but takes a plain
     ``image`` + ``image_id`` instead of an ``EvalItem`` (the original only used
     ``item.image`` and ``item.image_id``). Reads the dicts emitted by
-    ``discover_instances``'s ``observer`` hook: ``box``, ``fg`` (patch grid),
-    ``decision``, ``cls_score``, ``children`` boxes. Returns a matplotlib Figure.
+    ``cascade``'s ``observer`` hook: ``box``, ``fg`` (patch grid),
+    ``decision``, ``reid_score``, ``children`` boxes. Returns a matplotlib Figure.
     """
     import matplotlib.patches as mpatches
 
@@ -312,8 +312,8 @@ def render_trace(
                 fill=False, edgecolor="yellow", linewidth=1.5))
 
         decision = ev.get("decision", "?")
-        cls_score = ev.get("cls_score")
-        cls_txt = f"{cls_score:.2f}" if isinstance(cls_score, (int, float)) else "nan"
+        reid_score = ev.get("reid_score")
+        cls_txt = f"{reid_score:.2f}" if isinstance(reid_score, (int, float)) else "nan"
         ax.set_title(
             f"L{ev.get('level')} d{ev.get('depth')}  {decision}\n"
             f"n={ev.get('n_components')}  cls={cls_txt}\n"

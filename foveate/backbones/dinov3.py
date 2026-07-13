@@ -2,7 +2,7 @@
 
 Lifted from ``iquana_toolbox.ai.backbones.dinov3`` with the iquana dependency removed — it
 needs only ``torch`` + ``transformers``. The service can construct its own instance and pass
-it to :func:`foveate.discover_instances` to share weights.
+it to :func:`foveate.cascade` to share weights.
 
 DINOv3 (and DINOv2) resize any input to a fixed square ``image_size`` and patchify with
 ``patch_size``, so the patch grid is ``image_size // patch_size`` per side regardless of the

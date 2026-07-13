@@ -1,13 +1,16 @@
 """Streamlit frontend for the foveate recursive instance-discovery pipeline (DINOv3 only).
 
-Visualizes the two questions the reworked pipeline asks:
+Visualizes the three swappable stages of the cascade (paper Sec. 3), each ablatable on its own:
 
-- **WHERE** is the concept on a crop?  -> the INSID3 foreground-extraction algorithm
-  (fine-grained clusters + debiased forward/backward similarity matching).
-- **WHAT** does a crop contain?  -> a converged crop is ALWAYS split k=2 and each sub-crop is
-  kept only if it re-identifies the exemplar MORE strongly in CLS cosine (the same rule as zoom);
-  if neither sub-crop beats it, the crop itself is emitted. CLS (plus the ``min_crop`` size floor)
-  is the only stopping signal; ``cls_threshold`` is the class *floor* (reject below it).
+- **WHERE** is the concept on a crop?  -> the foreground extractor: INSID3 (clusters +
+  forward/backward matching), Otsu (Otsu on the similarity map to the top-k exemplars), or the
+  legacy bank gate.
+- **EXTRACT** the instances  -> connected components (4- or 8-connectivity) of the foreground
+  propose the tighter child crops.
+- **SPLIT** a converged crop  -> it is ALWAYS split (k=2 means / watershed / agglomerative) and
+  each sub-crop is kept only if its re-identification score ``g`` beats the parent (then every
+  sub-crop above ``crop_sim_floor`` τ_C); if none beats it, the crop itself is emitted.
+  Re-identification (``g``) plus the ``min_crop`` size floor ρ are the only stopping signals.
 
 Run with::
 
@@ -121,20 +124,32 @@ def _build_config(ui: dict):
 
     return Config.from_dict({
         "standardize": ui["standardize"],
+        # WHERE
         "foreground_extractor": ui["extractor"],
-        "insid3_tau": ui["insid3_tau"],
-        "insid3_aggregate_threshold": ui["insid3_aggregate_threshold"],
+        "insid3_tau_fg": ui["insid3_tau_fg"],
+        "insid3_aggt": ui["insid3_aggt"],
         "insid3_top_k_exemplars": ui["insid3_top_k_exemplars"],
-        "insid3_dynamic_params": ui["insid3_dynamic_params"],
-        "insid3_tau_scale": ui["insid3_tau_scale"],
-        "insid3_aggregate_scale": ui["insid3_aggregate_scale"],
+        "insid3_dynamic_tau_fg": ui["insid3_dynamic_tau_fg"],
+        "insid3_dynamic_aggt": ui["insid3_dynamic_aggt"],
+        "insid3_tau_fg_scale": ui["insid3_tau_fg_scale"],
+        "insid3_aggt_scale": ui["insid3_aggt_scale"],
+        "otsu_top_k": ui["otsu_top_k"],
+        "otsu_reduce": ui["otsu_reduce"],
+        "gate_threshold": ui["gate_threshold"],
+        "gate_threshold_mode": ui["gate_threshold_mode"],
+        "gate_percentile": ui["gate_percentile"],
+        # EXTRACT
+        "extract_connectivity": ui["extract_connectivity"],
+        # SPLIT
+        "split_mode": ui["split_mode"],
+        "cluster_tau": ui["cluster_tau"],
+        "zoom_split_retry_eps": ui["zoom_split_retry_eps"],
+        "emit_components": ui["emit_components"],
+        "boundary_smooth_sigma": ui["boundary_smooth_sigma"],
+        # features / acceptance / recursion / dedup
         "debias": ui["debias"],
         "debias_subspace_dim": ui["debias_subspace_dim"],
-        "cls_threshold": ui["cls_threshold"],
-        "split_mode": ui["split_mode"],
-        "zoom_split_retry_eps": ui["zoom_split_retry_eps"],
-        "boundary_smooth_sigma": ui["boundary_smooth_sigma"],
-        "gate_threshold": ui["gate_threshold"],
+        "crop_sim_floor": ui["crop_sim_floor"],
         "min_crop": ui["min_crop"],
         "nms_iou": ui["nms_iou"],
         "nms_containment": ui["nms_containment"],
@@ -184,15 +199,16 @@ def _hf_error_hint(exc: Exception) -> None:
 # ---------------------------------------------------------------------------
 st.title("foveate — recursive instance discovery")
 st.markdown(
-    "Two questions, visualized stage by stage:\n"
-    "- **WHERE** is the concept on a crop? → the **INSID3** foreground extractor "
-    "(fine-grained clusters + debiased similarity matching).\n"
-    "- **WHAT** does a crop contain? → a converged crop is **always split k=2**. The split is kept "
-    "when its **best** sub-crop beats the parent (isolating a real object raises CLS); once "
-    "confirmed, **every** sub-crop above `cls_threshold` is kept — so a *novel* instance sharing the "
-    "crop with the exemplar is not discarded for scoring below the exemplar-biased parent. If no "
-    "sub-crop beats the parent, the crop itself is emitted. CLS + the `min_crop` size floor are the "
-    "only stops."
+    "The cascade is three swappable stages, ablated independently (paper Sec. 3, Algorithm 1):\n"
+    "- **WHERE** is the concept on a crop? → the foreground extractor: **INSID3** "
+    "(clusters + forward/backward matching), **Otsu** (Otsu on the similarity map to the top-k "
+    "exemplars), or the legacy **bank** gate.\n"
+    "- **EXTRACT** the instances → connected components on the foreground propose tighter crops "
+    "(4- or 8-connectivity).\n"
+    "- **SPLIT** a converged crop → **k=2 means** / watershed / agglomerative / none. A split is "
+    "kept when its **best** sub-crop's re-id score `g` beats the parent; once confirmed, **every** "
+    "sub-crop above `crop_sim_floor` (τ_C) is kept. If none beats the parent, the crop is emitted. "
+    "Re-identification (`g`) + the `min_crop` size floor ρ are the only stops."
 )
 
 with st.sidebar:
@@ -201,59 +217,108 @@ with st.sidebar:
     image_size = st.number_input("image_size", min_value=64, max_value=2048, value=768, step=16)
     device = st.selectbox("device", ["auto", "cpu", "cuda"], index=0)
 
-    st.header("Foreground (WHERE)")
-    extractor = st.selectbox("extractor", ["insid3"], index=0)
-    insid3_top_k_exemplars = st.number_input(
-        "insid3_top_k_exemplars", 1, 32, 1, 1,
-        help="Per crop, run INSID3 on the K exemplars most CLS-similar to it (1 = standard "
-             "single-exemplar INSID3).")
-    insid3_dynamic_params = st.checkbox(
-        "insid3_dynamic_params", value=False,
-        help="Derive tau and aggregate_threshold from the crop↔exemplar CLS sim s (overrides the "
-             "two static sliders): tau = tau_scale·s, aggregate = aggregate_scale·(1-s).")
-    if insid3_dynamic_params:
-        insid3_tau_scale = st.slider("insid3_tau_scale", 0.0, 1.5, 0.3, 0.01,
-                                     disabled=not insid3_dynamic_params,
-                                     help="Dynamic tau = tau_scale · CLS sim. Raw s≈1 over-segments; "
-                                          "scale it down.")
-        insid3_aggregate_scale = st.slider("insid3_aggregate_scale", 0.0, 1.0, 0.3, 0.01,
-                                           disabled=not insid3_dynamic_params,
-                                           help="Dynamic aggregate_threshold = aggregate_scale · (1 - CLS sim).")
-        insid3_tau = 0.6
-        insid3_aggregate_threshold = 0.5
+    # Defaults so the ui dict is always complete regardless of which method each axis selects.
+    insid3_top_k_exemplars = 1
+    insid3_dynamic_tau_fg = insid3_dynamic_aggt = False
+    insid3_tau_fg, insid3_aggt = 0.6, 0.2
+    insid3_tau_fg_scale = insid3_aggt_scale = 0.3
+    otsu_top_k, otsu_reduce = 1, "mean"
+    gate_threshold, gate_threshold_mode, gate_percentile = 0.55, "static", 80.0
+    cluster_tau, boundary_smooth_sigma = 0.18, 0.0
 
-    else:
-        insid3_tau_scale = 0.3
-        insid3_aggregate_scale = 0.3
-        insid3_tau = st.slider("insid3_tau", 0.0, 1.0, 0.6, 0.01,
-                               disabled=insid3_dynamic_params)
-        insid3_aggregate_threshold = st.slider("insid3_aggregate_threshold", 0.0, 1.0, 0.2, 0.01,
-                                               disabled=insid3_dynamic_params)
-        #gate_threshold = st.slider("gate_threshold (bank)", 0.0, 1.0, 0.55, 0.01)
-    gate_threshold = 0.55  # This is deprecated
+    # ---------------- WHERE ----------------
+    st.header("① WHERE · foreground")
+    st.caption("Which patches of the crop are the concept? Each extractor exposes its own params.")
+    extractor = st.selectbox(
+        "where extractor", ["insid3", "otsu", "bank"], index=0,
+        help="insid3 = clusters + forward/backward matching · otsu = Otsu on the similarity map to "
+             "the top-k exemplars · bank = legacy per-patch max-cosine gate.")
+    if extractor == "insid3":
+        insid3_top_k_exemplars = st.number_input(
+            "insid3_top_k_exemplars", 1, 32, 1, 1,
+            help="Per crop, run INSID3 on the K exemplars most CLS-similar to it (1 = standard "
+                 "single-exemplar INSID3).")
+        insid3_dynamic_tau_fg = st.checkbox(
+            "insid3_dynamic_tau_fg", value=False,
+            help="Derive τ_fg from the crop↔exemplar CLS sim s (overrides the static slider): "
+                 "τ_fg = τ_fg_scale·(1-s).")
+        insid3_dynamic_aggt = st.checkbox(
+            "insid3_dynamic_aggt", value=False,
+            help="Derive AggT from the crop↔exemplar CLS sim s (overrides the static slider): "
+                 "AggT = aggt_scale·s.")
+        if insid3_dynamic_tau_fg:
+            insid3_tau_fg_scale = st.slider("insid3_tau_fg_scale", 0.0, 1.5, 0.3, 0.01,
+                                            help="Dynamic τ_fg = τ_fg_scale · (1 - CLS sim).")
+        else:
+            insid3_tau_fg = st.slider("insid3_tau_fg (τ_fg)", 0.0, 1.0, 0.6, 0.01,
+                                      help="INSID3 foreground-granularity threshold.")
+        if insid3_dynamic_aggt:
+            insid3_aggt_scale = st.slider("insid3_aggt_scale", 0.0, 1.0, 0.3, 0.01,
+                                          help="Dynamic AggT = aggt_scale · CLS sim.")
+        else:
+            insid3_aggt = st.slider("insid3_aggt (AggT)", 0.0, 1.0, 0.2, 0.01,
+                                    help="INSID3 aggregation threshold.")
+    elif extractor == "otsu":
+        otsu_top_k = st.number_input(
+            "otsu_top_k", 1, 32, 1, 1,
+            help="Build the similarity map from the K exemplars most CLS-similar to the crop.")
+        otsu_reduce = st.selectbox(
+            "otsu_reduce", ["mean", "max"], index=0,
+            help="Reduce the per-patch similarity over the K selected exemplars, then Otsu-threshold.")
+    else:  # bank
+        gate_threshold_mode = st.selectbox(
+            "gate_threshold_mode", ["static", "otsu", "gmm2", "percentile"], index=0,
+            help="How the per-patch max-cosine-to-bank map is binarized.")
+        if gate_threshold_mode == "static":
+            gate_threshold = st.slider("gate_threshold", 0.0, 1.0, 0.55, 0.01)
+        elif gate_threshold_mode == "percentile":
+            gate_percentile = st.slider("gate_percentile", 0.0, 100.0, 80.0, 1.0)
+
+    # ---------------- EXTRACT ----------------
+    st.header("② EXTRACT · components")
+    st.caption("Connected components of the foreground propose the tighter child crops.")
+    st.selectbox("extract method", ["connected_components"], index=0, disabled=True,
+                 help="Only connected components for now — the paper's Extract stage.")
+    extract_connectivity = st.selectbox(
+        "extract_connectivity", [8, 4], index=0,
+        help="8 = diagonal neighbours join one component (don't over-split a single instance); "
+             "4 = only edge neighbours join (splits diagonally-touching blobs).")
+
     st.header("Debias / features")
     standardize = st.checkbox("standardize", value=True)
     debias = st.checkbox("debias", value=True)
     debias_subspace_dim = st.number_input("debias_subspace_dim", 1, 64, 8, 1)
 
-    st.header("Acceptance & splitting (WHAT) / recursion")
-    st.caption("Stopping is CLS-only: a converged crop is **always** split k=2. The split is kept "
-               "when its best sub-crop beats the parent; then every sub-crop above `cls_threshold` "
-               "is kept (novel siblings included), else the crop itself is emitted. The single "
-               "geometric bound is the `min_crop` size floor.")
-    cls_threshold = st.slider("cls_threshold (class floor)", 0.0, 1.0, 0.3, 0.01)
-    split_mode = st.selectbox("split_mode", ["kmeans", "watershed", "none"], index=0,
-                              help="How a converged crop is split: kmeans (k=2 on features — "
-                                   "always splits) | watershed (marker-controlled) | none "
-                                   "(disable splitting, accept converged crops whole).")
+    # ---------------- SPLIT ----------------
+    st.header("③ SPLIT · individuation (WHAT)")
+    st.caption("A converged crop is **always** split; the sub-crops are kept only if the best "
+               "re-identifies (`g`) more strongly than the parent, then every sub-crop above τ_C.")
+    split_mode = st.selectbox("split_mode", ["kmeans", "watershed", "agglomerative", "none"], index=0,
+                              help="kmeans (k=2 on features — always splits) | watershed "
+                                   "(marker-controlled) | agglomerative (cluster the clump's "
+                                   "foreground patches at cluster_tau) | none (accept converged whole).")
+    if split_mode in ("agglomerative", "watershed"):
+        cluster_tau = st.slider("cluster_tau (distance threshold)", 0.0, 1.0, 0.18, 0.01,
+                                help="Agglomerative cosine-distance threshold. In agglomerative split "
+                                     "it sets sub-crop granularity (lower = finer); in watershed it "
+                                     "sizes the marker over-segmentation.")
+    if split_mode == "watershed":
+        boundary_smooth_sigma = st.slider("boundary_smooth_sigma", 0.0, 3.0, 0.0, 0.1,
+                                          help="Gaussian (patches) on watershed maps; >0 = fewer fragments.")
     zoom_split_retry_eps = st.slider("zoom_split_retry_eps", 0.0, 0.1, 0.01, 0.005,
-                                     help="When a zoom peaks by less than this (parent CLS beats the "
-                                          "child by a hair), try ONE k=2 split of the parent before "
+                                     disabled=(split_mode == "none"),
+                                     help="When a zoom peaks by less than this (parent g beats the "
+                                          "child by a hair), try ONE split of the parent before "
                                           "emitting — it may be a clump. 0 disables.")
-    boundary_smooth_sigma = st.slider("boundary_smooth_sigma", 0.0, 3.0, 0.0, 0.1,
-                                      disabled=(split_mode != "watershed"),
-                                      help="Gaussian (patches) on watershed maps; >0 = fewer fragments.")
-    min_crop = st.number_input("min_crop (px size floor)", 8, 512, 64, 8,
+    emit_components = st.checkbox("emit_components", value=False,
+                                  help="When a parent is emitted (reid-stop fallback), split its "
+                                       "OR-merged foreground into connected components and emit each "
+                                       "separately, instead of one merged mask. Recovers "
+                                       "non-touching instances a rejected split would otherwise fuse.")
+
+    st.header("Acceptance / recursion")
+    crop_sim_floor = st.slider("crop_sim_floor (τ_C, crop similarity floor)", 0.0, 1.0, 0.3, 0.01)
+    min_crop = st.number_input("min_crop (ρ, px size floor)", 8, 512, 64, 8,
                                help="Stop zooming/splitting once a crop side is at or below this. "
                                     "This is the ONLY geometric stop — there is no depth cap.")
     st.caption("Dedup: nested k=2 sub-crops can re-find the same object down two branches. A final "
@@ -266,16 +331,26 @@ with st.sidebar:
 
 ui = dict(
     model_id=model_id, image_size=int(image_size), device=device,
-    extractor=extractor, insid3_tau=insid3_tau,
-    insid3_aggregate_threshold=insid3_aggregate_threshold, gate_threshold=gate_threshold,
+    # WHERE
+    extractor=extractor, insid3_tau_fg=insid3_tau_fg, insid3_aggt=insid3_aggt,
     insid3_top_k_exemplars=int(insid3_top_k_exemplars),
-    insid3_dynamic_params=bool(insid3_dynamic_params),
-    insid3_tau_scale=float(insid3_tau_scale),
-    insid3_aggregate_scale=float(insid3_aggregate_scale),
-    standardize=standardize, debias=debias, debias_subspace_dim=int(debias_subspace_dim),
-    cls_threshold=cls_threshold, split_mode=split_mode,
+    insid3_dynamic_tau_fg=bool(insid3_dynamic_tau_fg),
+    insid3_dynamic_aggt=bool(insid3_dynamic_aggt),
+    insid3_tau_fg_scale=float(insid3_tau_fg_scale),
+    insid3_aggt_scale=float(insid3_aggt_scale),
+    otsu_top_k=int(otsu_top_k), otsu_reduce=otsu_reduce,
+    gate_threshold=float(gate_threshold), gate_threshold_mode=gate_threshold_mode,
+    gate_percentile=float(gate_percentile),
+    # EXTRACT
+    extract_connectivity=int(extract_connectivity),
+    # SPLIT
+    split_mode=split_mode, cluster_tau=float(cluster_tau),
     zoom_split_retry_eps=float(zoom_split_retry_eps),
-    boundary_smooth_sigma=boundary_smooth_sigma, min_crop=int(min_crop),
+    emit_components=bool(emit_components),
+    boundary_smooth_sigma=float(boundary_smooth_sigma),
+    # features / acceptance / recursion / dedup
+    standardize=standardize, debias=debias, debias_subspace_dim=int(debias_subspace_dim),
+    crop_sim_floor=crop_sim_floor, min_crop=int(min_crop),
     nms_iou=float(nms_iou), nms_containment=float(nms_containment),
 )
 
@@ -456,7 +531,7 @@ if run and ref_image is not None and exemplar_masks:
 
     st.success(f"DINOv3 ready on device `{backbone.device}` — grid {backbone.grid}×{backbone.grid}.")
 
-    from foveate import discover_instances
+    from foveate import cascade
     from foveate.foreground import build_extractor
 
     # ---------------- 1 · Reference panel ----------------
@@ -477,7 +552,7 @@ if run and ref_image is not None and exemplar_masks:
 
     # Build the foreground extractor; it exposes the per-exemplar CLS bank.
     try:
-        with st.spinner("Building INSID3 reference / CLS bank…"):
+        with st.spinner(f"Building {cfg.foreground_extractor} reference / exemplar CLS bank…"):
             extractor_obj = build_extractor(cfg)
             extractor_obj.set_reference(
                 backbone, (exemplar_images if multi else ref_image), exemplar_masks,
@@ -487,10 +562,10 @@ if run and ref_image is not None and exemplar_masks:
         _hf_error_hint(exc)
         st.stop()
 
-    cls_bank = getattr(extractor_obj, "cls_bank", None)
-    if cls_bank is not None:
-        bank_np = cls_bank.detach().cpu().numpy() if hasattr(cls_bank, "detach") else np.asarray(cls_bank)
-        rc1.write(f"`cls_bank.shape` = {tuple(bank_np.shape)}")
+    exemplar_cls = getattr(extractor_obj, "exemplar_cls", None)
+    if exemplar_cls is not None:
+        bank_np = exemplar_cls.detach().cpu().numpy() if hasattr(exemplar_cls, "detach") else np.asarray(exemplar_cls)
+        rc1.write(f"`exemplar_cls.shape` = {tuple(bank_np.shape)}")
         if bank_np.ndim == 2 and bank_np.shape[0] >= 1:
             norms = np.linalg.norm(bank_np, axis=1)
             if bank_np.shape[0] >= 2:
@@ -499,7 +574,7 @@ if run and ref_image is not None and exemplar_masks:
                 rc1.caption("Pairwise CLS cosine")
                 rc1.dataframe(np.round(sim, 3))
     else:
-        rc1.info("Extractor exposed no `cls_bank`.")
+        rc1.info("Extractor exposed no `exemplar_cls`.")
 
     # ---------------- 3 · Step-by-step cascade ----------------
     st.header("3 · Step-by-step cascade")
@@ -507,8 +582,8 @@ if run and ref_image is not None and exemplar_masks:
 
     try:
         t0 = time.time()
-        with st.spinner("Running discover_instances (recursive zoom)…", show_time=True):
-            instances, stats = discover_instances(
+        with st.spinner("Running cascade (recursive zoom)…", show_time=True):
+            instances, stats = cascade(
                 backbone, target_image, exemplar_masks,
                 negative_masks=None, config=cfg,
                 exemplar_image=None if (same_image or multi) else ref_image,
@@ -531,18 +606,19 @@ if run and ref_image is not None and exemplar_masks:
                       "final NMS.")
 
     # Producer note per decision — what the node did with its extracted instances.
-    _split_name = {"kmeans": "k=2 means", "watershed": "watershed"}.get(cfg.split_mode, cfg.split_mode)
+    _split_name = {"kmeans": "k=2 means", "watershed": "watershed",
+                   "agglomerative": "agglomerative"}.get(cfg.split_mode, cfg.split_mode)
     def _producer(decision: str, n_grids: int) -> str:
         return {
-            "split": f"Connected components found {n_grids} instances → recurse",
+            "split": f"EXTRACT: connected components found {n_grids} instances → recurse",
             "clump-split": f"Converged → {_split_name} split into {n_grids} sub-crops; kept if the "
-                           f"best beats the parent, then every sub-crop above the class floor "
+                           f"best beats the parent (g), then every sub-crop above τ_C "
                            f"(novel siblings included), else this crop is emitted",
             "zoom": "1 component, not converged → zoom in",
             "leaf": "Converged & unsplittable (or splitting off) → accepted as 1 instance",
-            "leaf-cap": f"min-crop size floor → emitted {n_grids} instance(s)",
-            "cls-stop": "No split/zoom child beat this crop → emit it as the instance",
-            "discard": "Below class floor → discarded",
+            "leaf-cap": f"min-crop size floor ρ → emitted {n_grids} instance(s)",
+            "reid-stop": "No split/zoom child beat this crop → emit it as the instance",
+            "discard": "Below the crop similarity floor τ_C → discarded",
             "empty": "Foreground gate fired on nothing",
         }.get(decision, decision)
 
@@ -581,7 +657,7 @@ if run and ref_image is not None and exemplar_masks:
             final_pred = viz.overlay_mask(final_pred, pred_masks[k], viz._PALETTE[k % len(viz._PALETTE)])
     ic0.image(final_pred,
               caption="prediction", width="content")
-    if gt_masks:
+    if gt_masks and False:
         with st.spinner("Loading GT plot", show_time=True):
             final_gt = target_image
             for k in range(len(gt_masks)):
@@ -598,7 +674,7 @@ if run and ref_image is not None and exemplar_masks:
     try:
         from experiments.trajectories import plot_cls_tree
 
-        ic2.pyplot(plot_cls_tree(events, cls_threshold=cfg.cls_threshold), width="content")
+        ic2.pyplot(plot_cls_tree(events, crop_sim_floor=cfg.crop_sim_floor), width="content")
     except Exception as e:  # noqa: BLE001
         ic2.caption(f"trajectory unavailable: {e}")
 
@@ -612,30 +688,30 @@ if run and ref_image is not None and exemplar_masks:
                              expanded=False):
                 y0, y1, x0, x1 = ev["box"]
                 crop = target_image[y0:y1, x0:x1]
-                cs = ev.get("cls_score")
+                cs = ev.get("reid_score")
                 cs_txt = f"{cs:.3f}" if isinstance(cs, (int, float)) else "nan"
 
-                if ev.get("decision") in ("cls-worse", "below-floor"):
-                    # A dropped child. Two reasons: cls-worse = no child beat this crop's parent, so
+                if ev.get("decision") in ("reid-worse", "below-floor"):
+                    # A dropped child. Two reasons: reid-worse = no child beat this crop's parent, so
                     # the parent was the peak and the cascade stopped there; below-floor = a stronger
                     # sibling confirmed the split, but this crop fell below BOTH its parent and the
                     # class floor, so it is pruned while the sibling keeps zooming.
-                    pcls = ev.get("parent_cls")
+                    pcls = ev.get("parent_reid")
                     pcls_txt = f"{pcls:.3f}" if isinstance(pcls, (int, float)) else "?"
                     if ev.get("decision") == "below-floor":
                         st.image(_to_uint8_rgb(crop), caption="crop — weak split sibling → pruned",
                                  width="content")
-                        st.caption(f"cls_score {cs_txt} ≤ parent {pcls_txt} and below the class "
-                                   f"floor {cfg.cls_threshold:.3f} → pruned; a stronger sibling beat "
+                        st.caption(f"reid_score {cs_txt} ≤ parent {pcls_txt} and below the class "
+                                   f"floor {cfg.crop_sim_floor:.3f} → pruned; a stronger sibling beat "
                                    f"the parent and continued the split.")
                     else:
                         st.image(_to_uint8_rgb(crop), caption="crop — CLS worse than parent → dropped",
                                  width="content")
-                        st.caption(f"cls_score {cs_txt} ≤ parent {pcls_txt} → dropped; no child beat "
+                        st.caption(f"reid_score {cs_txt} ≤ parent {pcls_txt} → dropped; no child beat "
                                    f"this crop, so the cascade stopped zooming here.")
                     continue
 
-                st.caption(f"box {ev.get('box')}  ·  cls_score {cs_txt}")
+                st.caption(f"box {ev.get('box')}  ·  reid_score {cs_txt}")
 
                 intern = ev.get("internals") or {}
 
@@ -660,15 +736,26 @@ if run and ref_image is not None and exemplar_masks:
                 else:
                     st.caption("single exemplar / bank gate — no per-crop selection")
 
-                # --- Foreground + INSID3 params ---
+                # --- Foreground (WHERE) + its params ---
                 col1, col2 = st.columns(2)
                 with col1:
                     fg = ev.get("fg")
-                    tau = intern.get("tau_used", cfg.insid3_tau)
-                    agg = intern.get("aggregate_used", cfg.insid3_aggregate_threshold)
+                    where = cfg.foreground_extractor
+                    if where == "otsu":
+                        thr = intern.get("otsu_threshold")
+                        red = intern.get("aggregate_used", cfg.otsu_reduce)
+                        fg_cap = (f"foreground — Otsu on {red} sim, thr={thr:.3f}"
+                                  if isinstance(thr, (int, float))
+                                  else f"foreground — Otsu on {red} sim")
+                    elif where == "insid3":
+                        tau = intern.get("tau_used", cfg.insid3_tau_fg)
+                        agg = intern.get("aggregate_used", cfg.insid3_aggt)
+                        fg_cap = f"foreground on crop — τ_fg={tau}, AggT={agg}"
+                    else:
+                        fg_cap = "foreground on crop — bank gate"
                     if fg is not None and np.asarray(fg).size:
                         st.image(viz.overlay_mask(crop, np.asarray(fg, dtype=bool), (255, 0, 0)),
-                                 caption=f"foreground on crop - tau={tau}, aggregate={agg}", width="content")
+                                 caption=fg_cap, width="content")
 
                 with col2:
                     # --- Extracted instances + producer ---
@@ -682,7 +769,7 @@ if run and ref_image is not None and exemplar_masks:
                     f"{viz._DECISIONS.get(ev.get('decision'), '')}  ·  "
                     f"{len(ev.get('children', []))} child crop(s) enqueued"
                 )
-                with st.expander("INSID3 internals", expanded=False):
+                with st.expander(f"WHERE internals ({cfg.foreground_extractor})", expanded=False):
                     shown = False
                     clusters = intern.get("clusters")
                     cols = st.columns(4)
@@ -714,4 +801,4 @@ if run and ref_image is not None and exemplar_masks:
                                      caption="seed", width="content")
                             shown = True
                     if not shown:
-                        st.caption("no internals (bank gate)")
+                        st.caption("no visual internals for this extractor")

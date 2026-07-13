@@ -1,6 +1,6 @@
 """FoveateMethod — the default method: recursive foveated instance discovery.
 
-Wraps :func:`foveate.discover_instances` behind the :class:`~experiments.methods.base.Method`
+Wraps :func:`foveate.cascade` behind the :class:`~experiments.methods.base.Method`
 interface exactly as the pre-abstraction runner did: the ``backbone:`` block builds the
 encoder, the ``foveate:`` block resolves into one :class:`foveate.Config`, and the observer
 callback is threaded through so the runner's cascade-trace rendering keeps working.
@@ -19,7 +19,7 @@ from experiments.methods.base import (
     build_backbone,
     register_method,
 )
-from foveate import Config, discover_instances
+from foveate import Config, cascade
 from foveate.foreground import build_extractor
 
 
@@ -32,7 +32,7 @@ class FoveateMethod(Method):
         self.backbone = build_backbone(config.get("backbone", {}))
         self.foveate_config = Config.from_dict(config.get("foveate", {}))
         # The runner's CLS-trajectory rendering reads the acceptance floor off the method.
-        self.cls_threshold = self.foveate_config.cls_threshold
+        self.crop_sim_floor = self.foveate_config.crop_sim_floor
         # Cross-image (inter) reuses one exemplar bank for every target of a class; cache the
         # extractor (whose set_reference embeds every exemplar crop) so that cost is paid once.
         self._ref_cache: dict = {}
@@ -58,7 +58,7 @@ class FoveateMethod(Method):
     def predict(
         self, item: EvalItem, observer: Callable[[dict], None] | None = None
     ) -> MethodPrediction:
-        instances, stats = discover_instances(
+        instances, stats = cascade(
             self.backbone, item.image, item.exemplar_masks, config=self.foveate_config,
             exemplar_image=item.exemplar_image, extractor=self._cached_extractor(item),
             observer=observer,
