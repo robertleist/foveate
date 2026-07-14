@@ -222,3 +222,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Re-id g validation plots (experiments/validate_reid_*.py outputs)
+experiments/reid_zoom_out/
