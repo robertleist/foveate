@@ -2,6 +2,9 @@
 runs/
 mlruns/
 papers/
+datasets/
+.idea/
+.claude/
 *.npz
 
 # Byte-compiled / optimized / DLL files
