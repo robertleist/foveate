@@ -114,9 +114,11 @@ class OtsuExtractor:
     # ------------------------------------------------------------------- predict
     def predict(
         self, target_feat: torch.Tensor, *, cls: torch.Tensor | None = None,
-        return_internals: bool = False,
+        box: tuple[int, int, int, int] | None = None, return_internals: bool = False,
     ) -> GateResult:
-        """Otsu on the per-patch similarity to the top-k exemplar prototypes → foreground grid."""
+        """Otsu on the per-patch similarity to the top-k exemplar prototypes → foreground grid.
+
+        ``box`` is accepted for interface parity (only the oracle extractor uses it) and ignored."""
         hp, wp, d = target_feat.shape
         device = target_feat.device
         t_deb = project_out(target_feat.reshape(hp * wp, d), self._B)         # (P, D) debiased

@@ -61,12 +61,13 @@ class BankExtractor:
 
     def predict(
         self, target_feat: torch.Tensor, *, cls: torch.Tensor | None = None,
-        return_internals: bool = False,
+        box: tuple[int, int, int, int] | None = None, return_internals: bool = False,
     ) -> GateResult:
         """Foreground = per-patch max cosine to the bank, thresholded (static/adaptive).
 
         ``cls`` is accepted for interface parity with INSID3 but unused (the bank gate scores
-        every target patch against the whole prototype bank, no per-crop exemplar selection)."""
+        every target patch against the whole prototype bank, no per-crop exemplar selection);
+        ``box`` is likewise accepted (only the oracle extractor uses it) and ignored."""
         hp, wp, d = target_feat.shape
         flat = project_out(target_feat.reshape(hp * wp, d), self._B)
         sims = (flat @ self.prototypes.T).max(dim=1).values.reshape(hp, wp).cpu().numpy()

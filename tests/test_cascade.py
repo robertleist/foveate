@@ -1,11 +1,12 @@
 import numpy as np
+import pytest
 
 import torch
 
 from foveate import Config, cascade
 from foveate.cascade import (
-    _CONN4, _CONN8, _extract_structure, _reid_survivors, _mask_overlap, _nms, _split_kmeans,
-    _survivors,
+    _CONN4, _CONN8, _component_scores, _extract_structure, _reid_survivors, _mask_overlap, _nms,
+    _split_kmeans, _survivors,
 )
 from foveate.types import Instance
 
@@ -25,6 +26,24 @@ def test_cascade_runs_with_otsu_where(backbone, two_squares):
     instances, stats = cascade(backbone, img, ex, config=cfg)
     assert stats.n_embeds > 0
     assert all(inst.mask.shape == img.shape[:2] for inst in instances)
+
+
+def test_cascade_runs_with_oracle_where(backbone, two_squares):
+    """The oracle Where extractor drives the full cascade off the injected GT foreground."""
+    img, ex = two_squares
+    gt = np.zeros(img.shape[:2], dtype=bool)              # both red squares are the class GT
+    gt[20:40, 20:40] = True
+    gt[80:100, 80:100] = True
+    cfg = Config(foreground_extractor="oracle", debias=False, min_crop=24,
+                 cascade_min_instance_area=4)
+    instances, stats = cascade(backbone, img, ex, config=cfg, gt_foreground=gt)
+    assert stats.n_embeds > 0
+    assert all(inst.mask.shape == img.shape[:2] for inst in instances)
+    # Perfect Where: every emitted mask overlaps the GT foreground and is dominated by it (patch-grid
+    # quantization on upsampling can bleed a few pixels past the exact GT boundary, so allow slack).
+    for inst in instances:
+        m = inst.mask.astype(bool)
+        assert (m & gt).sum() > (m & ~gt).sum()
 
 
 def test_cascade_runs_with_both_connectivities(backbone, two_squares):
@@ -220,6 +239,56 @@ def test_emit_components_splits_multi_component_parent(backbone, two_squares):
     split, _ = cascade(backbone, img, ex, config=Config(emit_components=True, **base))
     assert len(merged) == 1                      # two non-touching squares OR-merged into one
     assert len(split) == 2                       # ... recovered as two separate instances
+
+
+def test_component_scores_downweight_cutoff_sliver():
+    """A border-touching component (a cut-off sliver) is scaled by its area fraction of the
+    dominant component; interior components keep the crop's g. This is what stops the sliver — which
+    carries the exemplar's inflated g — from outranking a neighbour's full detection in NMS."""
+    shape = (8, 8)
+    whole = np.zeros(shape, dtype=bool); whole[2:6, 2:6] = True          # interior, 16 px, largest
+    sliver = np.zeros(shape, dtype=bool); sliver[0, 3:5] = True          # touches top border, 2 px
+    scores = _component_scores([whole, sliver], base_score=0.9, grid_shape=shape)
+    assert scores[0] == 0.9                                              # whole → g unchanged
+    assert scores[1] == pytest.approx(0.9 * 2 / 16)                      # sliver → area-scaled down
+    assert scores[1] < scores[0]                                         # so the full detection wins
+
+
+def test_component_scores_interior_components_keep_g():
+    """Two non-touching interior instances both keep the full g (no false area penalty)."""
+    shape = (10, 10)
+    a = np.zeros(shape, dtype=bool); a[2:4, 2:4] = True                  # interior, small
+    b = np.zeros(shape, dtype=bool); b[5:9, 5:9] = True                  # interior, large
+    scores = _component_scores([a, b], base_score=0.7, grid_shape=shape)
+    assert scores == [0.7, 0.7]
+
+
+@pytest.mark.parametrize("mode", ["mean", "kmeans", "full"])
+def test_reid_masked_modes_run_and_discover_targets(backbone, two_squares, mode):
+    """Each masked g mode drives the full cascade end-to-end (scoring the extracted foreground).
+    crop_sim_floor is lowered because masked-cosine g lives on a different scale than CLS cosine."""
+    img, ex = two_squares
+    cfg = Config(reid_mode=mode, reid_kmeans_k=2, crop_sim_floor=0.0,
+                 min_crop=24, cascade_min_instance_area=4)
+    instances, stats = cascade(backbone, img, ex, config=cfg)
+    assert stats.n_embeds > 0
+    assert len(instances) == 2                               # the two red squares, not the distractor
+    for inst in instances:
+        ys, xs = np.where(inst.mask)
+        cy, cx = ys.mean(), xs.mean()
+        assert not (cy < 60 and cx > 60), "discovered the blue distractor"
+
+
+def test_reid_mode_masked_is_independent_of_where_extractor(backbone, two_squares):
+    """The masked re-id score g is decoupled from the Where stage: it drives the cascade even with
+    a non-INSID3 foreground extractor (here otsu), because build_reid_scorer builds its own
+    exemplar bank rather than borrowing the extractor's."""
+    img, ex = two_squares
+    cfg = Config(reid_mode="mean", foreground_extractor="otsu", debias=False,
+                 crop_sim_floor=0.0, min_crop=24, cascade_min_instance_area=4)
+    instances, stats = cascade(backbone, img, ex, config=cfg)
+    assert stats.n_embeds > 0
+    assert len(instances) >= 1                               # runs end-to-end, no coupling error
 
 
 def test_max_depth_is_not_a_stopping_signal(backbone, two_squares):

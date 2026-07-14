@@ -224,10 +224,11 @@ class InSID3Extractor:
     # ------------------------------------------------------------------- predict
     def predict(
         self, target_feat: torch.Tensor, *, cls: torch.Tensor | None = None,
-        return_internals: bool = False,
+        box: tuple[int, int, int, int] | None = None, return_internals: bool = False,
     ) -> GateResult:
         """Run INSID3 on an ``(Hp, Wp, D)`` L2-normalized target grid.
 
+        ``box`` is accepted for interface parity (only the oracle extractor uses it) and ignored.
         ``cls`` is the crop's CLS token; when given, only the ``insid3_top_k_exemplars`` exemplars
         most similar to it build the matching gallery (and, if ``insid3_dynamic_tau_fg`` /
         ``insid3_dynamic_aggt``, set the granularity) — see

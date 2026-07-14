@@ -149,6 +149,9 @@ def _build_config(ui: dict):
         # features / acceptance / recursion / dedup
         "debias": ui["debias"],
         "debias_subspace_dim": ui["debias_subspace_dim"],
+        "reid_mode": ui["reid_mode"],
+        "reid_kmeans_k": ui["reid_kmeans_k"],
+        "reid_top_k": ui["reid_top_k"],
         "crop_sim_floor": ui["crop_sim_floor"],
         "min_crop": ui["min_crop"],
         "nms_iou": ui["nms_iou"],
@@ -317,6 +320,22 @@ with st.sidebar:
                                        "non-touching instances a rejected split would otherwise fuse.")
 
     st.header("Acceptance / recursion")
+    reid_mode = st.selectbox(
+        "reid_mode (how g is scored)", ["cls", "mean", "kmeans", "full"], index=0,
+        help="Standalone g, independent of the Where extractor. All score a crop as a set of "
+             "vectors (mean over target parts of best cosine to an exemplar part). cls = the CLS "
+             "token (whole-crop, framing-sensitive, needs no mask). mean/kmeans/full score the "
+             "EXTRACTED foreground: mean = its mean patch, kmeans = k centroids (k=1 ≡ mean), full "
+             "= every patch (heaviest). Masked modes live on a different scale — re-tune "
+             "crop_sim_floor when switching.")
+    reid_kmeans_k = st.number_input("reid_kmeans_k (k for reid_mode=kmeans)", 1, 32, 4, 1,
+                                    disabled=(reid_mode != "kmeans"),
+                                    help="Centroids per crop compared to the exemplar's k centroids. "
+                                         "1 collapses to reid_mode='mean'.")
+    reid_top_k = st.number_input("reid_top_k (exemplar aggregation)", 0, 64, 0, 1,
+                                 help="Aggregate g over exemplars as the mean of the top-K per-exemplar "
+                                      "scores. 0 (or ≥ S) = mean over all; 1 = max; 2 = top-2 mean. "
+                                      "Only bites for multi-exemplar banks (S>1).")
     crop_sim_floor = st.slider("crop_sim_floor (τ_C, crop similarity floor)", 0.0, 1.0, 0.3, 0.01)
     min_crop = st.number_input("min_crop (ρ, px size floor)", 8, 512, 64, 8,
                                help="Stop zooming/splitting once a crop side is at or below this. "
@@ -350,6 +369,7 @@ ui = dict(
     boundary_smooth_sigma=float(boundary_smooth_sigma),
     # features / acceptance / recursion / dedup
     standardize=standardize, debias=debias, debias_subspace_dim=int(debias_subspace_dim),
+    reid_mode=reid_mode, reid_kmeans_k=int(reid_kmeans_k), reid_top_k=int(reid_top_k),
     crop_sim_floor=crop_sim_floor, min_crop=int(min_crop),
     nms_iou=float(nms_iou), nms_containment=float(nms_containment),
 )

@@ -58,10 +58,16 @@ class FoveateMethod(Method):
     def predict(
         self, item: EvalItem, observer: Callable[[dict], None] | None = None
     ) -> MethodPrediction:
+        # Oracle Where ablation: feed the cascade the target's GT class foreground (union of GT
+        # instance masks). Only ``foreground_extractor: oracle`` consumes it — for every other
+        # extractor it stays None so the discovery is honest.
+        gt_foreground = None
+        if self.foveate_config.foreground_extractor == "oracle" and len(item.gt_masks):
+            gt_foreground = np.any(item.gt_masks, axis=0)
         instances, stats = cascade(
             self.backbone, item.image, item.exemplar_masks, config=self.foveate_config,
             exemplar_image=item.exemplar_image, extractor=self._cached_extractor(item),
-            observer=observer,
+            gt_foreground=gt_foreground, observer=observer,
         )
         h, w = item.image.shape[:2]
         if instances:

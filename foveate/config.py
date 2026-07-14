@@ -21,7 +21,10 @@ class Config:
     standardize: bool = True              # z-score feature dims before L2-norm
 
     # --- WHERE: foreground extraction strategy ---
-    foreground_extractor: str = "insid3"  # insid3 | otsu | bank — how "where is the concept" is decided
+    foreground_extractor: str = "insid3"  # insid3 | otsu | bank | oracle — how "where is the concept"
+                                          # is decided. "oracle" returns the GROUND-TRUTH foreground
+                                          # (the upper-bound Where ablation; needs the target GT mask,
+                                          # supplied via cascade(gt_foreground=...) by the runner).
 
     # --- WHERE: Otsu extractor (cheap baseline; paper Sec. 3 "Where") ---
     otsu_top_k: int = 1                   # per crop, build the similarity map from the K exemplars
@@ -88,6 +91,19 @@ class Config:
                                          # all exemplars = the mean-over-bank default of Eq. 2; 1 ⇒
                                          # max; 2 ⇒ top-2 mean). Mirrors INSID3's top-k exemplar
                                          # selection. Only bites for multi-exemplar banks (S>1).
+    reid_mode: str = "cls"                # how g(c) is computed by the standalone scorer (foveate.
+                                         # reid), independent of the Where extractor. All modes score
+                                         # a crop as a set of vectors (per exemplar: mean over target
+                                         # parts of best cosine to an exemplar part): "cls" = the CLS
+                                         # token (whole-crop, framing-sensitive, Eq. 1/2; needs no
+                                         # mask) | "mean" = mean of the extracted FOREGROUND patches |
+                                         # "kmeans" = reid_kmeans_k centroids of them (k=1 ≡ mean) |
+                                         # "full" = every foreground patch (faithful, heaviest). The
+                                         # masked modes score the actual Where mask, so they live on a
+                                         # different scale than CLS — re-tune crop_sim_floor when
+                                         # switching. reid_top_k aggregates all modes (top-k mean).
+    reid_kmeans_k: int = 4                # k for reid_mode="kmeans": centroids per crop compared to
+                                         # the exemplar's k centroids (1 collapses to reid_mode="mean").
     zoom_split_retry_eps: float = 0.01   # when a zoom peaks by only a hair (parent g beats the
                                          # child by less than this), the crop may be a CLUMP that
                                          # tightening onto one component can't improve — so try ONE

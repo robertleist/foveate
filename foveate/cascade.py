@@ -54,6 +54,7 @@ from scipy.ndimage import generate_binary_structure, label
 from foveate import clustering, features as featlib, individuation, merge
 from foveate.config import Config
 from foveate.foreground import build_extractor
+from foveate.reid import build_reid_scorer
 from foveate.types import Instance, Stats
 
 _CONN8 = generate_binary_structure(2, 2)   # 8-connectivity: don't over-split single instances
@@ -120,6 +121,27 @@ def _child_box(comp, box, pad_frac):
     pady, padx = int(round((py1 - py0) * pad_frac)), int(round((px1 - px0) * pad_frac))
     return (max(y0, py0 - pady), min(y1, py1 + pady),
             max(x0, px0 - padx), min(x1, px1 + padx))
+
+
+def _component_scores(comps: list[np.ndarray], base_score: float, grid_shape) -> list[float]:
+    """Per-component confidence when a parent crop is emitted as connected components.
+
+    All components share the crop's re-id score ``g`` (``base_score``), but that ``g`` is biased
+    high by the true exemplar in the crop. A component touching the crop **border** is only
+    partially in frame — a cut-off sliver of a neighbouring instance — so it must not inherit the
+    full ``g``: score-ranked NMS would keep the tiny sliver and suppress that neighbour's full
+    detection (found in its own crop). Border-touching components are scaled by their area fraction
+    of the crop's dominant component; whole (interior) components keep ``base_score`` unchanged, so
+    genuine non-touching instances are unaffected.
+    """
+    hp, wp = grid_shape
+    top = max((int(c.sum()) for c in comps), default=1) or 1
+    scores: list[float] = []
+    for c in comps:
+        ys, xs = np.where(c)
+        cut = bool(ys.min() == 0 or ys.max() == hp - 1 or xs.min() == 0 or xs.max() == wp - 1)
+        scores.append(base_score * (int(c.sum()) / top) if cut else base_score)
+    return scores
 
 
 def _box_area(box):
@@ -301,6 +323,8 @@ def cascade(
     exemplar_image: np.ndarray | None = None,
     exemplar_images: list[np.ndarray] | None = None,
     extractor=None,
+    reid_scorer=None,
+    gt_foreground: np.ndarray | None = None,
     observer=None,
 ) -> tuple[list[Instance], Stats]:
     """Discover instances of the exemplar class by recursive, batched zoom-in.
@@ -328,6 +352,17 @@ def cascade(
         skips re-embedding every exemplar crop per image. ``None`` (default) builds and sets the
         reference here, as before. The caller is responsible for passing an extractor whose
         reference matches ``exemplar_image`` / ``exemplar_images``.
+    reid_scorer:
+        Optional pre-built re-identification scorer (see :func:`foveate.reid.build_reid_scorer`),
+        the standalone ``g`` over the exemplar bank. Like ``extractor`` it can be built once and
+        reused across the target images of one class (inter protocol) so the exemplars are embedded
+        once. ``None`` (default) builds it here — reusing the extractor's exemplar CLS for free in
+        ``reid_mode="cls"``, embedding the exemplars once for ``"masked"``.
+    gt_foreground:
+        Optional ``(H, W)`` bool mask — the ground-truth class foreground of ``image`` (the union of
+        its GT instance masks). Only the ``"oracle"`` foreground extractor consumes it (the
+        upper-bound *Where* ablation: perfect foreground, everything else the real cascade); other
+        extractors ignore it. Injected on the extractor once here, before any crop is predicted.
     observer:
         Optional ``callable(info: dict)`` invoked once per processed region for tracing.
     """
@@ -345,29 +380,25 @@ def cascade(
     # class region on every target crop. This is the INSID3 reference-at-gating-time flow.
     # A caller reusing one bank across images (inter) may hand in a pre-built extractor, so the
     # exemplar crops are embedded once, not per target image.
+    ref_image = exemplar_images if multi else (image if same_image else exemplar_image)
     if extractor is None:
         extractor = build_extractor(cfg)
-        ref_image = exemplar_images if multi else (image if same_image else exemplar_image)
         extractor.set_reference(backbone, ref_image, exemplar_masks, negative_masks, cfg)
         stats.n_embeds += 1
-    exemplar_cls = extractor.exemplar_cls                       # (S, D) L2-normalized exemplar CLS
+    # Oracle Where ablation: hand the target's GT class foreground to the extractor (transient
+    # per-image state, so a cached inter-protocol extractor is simply refreshed each image). Only the
+    # oracle extractor exposes ``set_target_foreground``; the others never see the GT.
+    if gt_foreground is not None and hasattr(extractor, "set_target_foreground"):
+        extractor.set_target_foreground(gt_foreground)
     extract_struct = _extract_structure(cfg.extract_connectivity)   # Extract: CC connectivity
 
-    def reidentify(cls: torch.Tensor) -> float:
-        """Re-identification score ``g(c)`` (paper Eq. 2) — the "is this the concept" test.
-
-        Mean crop similarity of the crop to its ``cfg.reid_top_k`` most-similar exemplars in the
-        bank, where crop similarity ``cs(c, b)`` (Eq. 1) is the cosine of the two CLS tokens
-        (``<= 0`` or ``>= S`` ⇒ all exemplars, the mean-over-bank default of Eq. 2; ``1`` ⇒ max).
-        This mirrors the top-K exemplar selection in INSID3's ``_select_reference`` so both paths
-        aggregate the exemplar bank the same way.
-        """
-        gallery = exemplar_cls.to(cls.device, cls.dtype)
-        sims = cls @ gallery.T                          # (S,) crop similarity to each exemplar
-        k = cfg.reid_top_k
-        if 0 < k < sims.shape[0]:
-            sims = sims.topk(k).values
-        return float(sims.mean())
+    # Re-identification score g: a standalone scorer over the exemplar bank, independent of the
+    # Where extractor above. "cls" reuses the extractor's already-embedded exemplar CLS for free;
+    # "masked" embeds the exemplars once to get their foreground-patch prototypes. A caller may hand
+    # in a pre-built scorer (inter protocol) to embed the exemplars once across many target images.
+    if reid_scorer is None:
+        reid_scorer = build_reid_scorer(cfg, backbone, ref_image, exemplar_masks,
+                                        exemplar_cls=extractor.exemplar_cls)
 
     def emit(region, comp_grid, score):
         y0, y1, x0, x1 = region.box
@@ -390,6 +421,14 @@ def cascade(
         converged ``g`` says "the object is in here"); with ``cfg.emit_components`` the merged
         foreground is instead split into connected components and each emitted separately — so a
         rejected split whose instances don't touch is recovered as several instances.
+
+        **Confidence of split-out components.** The crop's ``g`` is biased high by the true exemplar
+        it contains, so a component that is merely a *cut-off sliver* of a neighbouring instance (the
+        crop clipped it at its border) must not inherit that ``g`` — score-ranked NMS would then keep
+        the tiny sliver and suppress that neighbour's full detection (found in its own crop). A
+        component touching the crop border is provably only partially in frame, so its confidence is
+        scaled by its area fraction of the crop's dominant component; a whole (border-free) component
+        keeps ``g`` unchanged, so genuine non-touching instances are unaffected.
         """
         if parent.reid < cfg.crop_sim_floor:
             stats.discarded += 1
@@ -398,8 +437,9 @@ def cascade(
         merged = np.logical_or.reduce(parent.comps)
         if cfg.emit_components:
             labels, n = label(merged, structure=extract_struct)
-            for cid in range(1, n + 1):
-                emit(pr, labels == cid, parent.reid)
+            comps = [labels == cid for cid in range(1, n + 1)]
+            for c, score in zip(comps, _component_scores(comps, parent.reid, merged.shape)):
+                emit(pr, c, score)
         else:
             emit(pr, merged, parent.reid)
 
@@ -418,7 +458,17 @@ def cascade(
         fresh_map = dict(zip(fresh_idx, fresh))
         embedded = [r.embedded if r.embedded is not None else fresh_map[i]
                     for i, r in enumerate(frontier)]
-        reid_scores = [reidentify(cls) for _, cls in embedded]
+        # g scores the crop's EXTRACTED foreground, so when the scorer needs it (masked modes) run
+        # Where predict for the whole frontier up front and reuse each result for its survivor below
+        # — no wasted predict, only the losers pay extra. CLS g needs no mask → predict survivors
+        # only, as before (``gates`` stays None and predict runs lazily in the survivor loop).
+        gates: list = [None] * len(frontier)
+        if reid_scorer.needs_foreground:
+            gates = [extractor.predict(feat, cls=cls, box=frontier[i].box,
+                                       return_internals=observer is not None)
+                     for i, (feat, cls) in enumerate(embedded)]
+        reid_scores = [reid_scorer.score(feat, cls, gates[i].foreground if gates[i] else None)
+                       for i, (feat, cls) in enumerate(embedded)]
 
         # reid-stop: pursue children by the :func:`_survivors` rule — a single zoom child must beat
         # the crop it came from (over-zoom peak guard), while a SPLIT's children are kept whenever
@@ -509,7 +559,8 @@ def cascade(
             reid_score = reid_scores[i]
             stats.max_depth = max(stats.max_depth, r.depth)
 
-            gr = extractor.predict(feat, cls=cls, return_internals=observer is not None)
+            gr = gates[i] if gates[i] is not None else extractor.predict(
+                feat, cls=cls, box=r.box, return_internals=observer is not None)
             fg = gr.foreground
             labels, n = (label(fg, structure=extract_struct) if fg.any()
                          else (np.zeros_like(fg, dtype=int), 0))

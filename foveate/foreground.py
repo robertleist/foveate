@@ -76,10 +76,12 @@ class ForegroundExtractor(Protocol):
 
     def predict(
         self, target_feat: torch.Tensor, *, cls: torch.Tensor | None = None,
-        return_internals: bool = False,
+        box: tuple[int, int, int, int] | None = None, return_internals: bool = False,
     ) -> GateResult:
         """``cls`` (the crop's CLS token, optional) lets an extractor pick which exemplars to run
-        against per crop; extractors that don't need it ignore it."""
+        against per crop; extractors that don't need it ignore it. ``box`` (the crop's
+        ``(y0, y1, x0, x1)`` in original-image coords) is likewise optional — only the oracle
+        extractor, which slices a ground-truth mask to the crop, consumes it."""
         ...
 
 
@@ -119,8 +121,9 @@ def build_extractor(cfg) -> ForegroundExtractor:
 
     ``"insid3"`` -> the official INSID3 algorithm (clusters + forward/backward matching);
     ``"otsu"`` -> Otsu on the similarity map to the top-k exemplars (the cheap Where baseline);
-    ``"bank"`` -> the legacy per-patch bank gate. Imports are deferred so picking one strategy
-    never pulls the others' dependencies.
+    ``"bank"`` -> the legacy per-patch bank gate;
+    ``"oracle"`` -> the ground-truth foreground (upper-bound ablation; needs ``gt_foreground``).
+    Imports are deferred so picking one strategy never pulls the others' dependencies.
     """
     name = cfg.foreground_extractor
     if name == "insid3":
@@ -135,4 +138,8 @@ def build_extractor(cfg) -> ForegroundExtractor:
         from foveate.gate import BankExtractor
 
         return BankExtractor(cfg)
+    if name == "oracle":
+        from foveate.oracle import OracleExtractor
+
+        return OracleExtractor(cfg)
     raise ValueError(f"unknown foreground_extractor {name!r}")
