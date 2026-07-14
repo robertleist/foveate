@@ -36,7 +36,7 @@ foveate:                  # any foveate.Config field — full algorithm knob set
   # --- acceptance & splitting (WHAT): identical to foveate_corals.yaml so only Where differs ---
   crop_sim_floor: 0.3             # reject floor on mean cos(crop CLS, exemplar CLS bank)
   reid_top_k: 0                   # exemplar aggregation for the crop CLS score: 0 = mean over the bank
-  split_mode: kmeans              # kmeans (k=2, always splits) | watershed | none
+  split_mode: none              # kmeans (k=2, always splits) | watershed | none
   zoom_split_retry_eps: 0.01      # a zoom that peaks by < eps tries ONE k=2 split before emitting
   # --- duplicate suppression: nested k=2 sub-crops can re-find one object; NMS keeps the best ---
   nms_iou: 0.5
