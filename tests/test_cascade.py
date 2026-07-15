@@ -46,6 +46,19 @@ def test_cascade_runs_with_oracle_where(backbone, two_squares):
         assert (m & gt).sum() > (m & ~gt).sum()
 
 
+def test_cascade_runs_with_oracle_cc_where(backbone, two_squares):
+    """The Oracle+CC extractor runs end-to-end off an injected instance-label map."""
+    img, ex = two_squares
+    labels = np.zeros(img.shape[:2], dtype=np.int32)     # two GT instances (the red squares)
+    labels[20:40, 20:40] = 1
+    labels[80:100, 80:100] = 2
+    cfg = Config(foreground_extractor="oracle_cc", debias=False, min_crop=24,
+                 cascade_min_instance_area=4)
+    instances, stats = cascade(backbone, img, ex, config=cfg, gt_foreground=labels)
+    assert stats.n_embeds > 0
+    assert all(inst.mask.shape == img.shape[:2] for inst in instances)
+
+
 def test_cascade_runs_with_both_connectivities(backbone, two_squares):
     """Extract connectivity is an ablatable axis: 4 and 8 both run the cascade."""
     img, ex = two_squares

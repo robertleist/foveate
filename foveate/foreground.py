@@ -122,8 +122,10 @@ def build_extractor(cfg) -> ForegroundExtractor:
     ``"insid3"`` -> the official INSID3 algorithm (clusters + forward/backward matching);
     ``"otsu"`` -> Otsu on the similarity map to the top-k exemplars (the cheap Where baseline);
     ``"bank"`` -> the legacy per-patch bank gate;
-    ``"oracle"`` -> the ground-truth foreground (upper-bound ablation; needs ``gt_foreground``).
-    Imports are deferred so picking one strategy never pulls the others' dependencies.
+    ``"oracle"`` -> the ground-truth foreground (upper-bound ablation; needs ``gt_foreground``);
+    ``"oracle_cc"`` -> the ground-truth foreground with inter-instance seams carved so connected
+    components pre-separate touching instances (needs the GT instance-label map). Imports are
+    deferred so picking one strategy never pulls the others' dependencies.
     """
     name = cfg.foreground_extractor
     if name == "insid3":
@@ -142,4 +144,8 @@ def build_extractor(cfg) -> ForegroundExtractor:
         from foveate.oracle import OracleExtractor
 
         return OracleExtractor(cfg)
+    if name == "oracle_cc":
+        from foveate.oracle import OracleCCExtractor
+
+        return OracleCCExtractor(cfg)
     raise ValueError(f"unknown foreground_extractor {name!r}")

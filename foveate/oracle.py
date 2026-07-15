@@ -18,6 +18,7 @@ not ``g``.
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
 import torch
 
@@ -46,6 +47,7 @@ class OracleExtractor:
         self.cfg = cfg
         self.exemplar_cls: torch.Tensor | None = None      # (S, D) L2-normalized per-exemplar CLS
         self._gt: np.ndarray | None = None                 # (H, W) bool full-image GT class foreground
+        self._gt_labels: np.ndarray | None = None          # (H, W) int per-instance GT ids (0 = bg)
 
     # ------------------------------------------------------------------ reference
     def set_reference(
@@ -69,11 +71,18 @@ class OracleExtractor:
 
     # ------------------------------------------------------------------ target GT
     def set_target_foreground(self, gt_foreground: np.ndarray) -> None:
-        """Inject the target image's GT class foreground (``(H, W)`` bool) for the current image.
+        """Inject the target image's GT class foreground for the current image.
+
+        ``gt_foreground`` is either a ``(H, W)`` bool union mask or a ``(H, W)`` int instance-label
+        map (``0`` = background, ``i`` = the ``i``-th GT instance) — the label map additionally
+        carries the per-instance identity the :class:`OracleCCExtractor` needs. A bool mask is just
+        the single-instance case (every foreground pixel labelled ``1``).
 
         Called once per target image by the cascade. It is transient per-image state — a cached
         extractor reused across inter-protocol targets simply has it overwritten each image."""
-        self._gt = np.asarray(gt_foreground).astype(bool)
+        labels = np.asarray(gt_foreground).astype(np.int32)
+        self._gt_labels = labels
+        self._gt = labels > 0
 
     # ------------------------------------------------------------------- predict
     def predict(
@@ -107,6 +116,84 @@ class OracleExtractor:
                 "candidate_mask": foreground,
                 "foreground": foreground,
                 "tau_used": 0.5,                                 # nominal cut for the viz caption
+            }
+        return GateResult(
+            foreground=foreground,
+            score_map=score_map,
+            exemplar_cls=self.exemplar_cls.cpu().numpy(),
+            internals=internals,
+        )
+
+
+def _instance_seams(lab_grid: np.ndarray) -> np.ndarray:
+    """Patches on a border between two *different* GT instances (8-neighbourhood).
+
+    A patch is a seam if any of its 8 neighbours carries a different non-zero instance id. Removing
+    the seam patches opens a ≥1-patch background gap between adjacent instances, so the cascade's
+    connected-components Extract stage (whether 4- or 8-connectivity) recovers each instance as its
+    own component instead of fusing touching ones.
+    """
+    hp, wp = lab_grid.shape
+    padded = np.pad(lab_grid, 1)                                  # zero border → edges never seam-match
+    seam = np.zeros((hp, wp), dtype=bool)
+    core = lab_grid
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            neigh = padded[1 + dy:1 + dy + hp, 1 + dx:1 + dx + wp]
+            seam |= (core > 0) & (neigh > 0) & (core != neigh)
+    return seam
+
+
+class OracleCCExtractor(OracleExtractor):
+    """Oracle foreground that also **pre-separates touching instances** into distinct components.
+
+    The plain :class:`OracleExtractor` returns the GT *union*, so two GT instances that touch fall in
+    one connected component and the cascade must tease them apart with the learned Split stage. This
+    variant instead uses the GT per-instance identity (the label map from
+    :meth:`set_target_foreground`) to carve the seam patches between different instances, so the
+    Extract stage's connected components recover each instance directly — the upper bound where **both**
+    the foreground and the instance boundaries are perfect. Comparing it against ``oracle`` isolates
+    how much the pipeline is limited by imperfect instance separation versus imperfect foreground.
+    """
+
+    def predict(
+        self, target_feat: torch.Tensor, *, cls: torch.Tensor | None = None,
+        box: tuple[int, int, int, int] | None = None, return_internals: bool = False,
+    ) -> GateResult:
+        """GT foreground of the crop with inter-instance seams carved so CC separates instances."""
+        if self._gt_labels is None:
+            raise RuntimeError(
+                "OracleCCExtractor.predict called before set_target_foreground — the cascade must "
+                "receive gt_foreground for the oracle extractor."
+            )
+        if box is None:
+            raise RuntimeError(
+                "OracleCCExtractor.predict needs the crop box to slice the GT foreground; the cascade "
+                "must pass box=region.box."
+            )
+        hp, wp, _ = target_feat.shape
+        y0, y1, x0, x1 = box
+        crop_labels = self._gt_labels[y0:y1, x0:x1]
+        # Nearest-resize the integer label map onto the patch grid: a patch takes the instance id at
+        # its source-pixel centre, so ``lab_grid > 0`` is exactly the plain oracle's union foreground
+        # (same centre-pixel sampling) while carrying which instance each patch belongs to.
+        if crop_labels.any():
+            lab_grid = cv2.resize(crop_labels, (wp, hp), interpolation=cv2.INTER_NEAREST)
+        else:
+            lab_grid = np.zeros((hp, wp), dtype=crop_labels.dtype)
+        foreground = (lab_grid > 0) & ~_instance_seams(lab_grid)
+        score_map = foreground.astype(np.float32)
+
+        internals: dict = {}
+        if return_internals:
+            internals = {
+                "forward_sim": score_map,
+                "candidate_mask": foreground,
+                "foreground": foreground,
+                "instance_labels": lab_grid,             # per-patch GT instance id (viz)
+                "tau_used": 0.5,
             }
         return GateResult(
             foreground=foreground,

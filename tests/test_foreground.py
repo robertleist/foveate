@@ -8,7 +8,7 @@ from foveate.features import l2_normalize
 from foveate.foreground import build_extractor
 from foveate.gate import BankExtractor
 from foveate.insid3 import InSID3Extractor
-from foveate.oracle import OracleExtractor
+from foveate.oracle import OracleCCExtractor, OracleExtractor
 from foveate.otsu import OtsuExtractor
 
 
@@ -17,6 +17,7 @@ def test_build_extractor_dispatch():
     assert isinstance(build_extractor(Config(foreground_extractor="otsu")), OtsuExtractor)
     assert isinstance(build_extractor(Config(foreground_extractor="bank")), BankExtractor)
     assert isinstance(build_extractor(Config(foreground_extractor="oracle")), OracleExtractor)
+    assert isinstance(build_extractor(Config(foreground_extractor="oracle_cc")), OracleCCExtractor)
 
 
 def test_build_extractor_unknown_raises():
@@ -24,7 +25,7 @@ def test_build_extractor_unknown_raises():
         build_extractor(Config(foreground_extractor="nope"))
 
 
-@pytest.mark.parametrize("name", ["insid3", "otsu", "bank", "oracle"])
+@pytest.mark.parametrize("name", ["insid3", "otsu", "bank", "oracle", "oracle_cc"])
 def test_exemplar_cls_shape_and_norm(backbone, two_squares, name):
     img, ex = two_squares
     cfg = Config(foreground_extractor=name, standardize=True)
@@ -93,6 +94,36 @@ def test_oracle_extractor_returns_gt_foreground(backbone, two_squares):
     # A crop over the empty bottom-right square yields an all-false foreground.
     gr_empty = extr.predict(feat, cls=cls, box=(80, 100, 80, 100))
     assert not gr_empty.foreground.any()
+
+
+def test_oracle_cc_separates_touching_instances(backbone, two_squares):
+    """Oracle+CC carves the seam between adjacent GT instances so CC recovers each separately."""
+    from scipy.ndimage import label
+
+    img, ex = two_squares
+    h, w = img.shape[:2]
+    labels = np.zeros((h, w), dtype=np.int32)
+    labels[:, : w // 2] = 1                           # left half  → instance 1
+    labels[:, w // 2:] = 2                            # right half → instance 2 (touching at the seam)
+
+    cfg_cc = Config(foreground_extractor="oracle_cc")
+    cc = build_extractor(cfg_cc)
+    cc.set_reference(backbone, img, ex, None, cfg_cc)
+    cc.set_target_foreground(labels)
+
+    cfg_plain = Config(foreground_extractor="oracle")
+    plain = build_extractor(cfg_plain)
+    plain.set_reference(backbone, img, ex, None, cfg_plain)
+    plain.set_target_foreground(labels)
+
+    feat, clstok = featlib.embed_batch(backbone, [img])[0]
+    box = (0, h, 0, w)
+    fg_plain = plain.predict(feat, cls=clstok, box=box).foreground
+    fg_cc = cc.predict(feat, cls=clstok, box=box).foreground
+
+    assert label(fg_plain)[1] == 1                    # union: touching instances are one blob
+    assert label(fg_cc)[1] == 2                       # oracle+cc: the seam splits them into two
+    assert fg_cc.sum() < fg_plain.sum()               # seam patches were removed
 
 
 def test_oracle_extractor_requires_gt_and_box(backbone, two_squares):

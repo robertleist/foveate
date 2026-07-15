@@ -359,10 +359,12 @@ def cascade(
         once. ``None`` (default) builds it here — reusing the extractor's exemplar CLS for free in
         ``reid_mode="cls"``, embedding the exemplars once for ``"masked"``.
     gt_foreground:
-        Optional ``(H, W)`` bool mask — the ground-truth class foreground of ``image`` (the union of
-        its GT instance masks). Only the ``"oracle"`` foreground extractor consumes it (the
-        upper-bound *Where* ablation: perfect foreground, everything else the real cascade); other
-        extractors ignore it. Injected on the extractor once here, before any crop is predicted.
+        Optional ``(H, W)`` ground-truth class foreground of ``image`` — a bool union mask or an int
+        instance-label map (``0`` = bg, ``i`` = the ``i``-th GT instance). Only the ``"oracle"`` /
+        ``"oracle_cc"`` foreground extractors consume it (the upper-bound *Where* ablation: perfect
+        foreground, everything else the real cascade — ``oracle_cc`` additionally uses the per-instance
+        ids to pre-separate touching instances); other extractors ignore it. Injected on the extractor
+        once here, before any crop is predicted.
     observer:
         Optional ``callable(info: dict)`` invoked once per processed region for tracing.
     """

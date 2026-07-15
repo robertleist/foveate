@@ -21,10 +21,12 @@ class Config:
     standardize: bool = True              # z-score feature dims before L2-norm
 
     # --- WHERE: foreground extraction strategy ---
-    foreground_extractor: str = "insid3"  # insid3 | otsu | bank | oracle — how "where is the concept"
-                                          # is decided. "oracle" returns the GROUND-TRUTH foreground
-                                          # (the upper-bound Where ablation; needs the target GT mask,
-                                          # supplied via cascade(gt_foreground=...) by the runner).
+    foreground_extractor: str = "insid3"  # insid3 | otsu | bank | oracle | oracle_cc — how "where is
+                                          # the concept" is decided. "oracle" returns the GROUND-TRUTH
+                                          # foreground (upper-bound Where ablation); "oracle_cc" also
+                                          # carves seams between distinct GT instances so connected
+                                          # components pre-separate touching ones. Both need the target
+                                          # GT, supplied via cascade(gt_foreground=...) by the runner.
 
     # --- WHERE: Otsu extractor (cheap baseline; paper Sec. 3 "Where") ---
     otsu_top_k: int = 1                   # per crop, build the similarity map from the K exemplars

@@ -1,0 +1,60 @@
+# ORACLE+CC Where ablation on the HIFMB corals COCO dataset (single-exemplar protocol).
+# Like oracle_corals.yaml but the foreground extractor ALSO carves the seams between distinct GT
+# instances, so the cascade's connected-components Extract stage pre-separates touching instances
+# (perfect foreground AND perfect instance boundaries). Compare against oracle_corals.yaml (GT union,
+# touching instances left for the Split stage) to isolate the cost of imperfect instance separation.
+# Requires the [dino] extra + the downloaded dataset; DINOv3 weights are HF-gated.
+run_name: oracle_cc_corals
+
+backbone:
+  type: dino
+  model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+  image_size: 768
+
+data:
+  name: coco                    # registry key (the corals dataset is COCO-format)
+  label: corals                 # dataset name for MLflow logging/filtering
+  root: /data/robert/hifmb_corals
+  annotation_file: annotations.json
+  images_dir: images
+  categories: [Coral Fragment]
+  min_instances: 2
+  train_images: 1         # intra pool + cross-image support pool
+  interval_images: -1     # -1 = evaluate on ALL images not in the train set (inter / cross-image)
+  known_ratio: 0          # fraction of instances that are known/prompts; rest are discovery GT
+  seed: 42
+
+foveate:                  # any foveate.Config field — full algorithm knob set (mirrors frontend/app.py)
+  # --- features ---
+  standardize: true               # z-score feature dims before L2-norm
+  # --- WHERE: oracle foreground + instance-separating connected components (upper-bound ablation) ---
+  foreground_extractor: oracle_cc # GT class foreground per crop with inter-instance seams carved, so
+                                  #   connected components recover each GT instance directly.
+  # --- positional debiasing (still applies to the re-id score g's masked modes / cross-image) ---
+  debias: true                    # project out DINOv3 positional bias; required for cross-image
+  debias_subspace_dim: 8          # rank of the positional subspace projected out
+  # --- acceptance & splitting (WHAT): identical to oracle_corals.yaml so only Where differs ---
+  crop_sim_floor: 0.3             # reject floor on mean cos(crop CLS, exemplar CLS bank)
+  split_mode: none                # kmeans (k=2, always splits) | watershed | none
+  zoom_split_retry_eps: 0.01      # a zoom that peaks by < eps tries ONE k=2 split before emitting
+  # --- duplicate suppression: nested k=2 sub-crops can re-find one object; NMS keeps the best ---
+  nms_iou: 0.5
+  nms_containment: 0.7
+  # --- recursion / cost ---
+  min_crop: 16                    # px size floor — the ONLY geometric stop (no depth cap)
+  max_total_embeds: 512           # global embed budget (safety cap)
+
+eval:
+  targets: [intra, inter]         # intra = same-image discovery; inter = cross-image (all non-train)
+  max_exemplars: 1
+  limit: null
+  visualize: 8                    # render prompt|GT|prediction overlays for the first N images
+  cascade_trace: 2                # contact sheet of the recursive zoom for the first N images
+
+mlflow:
+  enabled: true
+  experiment_name: cv4e@eccv
+  tracking_uri: null
+  username: null
+  password: null
+  dotenv: null
