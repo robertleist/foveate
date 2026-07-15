@@ -20,7 +20,7 @@ data:
   images_dir: images
   categories: [Polyps]
   min_instances: 2
-  train_images: 10        # intra pool (same-image discovery)
+  train_images: 1        # intra pool (same-image discovery)
   interval_images: -1     # disjoint novel images for cross-image (inter) eval
   known_ratio: 0.3        # fraction of instances used as known/prompts (intra GT = all instances)
   seed: 42
