@@ -1,0 +1,51 @@
+# "No Time to Train!" (Espinosa et al.) baseline on a COCO subset — reference-based instance
+# segmentation with a frozen DINO encoder + HF SAM 2, no training. Sits in the same MLflow
+# experiment as the foveate / sam3 / semantic_cc runs so all baselines are directly comparable.
+# See no_time_to_train_corals.yaml for the pipeline description.
+#
+#   python -m experiments.run --config configs/cv4e@eccv26/single_exemplar/no_time_to_train_polyps.yaml
+run_name: no_time_to_train_polyps
+
+backbone:
+  type: dino
+  model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+  image_size: 768
+
+data:
+  name: coco                    # registry key (the polyps dataset is COCO-format)
+  label: polyps                 # dataset name for MLflow logging/filtering
+  root: /data/robert/hifmb_polyps
+  annotation_file: annotations.json   # sic — the polyps annotation file (matches run_polyps.yaml)
+  images_dir: images
+  categories: [Polyps]
+  min_instances: 2
+  train_images: 1         # intra pool (same-image discovery)
+  interval_images: -1     # disjoint novel images for cross-image (inter) eval
+  known_ratio: 0          # fraction of instances used as known/prompts (intra GT = all instances)
+  seed: 42
+
+method:
+  type: no_time_to_train
+  sam2_model: facebook/sam2-hiera-large   # HF promptable segmenter (not gated)
+  kmeans_k: 8             # memory centers per class (modal sub-parts of the exemplar concept)
+  num_points: 100         # top-k matched patches used as SAM 2 point prompts
+  point_thr: 0.5          # min cosine similarity (to memory) for a patch to become a query point
+  score_thr: 0.5          # min semantic score in [0,1] to keep a candidate mask
+  iou_thr: 0.8            # duplicate-suppression IoU
+  containment_thr: 0.9    # drop masks mostly nested inside a higher-scoring one
+  min_area: 4             # drop masks smaller than this (pixels)
+
+eval:
+  targets: [intra, inter]         # intra = same-image; inter = cross-image (DINO memory from support)
+  max_exemplars: 1
+  limit: null
+  visualize: 10                   # render prompt|GT|prediction overlays for the first N images
+  cascade_trace: 0                # NTT has no recursive cascade
+
+mlflow:
+  enabled: true
+  experiment_name: cv4e@eccv      # same experiment as foveate so NTT sits beside it
+  tracking_uri: null              # overrides MLFLOW_TRACKING_URI; null -> ./mlruns
+  username: null                  # overrides MLFLOW_TRACKING_USERNAME
+  password: null                  # overrides MLFLOW_TRACKING_PASSWORD
+  dotenv: null                    # explicit .env path; null -> looks for ./.env
