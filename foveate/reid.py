@@ -125,6 +125,7 @@ def build_reid_scorer(
     ref_masks: list[np.ndarray],
     *,
     exemplar_cls: torch.Tensor | None = None,
+    mode: str | None = None,
 ) -> ReidScorer:
     """Build the re-id scorer from the exemplar crops + masks (built once, reused per target).
 
@@ -132,17 +133,22 @@ def build_reid_scorer(
     In ``"cls"`` mode a caller that already embedded the exemplars (e.g. the *Where* extractor) may
     pass their ``exemplar_cls`` stack to skip re-embedding; the masked modes always embed, since
     they need the exemplar foreground patches the CLS stack does not carry.
-    """
-    if cfg.reid_mode not in _MODES:
-        raise ValueError(f"unknown reid_mode {cfg.reid_mode!r} (expected one of {_MODES})")
 
-    if cfg.reid_mode == "cls" and exemplar_cls is not None:
+    ``mode`` overrides ``cfg.reid_mode`` — used to build a **second** scorer in a masked mode for the
+    final leaf *confidence* (see :data:`Config.confidence_reid_mode`) while the recursion ``g`` keeps
+    its own (``cls``) mode. All other knobs (top-k, debias, kmeans-k) come from ``cfg``.
+    """
+    mode = mode or cfg.reid_mode
+    if mode not in _MODES:
+        raise ValueError(f"unknown reid_mode {mode!r} (expected one of {_MODES})")
+
+    if mode == "cls" and exemplar_cls is not None:
         return ReidScorer(mode="cls", reid_top_k=cfg.reid_top_k,
                           exemplars=[c.view(1, -1) for c in exemplar_cls])
 
     images, masks = normalize_reference(ref_image, ref_masks)
     B = None
-    if cfg.reid_mode in _MASKED_MODES and cfg.debias:
+    if mode in _MASKED_MODES and cfg.debias:
         B = estimate_positional_basis(
             backbone, subspace_dim=cfg.debias_subspace_dim, n_noise=cfg.debias_n_noise,
             seed=cfg.debias_seed, standardize=cfg.standardize,
@@ -154,7 +160,7 @@ def build_reid_scorer(
 
     exemplars: list[torch.Tensor] = []
     for m, (y0, y1, x0, x1), (feat, cls) in zip(masks, boxes, embedded):
-        if cfg.reid_mode == "cls":
+        if mode == "cls":
             exemplars.append(featlib.l2_normalize(cls, dim=0).view(1, -1))
             continue
         hp, wp, d = feat.shape
@@ -162,7 +168,7 @@ def build_reid_scorer(
         if not mask_grid.any():                                          # mask thinner than a patch
             mask_grid = np.ones((hp, wp), dtype=bool)
         patches = project_out(feat[torch.from_numpy(mask_grid).to(feat.device)], B)  # (M, D)
-        exemplars.append(_reduce_patches(patches, cfg.reid_mode, cfg.reid_kmeans_k))
+        exemplars.append(_reduce_patches(patches, mode, cfg.reid_kmeans_k))
 
-    return ReidScorer(mode=cfg.reid_mode, reid_top_k=cfg.reid_top_k, exemplars=exemplars,
+    return ReidScorer(mode=mode, reid_top_k=cfg.reid_top_k, exemplars=exemplars,
                       B=B, kmeans_k=cfg.reid_kmeans_k)

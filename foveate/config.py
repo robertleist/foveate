@@ -106,6 +106,17 @@ class Config:
                                          # switching. reid_top_k aggregates all modes (top-k mean).
     reid_kmeans_k: int = 4                # k for reid_mode="kmeans": centroids per crop compared to
                                          # the exemplar's k centroids (1 collapses to reid_mode="mean").
+    confidence_reid_mode: str | None = None  # how the FINAL leaf confidence (the score NMS + AP rank
+                                         # by) is computed, DECOUPLED from the recursion stop signal g
+                                         # (which stays reid_mode above). None = legacy: a leaf inherits
+                                         # its crop's recursion score, so all instances carved out of
+                                         # one crop share one confidence (a sliver ties the true
+                                         # instance). Set to a MASKED mode ("mean" | "kmeans" | "full")
+                                         # to instead score EACH emitted instance on its OWN foreground
+                                         # patches — "full" = mean over the instance's foreground
+                                         # patches of best cosine to the exemplar patch set (the "mean
+                                         # cosine sim of the masked foreground features"). Reuses the
+                                         # masked-family debias/top-k knobs.
     zoom_split_retry_eps: float = 0.01   # when a zoom peaks by only a hair (parent g beats the
                                          # child by less than this), the crop may be a CLUMP that
                                          # tightening onto one component can't improve — so try ONE

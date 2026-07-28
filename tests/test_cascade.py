@@ -28,6 +28,21 @@ def test_cascade_runs_with_otsu_where(backbone, two_squares):
     assert all(inst.mask.shape == img.shape[:2] for inst in instances)
 
 
+def test_cascade_masked_confidence_scores_each_instance_on_its_own_foreground(backbone, two_squares):
+    """With confidence_reid_mode set, leaves are scored by the masked confidence scorer (per
+    instance), not by the shared recursion CLS score. The run stays valid and scores finite."""
+    img, ex = two_squares
+    gt = np.zeros(img.shape[:2], dtype=bool)
+    gt[20:40, 20:40] = True
+    gt[80:100, 80:100] = True
+    cfg = Config(foreground_extractor="oracle", debias=False, min_crop=24,
+                 cascade_min_instance_area=4, confidence_reid_mode="full")
+    instances, stats = cascade(backbone, img, ex, config=cfg, gt_foreground=gt)
+    assert stats.n_embeds > 0
+    # Masked cosine scores, finite and within [-1, 1] up to float32 slack.
+    assert all(np.isfinite(inst.score) and abs(inst.score) <= 1.0 + 1e-5 for inst in instances)
+
+
 def test_cascade_runs_with_oracle_where(backbone, two_squares):
     """The oracle Where extractor drives the full cascade off the injected GT foreground."""
     img, ex = two_squares

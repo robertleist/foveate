@@ -85,10 +85,13 @@ class _Parent:
     # the observer sees each region once, with its FINAL decision (the trajectory tooling rebuilds
     # the tree by unique box, so a region must appear exactly once).
     event: dict | None = None
-    # The parent's patch features, kept ONLY for a single-component (zoom) parent so that a zoom
-    # which peaks by a hair can be split k=2 in place before being emitted (``zoom_split_retry``).
-    # ``None`` once used (a retry produces a multi-child split parent, which never retries again).
+    # The parent's patch feature grid ``(Hp, Wp, D)``. Held so a hair-thin zoom peak can be split
+    # k=2 in place before emit (``zoom_split_retry``) AND so each emitted component can be scored on
+    # its OWN foreground for the masked confidence (see ``confidence_reid_mode``). Always set now.
     feat: object | None = None
+    # Whether this parent may still attempt a one-shot k=2 retry. True only for single-component
+    # (zoom) parents; a retry produces a split parent with this False, so no unbounded retry chain.
+    allow_retry: bool = False
 
 
 @dataclass
@@ -324,6 +327,7 @@ def cascade(
     exemplar_images: list[np.ndarray] | None = None,
     extractor=None,
     reid_scorer=None,
+    confidence_scorer=None,
     gt_foreground: np.ndarray | None = None,
     observer=None,
 ) -> tuple[list[Instance], Stats]:
@@ -402,8 +406,22 @@ def cascade(
         reid_scorer = build_reid_scorer(cfg, backbone, ref_image, exemplar_masks,
                                         exemplar_cls=extractor.exemplar_cls)
 
-    def emit(region, comp_grid, score):
+    # Final leaf confidence: a SEPARATE masked scorer, independent of the recursion stop signal g.
+    # When set, each emitted instance's score is the masked reid of its OWN foreground patches, so
+    # two instances carved out of one crop no longer share the crop's (biased) score. ``None`` keeps
+    # the legacy behaviour (the leaf inherits the recursion score passed to ``emit``).
+    if confidence_scorer is None and cfg.confidence_reid_mode:
+        confidence_scorer = build_reid_scorer(cfg, backbone, ref_image, exemplar_masks,
+                                              mode=cfg.confidence_reid_mode)
+
+    def emit(region, comp_grid, score, feat=None):
         y0, y1, x0, x1 = region.box
+        comp_grid = np.asarray(comp_grid, dtype=bool)
+        # Score this instance on its own foreground patches (masked confidence) rather than letting
+        # it inherit the crop's shared recursion score. ``feat`` is the crop's patch grid, whose
+        # (Hp, Wp) matches ``comp_grid`` exactly, so the mask indexes straight into it.
+        if confidence_scorer is not None and feat is not None and comp_grid.any():
+            score = confidence_scorer.score(feat, None, comp_grid)
         mask_local = featlib.upsample_mask(comp_grid, (x1 - x0, y1 - y0),
                                            bilinear=cfg.mask_upsample == "bilinear")
         if int(mask_local.sum()) < cfg.cascade_min_instance_area:
@@ -441,9 +459,9 @@ def cascade(
             labels, n = label(merged, structure=extract_struct)
             comps = [labels == cid for cid in range(1, n + 1)]
             for c, score in zip(comps, _component_scores(comps, parent.reid, merged.shape)):
-                emit(pr, c, score)
+                emit(pr, c, score, feat=parent.feat)
         else:
-            emit(pr, merged, parent.reid)
+            emit(pr, merged, parent.reid, feat=parent.feat)
 
     frontier = [_Region((0, H, 0, W), 0)]
     level_idx = 0
@@ -501,7 +519,7 @@ def cascade(
                 # like a convergence split (``max child > parent`` → pursue, else emit the parent
                 # there). Only single-component (zoom) parents qualify; a retry yields a multi-child
                 # split parent, which never retries again → no unbounded chain.
-                if (len(members) == 1 and parent.feat is not None and cfg.split_mode != "none"
+                if (len(members) == 1 and parent.allow_retry and cfg.split_mode != "none"
                         and cfg.zoom_split_retry_eps > 0 and parent.reid >= cfg.crop_sim_floor
                         and 0.0 <= parent.reid - reid_scores[members[0]] < cfg.zoom_split_retry_eps):
                     comp = parent.comps[0]
@@ -524,7 +542,8 @@ def cascade(
                             parent.event["children"] = list(sub_boxes)
                             parent.event["instance_grids"] = list(subs)
                         pnew = _Parent(reid=parent.reid, box=parent.box, depth=parent.depth,
-                                       comps=[comp], event=parent.event)   # feat=None: no re-retry
+                                       comps=[comp], event=parent.event, feat=parent.feat,
+                                       allow_retry=False)   # keep feat for confidence; no re-retry
                         deferred_retry += [_Region(cb, parent.depth + 1, embedded=ce, parent=pnew)
                                            for cb, ce in zip(sub_boxes, sub_emb)]
                         retried = True
@@ -577,7 +596,7 @@ def cascade(
             elif floor:                                   # SIZE floor (px) — the only non-CLS stop
                 decision = "leaf-cap"
                 for cid in range(1, n + 1):
-                    emit(r, labels == cid, reid_score)
+                    emit(r, labels == cid, reid_score, feat=feat)
             elif n >= 2:                                  # multiple instances → tighter crops
                 # A component whose padded bbox clips back to THIS crop's box makes no
                 # geometric progress: re-enqueuing it re-embeds the identical crop, finds the
@@ -589,7 +608,7 @@ def cascade(
                 kept = [(c, b) for c, b in zip(comps_all, boxes_all) if b != r.box]
                 for c, b in zip(comps_all, boxes_all):
                     if b == r.box:
-                        emit(r, c, reid_score)
+                        emit(r, c, reid_score, feat=feat)
                 if kept:
                     decision = "split"
                     child_comps = [c for c, _ in kept]
@@ -605,9 +624,9 @@ def cascade(
                     if cfg.discard_rejected:
                         decision = "discard"; stats.discarded += 1
                     else:
-                        decision = "leaf"; emit(r, comp, reid_score)
+                        decision = "leaf"; emit(r, comp, reid_score, feat=feat)
                 elif cfg.split_mode == "none":
-                    decision = "leaf"; emit(r, comp, reid_score)   # splitting disabled → whole
+                    decision = "leaf"; emit(r, comp, reid_score, feat=feat)   # splitting disabled → whole
                 else:
                     # Cannot zoom in (converged) → NEVER accept as a leaf on the spot. ALWAYS split
                     # k=2 on the foreground and enqueue the sub-crops against THIS crop as their
@@ -634,7 +653,7 @@ def cascade(
                         stats.n_embeds += len(child_embeds)
                         decision, children, child_comps = "clump-split", sub_boxes, [comp]
                     else:                                 # unsplittable / no tighter sub-crop
-                        decision = "leaf"; emit(r, comp, reid_score)
+                        decision = "leaf"; emit(r, comp, reid_score, feat=feat)
 
             if decision == "leaf-cap":
                 instance_grids = [labels == cid for cid in range(1, n + 1)]
@@ -657,7 +676,7 @@ def cascade(
                 # next level, in the group loop above), so it is fired there with the final label.
                 # A zoom parent also carries its features so a hair-thin peak can be split in place.
                 par = _Parent(reid=reid_score, box=r.box, depth=r.depth, comps=child_comps, event=ev,
-                              feat=(feat if decision == "zoom" else None))
+                              feat=feat, allow_retry=(decision == "zoom"))
                 if child_embeds is not None:              # clump-split: reuse the lookahead embeds
                     nxt += [_Region(cb, r.depth + 1, embedded=ce, parent=par)
                             for cb, ce in zip(children, child_embeds)]

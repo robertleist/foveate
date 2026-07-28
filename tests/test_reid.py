@@ -82,3 +82,15 @@ def test_build_reid_scorer_rejects_unknown_mode(backbone, two_squares):
     cfg = Config.from_dict({"reid_mode": "bogus"})
     with pytest.raises(ValueError, match="reid_mode"):
         build_reid_scorer(cfg, backbone, np.zeros((4, 4, 3), np.uint8), ex)
+
+
+def test_mode_override_builds_a_masked_scorer_over_a_cls_config(backbone, two_squares):
+    """The ``mode`` override lets a cls-config caller build a SECOND masked scorer for the leaf
+    confidence — independent of cfg.reid_mode (which stays cls for the recursion signal)."""
+    img, ex = two_squares
+    cfg = Config(reid_mode="cls", debias=False)
+    conf = build_reid_scorer(cfg, backbone, img, ex, mode="full")
+    assert conf.mode == "full" and conf.needs_foreground
+    # cfg.reid_mode is untouched: the recursion scorer built from the same cfg is still cls.
+    recursion = build_reid_scorer(cfg, backbone, img, ex, exemplar_cls=torch.eye(len(ex)))
+    assert recursion.mode == "cls"

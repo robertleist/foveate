@@ -35,6 +35,9 @@ foveate:                  # any foveate.Config field — full algorithm knob set
   debias_subspace_dim: 8          # rank of the positional subspace projected out
   # --- acceptance & splitting (WHAT): identical to oracle_corals.yaml so only Where differs ---
   crop_sim_floor: 0.3             # reject floor on mean cos(crop CLS, exemplar CLS bank)
+  confidence_reid_mode: full      # FINAL leaf confidence = mean cosine of THIS instance's own masked
+                                  #   foreground features (decoupled from the recursion CLS g). null =
+                                  #   legacy: leaf inherits the crop's shared recursion score.
   split_mode: none                # kmeans (k=2, always splits) | watershed | none
   zoom_split_retry_eps: 0.01      # a zoom that peaks by < eps tries ONE k=2 split before emitting
   # --- duplicate suppression: nested k=2 sub-crops can re-find one object; NMS keeps the best ---
