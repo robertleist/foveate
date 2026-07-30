@@ -188,10 +188,11 @@ def run(config: dict, limit: int = 8, target: str = "intra") -> MissBreakdown:
         pred = method.predict(item, observer=lambda ev: trace.append(
             {k: v for k, v in ev.items() if k in ("box", "decision")}))
         pre = pred.masks.astype(bool)
-        boxes = pred.boxes if pred.boxes is not None else np.zeros((pre.shape[0], 4))
-
-        leaves = [Instance(m.astype(np.uint8), tuple(int(v) for v in b), 0, float(s))
-                  for m, b, s in zip(pre, boxes, pred.scores)]
+        # Rebuild the (y0, y1, x0, x1) box the NMS expects from the mask itself: ``pred.boxes`` is
+        # the detection box in (x0, y0, x1, y1) order, and feeding that in silently breaks the
+        # cheap box pre-filter, so the re-applied NMS was not the cascade's own.
+        leaves = [Instance(m.astype(np.uint8), _mask_box(m) or (0, 0, 0, 0), 0, float(s))
+                  for m, s in zip(pre, pred.scores)]
         kept, _ = _nms(leaves, nms_iou, nms_containment)
         post = np.stack([i.mask.astype(bool) for i in kept]) if kept else np.zeros((0, *pre.shape[1:]), bool)
 
