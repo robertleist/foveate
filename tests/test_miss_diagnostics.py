@@ -100,3 +100,45 @@ def test_report_mentions_every_category():
     text = d.report()
     for name in ("detected", "suppressed by NMS", "framed but not emitted", "never framed"):
         assert name in text
+
+
+# ---------------------------------------------------------------------------
+# The precision side: what did we emit that is not a true positive?
+# ---------------------------------------------------------------------------
+def test_classify_predictions_counts_matches_duplicates_partials_and_background():
+    """One object, four detections — one good, one redundant, one straddling, one on nothing."""
+    from experiments.miss_diagnostics import classify_predictions
+
+    H = W = 40
+    gt = np.zeros((H, W), bool); gt[10:30, 10:30] = True
+
+    good = gt.copy()                                        # IoU 1.0  → matched
+    dup = np.zeros((H, W), bool); dup[11:29, 11:29] = True   # IoU 0.81 → the instance is taken
+    partial = np.zeros((H, W), bool); partial[10:30, 22:38] = True   # IoU ~0.3 → lands on it, badly
+    bg = np.zeros((H, W), bool); bg[0:5, 34:40] = True       # IoU 0    → background
+
+    out = classify_predictions([gt], [good, dup, partial, bg], [0.9, 0.8, 0.7, 0.6])
+    assert (out.n_pred, out.matched, out.duplicate, out.partial, out.background) == (4, 1, 1, 1, 1)
+
+
+def test_classify_predictions_matches_in_score_order_like_ap_does():
+    """The greedy match is score-ranked, so the higher-scoring detection claims the instance."""
+    from experiments.miss_diagnostics import classify_predictions
+
+    H = W = 40
+    gt = np.zeros((H, W), bool); gt[10:30, 10:30] = True
+    tight = gt.copy()
+    loose = np.zeros((H, W), bool); loose[8:32, 8:32] = True         # IoU 0.69, still >= 0.5
+
+    hi_tight = classify_predictions([gt], [tight, loose], [0.9, 0.1])
+    hi_loose = classify_predictions([gt], [tight, loose], [0.1, 0.9])
+    assert hi_tight.matched == hi_loose.matched == 1
+    assert hi_tight.duplicate == hi_loose.duplicate == 1
+
+
+def test_prediction_breakdown_precision_is_the_matched_fraction():
+    from experiments.miss_diagnostics import PredBreakdown
+
+    b = PredBreakdown(n_pred=10, matched=4, duplicate=3, partial=2, background=1)
+    assert b.to_metrics("intra")["intra_fp_matched_frac"] == 0.4
+    assert "precision 40.0%" in b.report()

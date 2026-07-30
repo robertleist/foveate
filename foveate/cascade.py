@@ -215,9 +215,9 @@ def cascade(
 
     # Oracle ablations: hand the target's GT to whichever slot asks for it (transient per-image
     # state, so a cached inter-protocol extractor is simply refreshed each image). Only the oracle
-    # Extract slot / Stop rule expose this hook; every other implementation never sees the GT.
+    # Extract / Stop / Merge implementations expose this hook; every other one never sees the GT.
     if gt_foreground is not None:
-        for slot in (extractor, stop):
+        for slot in (extractor, stop, merge_rule):
             if hasattr(slot, "set_target_instances"):
                 slot.set_target_instances(gt_foreground)
 

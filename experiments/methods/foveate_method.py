@@ -67,7 +67,8 @@ class FoveateMethod(Method):
         cfg = self.foveate_config
         oracle = (resolve_extractor_name(cfg) == "oracle"
                   or cfg.foreground_extractor in ("oracle", "oracle_cc")
-                  or cfg.stop_rule == "oracle")
+                  or cfg.stop_rule == "oracle"
+                  or cfg.merge_rule == "oracle")
         gt_foreground = None
         if oracle and len(item.gt_masks):
             gt_foreground = np.zeros(item.image.shape[:2], dtype=np.int32)

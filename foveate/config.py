@@ -270,7 +270,18 @@ class Config:
                                          # already-kept detection. Smaller = harsher.
     merge_soft_score_floor: float = 1e-3  # soft rule only: drop a detection once its decayed score
                                          # falls below this (the soft analogue of deletion)
-    # --- deduplication (inputs to the nms / soft merge rules) ---
+    # --- deduplication (inputs to the nms / soft / oracle merge rules) ---
+    merge_drop_clipped: bool = False     # drop a detection whose mask touches its own CROP border
+                                         # (an image border does not count — the object really ends
+                                         # there). Such a mask is PROVABLY a piece: the object
+                                         # continues outside the crop it was found in, while the
+                                         # same object is framed properly by its own branch. This is
+                                         # provenance, not overlap, so suppression cannot see it —
+                                         # the piece barely overlaps the real detection. With Extract
+                                         # and Stop oracular these fragments are the dominant false
+                                         # positive (~44 % of dense detections, ~32 % of general, at
+                                         # a median 0.21 of their object's area). Runs BEFORE the
+                                         # fragment union and the suppression rule.
     merge_fragments: bool = False        # union detections that are pieces of ONE object cut apart
                                          # by a crop boundary. NMS cannot do this: two halves found
                                          # in two crops are DISJOINT (IoU ~ 0, no containment), so no
