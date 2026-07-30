@@ -33,6 +33,27 @@ class Config:
                                           # whose CLS is most cosine-similar to the crop
     otsu_reduce: str = "mean"             # reduce the per-patch similarity over the K exemplars:
                                           # mean | max
+    otsu_min_separability: float = 0.0    # scale guard (roadmap A1.2). Otsu always returns a cut,
+                                          # even on a UNIMODAL map — which is what a crop the object
+                                          # already fills produces — and then the cut lands *inside*
+                                          # the object, the padded bbox comes in too tight and the
+                                          # child crop truncates it (over-zoom). When the cut's
+                                          # separability eta (thresholding.separability) is below
+                                          # this, the map is judged unimodal and
+                                          # ``otsu_unimodal_fallback`` decides instead. 0 = off
+                                          # (always trust Otsu, the pre-A1.2 behaviour).
+    otsu_unimodal_fallback: str = "accept_all"  # what to do on a map judged unimodal:
+                                          # accept_all (the concept fills the crop → converge here,
+                                          # let Stop decide) | percentile (cut at gate_percentile) |
+                                          # otsu (keep the cut anyway — a no-op control for the
+                                          # ablation, so the guard's *detection* can be measured
+                                          # separately from its *action*)
+    otsu_hysteresis_lo: float = 0.0       # two-threshold foreground (roadmap A1.2): seed at the
+                                          # Otsu cut, then grow into connected patches within this
+                                          # margin BELOW it, on the min-max-normalized map (so the
+                                          # margin is a fraction of the crop's similarity range).
+                                          # Recovers the dim rim a single cut shaves off — the
+                                          # cheapest over-zoom fix. 0 = off (single cut).
 
     # --- EXTRACT: which instances does the foreground hold? (slot 2 of 3, foveate.extract) ---
     instance_extractor: str = "kmeans"    # cc | kmeans | agglomerative | watershed — how a crop's
@@ -94,7 +115,46 @@ class Config:
     min_crop: int = 64                    # rho: size floor (px) — a crop at or below this is emitted
                                           # without splitting further (paper Sec. 3, Algorithm 1)
     pad_frac: float = 0.08               # padding fraction around child crops
+    crop_dilate: float = 0.0             # dilate a component by this many PATCHES before taking the
+                                         # child crop's bbox (roadmap A1.2). Padding is relative
+                                         # (pad_frac * side), so it shrinks with the crop and cannot
+                                         # cover a fixed one-patch quantization error; at 48x48 one
+                                         # patch is ~2% of the side, and the foreground's outermost
+                                         # patch is exactly where a threshold is least certain.
+                                         # Affects ONLY the box, never the emitted mask — widening
+                                         # the mask would trade boundary precision for it. 0 = off.
+                                         # FRACTIONAL on purpose: a patch is foreground when its
+                                         # CENTRE falls inside the object, so the grid bbox can be
+                                         # short by at most HALF a patch on each side. 0.5 is the
+                                         # quantization error itself; whole patches over-correct and
+                                         # inflate the crop (and the cost) beyond what is needed.
     shrink_stop: float = 0.9             # converge when child/crop area ratio >= this
+    oracle_isolation: str = "bbox"       # ORACLE STOP ONLY. How "am I framing exactly one instance?"
+                                         # is scored: "bbox" = IoU(crop box, GT instance BBOX) — 1
+                                         # exactly when the crop equals that bbox, and comparable
+                                         # across instance shapes. "mask" = the original IoU(crop as
+                                         # a filled rectangle, GT instance MASK), whose maximum is
+                                         # only the instance's fill ratio (mask area / bbox area) and
+                                         # can be raised by shrinking INTO the mask — so its peak
+                                         # lies tighter than the true bbox and the rule over-zooms.
+                                         # Kept as an ablation arm, not a default.
+    oracle_isolation_select: str = "max"  # which GT instance the crop is scored against: "max" (the
+                                         # best-scoring one — the upper envelope, so the peak is the
+                                         # best crop available) | "center" (the one whose bbox centre
+                                         # is nearest the crop centre, among those the crop overlaps;
+                                         # keeps the target fixed along a zoom chain)
+    oracle_coverage: str = "any"         # ORACLE SLOTS ONLY. How the GT is put on the patch grid:
+                                         # "any" = a patch is positive if it contains ANY pixel of an
+                                         # instance | "center" = only if the patch centre is inside.
+                                         # "any" is the right upper bound because Where is a
+                                         # PROPOSAL ("the concept may be here, go and look"), and the
+                                         # cascade then foveates onto it. Centre sampling deletes
+                                         # every object smaller than a patch before the recursion can
+                                         # see it — no patch, no component, no crop — which is a
+                                         # downsampling artefact, not a Where error an oracle should
+                                         # inherit. "any" also makes the patch-interval box CONTAIN
+                                         # the object instead of under-covering it, so crop_dilate
+                                         # stops being needed. "center" kept for the ablation.
     stop_rule: str = "reid"               # STOP slot (slot 3 of 3, foveate.stop): reid | oracle —
                                           # what decides descend / emit / reject. "reid" is the paper
                                           # rule (peak guard + confirm-then-floor on g, floored by
@@ -148,10 +208,37 @@ class Config:
     split_aggregate: str = "mean"        # DEPRECATED / unused: sub-crops are gated by the split
                                          # confirm + class floor, not pooled; kept for config compat
     cascade_min_instance_area: int = 16  # drop leaf masks smaller than this (pixels)
+    mask_refine: str = "none"            # none | grabcut — snap the emitted patch-grid mask to the
+                                         # image's own boundaries (foveate.mask_refine). A mask built
+                                         # on a 16 px grid cannot score well at strict IoU: an
+                                         # instance 2 patches across is localized to ~half its width,
+                                         # so mask AP@0.75+ measures the patch size, not the method.
+                                         # Matters most on the dense slice, where instances are 1-2
+                                         # patches. Costs CPU per emitted instance.
+    mask_refine_band: int = 2            # patches of uncertainty around the mask edge that GrabCut
+                                         # re-decides; inside stays foreground, outside background
+    mask_refine_iters: int = 3           # GrabCut iterations
+    mask_refine_max_change: float = 0.5  # reject a refinement that changes the area by more than
+                                         # this fraction (the colour model latched onto background)
+    report_boxes: str = "mask"           # which box is scored for DETECTION AP: "mask" = the tight
+                                         # box of the emitted mask (what COCO-FSOD / RF20-VL /
+                                         # CD-FSOD compare against; GT is always a tight box) |
+                                         # "crop" = the final crop the cascade converged on. The
+                                         # crop is padded by pad_frac/crop_dilate, so scoring it as
+                                         # a detection penalises the method for its own padding —
+                                         # keep it as a framing DIAGNOSTIC, not as the reported box.
     mask_upsample: str = "nearest"       # how a leaf's patch-grid mask is upsampled to pixels:
                                          # nearest (blocky patch staircase) | bilinear (smooth the
                                          # boundary — resize as float, re-binarize at 0.5)
     # --- deduplication (final NMS on emitted leaves) ---
+    merge_fragments: bool = False        # union detections that are pieces of ONE object cut apart
+                                         # by a crop boundary. NMS cannot do this: two halves found
+                                         # in two crops are DISJOINT (IoU ~ 0, no containment), so no
+                                         # suppression rule relates them, and deleting either would
+                                         # lose pixels. Pairs are joined when they are adjacent AND
+                                         # at least one touches its own crop border (= provably
+                                         # partial). Runs BEFORE nms.
+    merge_fragment_gap: int = 2          # pixels of dilation used for the adjacency test
     nms_iou: float = 0.5                 # suppress a lower-scored leaf overlapping a kept one above
                                          # this mask IoU (independent branches re-finding one object)
     nms_containment: float = 0.7         # ...or contained in a kept one beyond this fraction of its

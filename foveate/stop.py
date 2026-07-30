@@ -165,6 +165,8 @@ class OracleStopRule:
         self.cfg = cfg
         self._labels: np.ndarray | None = None
         self._areas: np.ndarray | None = None      # per-instance pixel area, indexed by label id
+        self._boxes: np.ndarray | None = None      # (N, 4) per-instance GT bbox y0,y1,x0,x1
+        self._centers: np.ndarray | None = None    # (N, 2) per-instance bbox centre (y, x)
 
     def set_target_instances(self, gt: np.ndarray) -> None:
         """Inject the target image's GT instances (transient per-image state)."""
@@ -173,10 +175,71 @@ class OracleStopRule:
         self._labels = labels
         self._areas = np.bincount(labels.ravel())
 
+        n = int(labels.max())
+        boxes = np.zeros((n, 4), dtype=np.float64)
+        for i in range(1, n + 1):
+            ys, xs = np.where(labels == i)
+            if ys.size:
+                boxes[i - 1] = (ys.min(), ys.max() + 1, xs.min(), xs.max() + 1)
+        self._boxes = boxes
+        self._centers = np.stack([(boxes[:, 0] + boxes[:, 1]) / 2,
+                                  (boxes[:, 2] + boxes[:, 3]) / 2], axis=1)
+
     def _isolation(self, box: _Box) -> float:
-        """Best IoU between ``box`` (as a mask) and any single GT instance; 0 if no GT is injected."""
+        """How close is ``box`` to framing exactly one GT instance? In ``[0, 1]``.
+
+        ``cfg.oracle_isolation`` picks the definition:
+
+        ``"bbox"`` (default)
+            IoU between the crop box and a GT instance's **bounding box**. This is the only
+            definition that reaches **1 exactly when the crop equals the instance's bbox**, which is
+            what the Stop slot is supposed to detect, and it is scale-free across instance shapes.
+        ``"mask"`` (the original, kept for the ablation)
+            IoU between the crop box treated as a filled rectangle and the instance's **mask**. Its
+            maximum is the instance's *fill ratio* (mask area / bbox area), not 1 — 0.2 or less for a
+            thin or diagonal object — and the score can be raised by shrinking the box into the
+            densest part of the mask. So the peak sits *tighter* than the true bbox, which biases the
+            rule toward over-zooming, and the value means different things for different shapes.
+
+        Other instances being visible never lowers the score: the question is "am I framing one
+        instance?", not "am I seeing only one instance".
+
+        Target selection (``cfg.oracle_isolation_select``): ``"max"`` takes the best-scoring instance
+        — the upper envelope of the per-instance curves, so the peak is the best crop available;
+        ``"center"`` takes the instance whose bbox centre is nearest the crop centre, which keeps the
+        target identity fixed along a zoom chain but can track an instance the crop is not framing.
+        """
         if self._labels is None or self._areas is None or self._areas.size < 2:
             return 0.0
+        if str(getattr(self.cfg, "oracle_isolation", "bbox")) == "mask":
+            return self._isolation_mask(box)
+        return self._isolation_bbox(box)
+
+    def _isolation_bbox(self, box: _Box) -> float:
+        boxes = self._boxes
+        if boxes is None or boxes.size == 0:
+            return 0.0
+        y0, y1, x0, x1 = box
+        iy0 = np.maximum(boxes[:, 0], y0); iy1 = np.minimum(boxes[:, 1], y1)
+        ix0 = np.maximum(boxes[:, 2], x0); ix1 = np.minimum(boxes[:, 3], x1)
+        inter = np.clip(iy1 - iy0, 0, None) * np.clip(ix1 - ix0, 0, None)
+        crop_area = max((y1 - y0) * (x1 - x0), 1)
+        gt_area = (boxes[:, 1] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 2])
+        iou = inter / np.maximum(crop_area + gt_area - inter, 1.0)
+
+        if str(getattr(self.cfg, "oracle_isolation_select", "max")) == "center":
+            cy, cx = (y0 + y1) / 2, (x0 + x1) / 2
+            d = (self._centers[:, 0] - cy) ** 2 + (self._centers[:, 1] - cx) ** 2
+            # Only instances actually touching the crop are candidates; otherwise a distant
+            # instance with no overlap could be selected and the score would read 0 forever.
+            visible = np.where(inter > 0)[0]
+            if visible.size == 0:
+                return 0.0
+            return float(iou[visible[np.argmin(d[visible])]])
+        return float(iou.max())
+
+    def _isolation_mask(self, box: _Box) -> float:
+        """The original definition: crop-as-rectangle vs instance **mask** (see :meth:`_isolation`)."""
         y0, y1, x0, x1 = box
         sub = self._labels[y0:y1, x0:x1]
         if sub.size == 0:

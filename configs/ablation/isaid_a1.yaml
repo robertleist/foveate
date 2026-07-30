@@ -1,0 +1,90 @@
+# The standing Track-A ablation harness (roadmap A3.0): iSAID, frozen subset, diagnostics ON.
+#
+# This is the ONE config every A1/A2 knob is judged against, so the data block is FROZEN once the
+# subset is picked — change `seed`, `train_images`, `interval_images` or `max_exemplars` and no two
+# ablation numbers are comparable again. Sweep `foveate.*` only.
+#
+# Why iSAID: the one PUBLIC benchmark whose motivation is Foveate's pitch — many small objects, huge
+# scale variation, dense distribution. A small_vehicle is sub-patch at full frame, so a single frozen
+# forward cannot resolve it even in principle; parked vehicles and moored ships touch, which
+# exercises the Extract/split axis. LIVECell is the non-aerial guard; corals/polyps are showcases.
+#
+# ---------------------------------------------------------------------------------------------
+# SETUP — NOT YET RUNNABLE. Three things to do first (roadmap A3.0.4):
+#   1. Fetch the iSAID COCO annotations + the DOTA images; point `root` at them.
+#   2. Verify the category string. iSAID inherits DOTA's inconsistent casing ("Small_Vehicle" vs
+#      "small_vehicle"), and a mismatch here yields an EMPTY dataset instead of an error:
+#        python -c "import json;print([c['name'] for c in json.load(open('<ann>.json'))['categories']])"
+#   3. Freeze the subset: the ~50 images richest in that one class, ids recorded in the vault note.
+# ---------------------------------------------------------------------------------------------
+run_name: isaid_a1
+
+backbone:
+  type: dino
+  model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+  image_size: 768
+
+data:
+  name: coco                      # iSAID ships MS-COCO-format instance annotations
+  label: isaid
+  root: datasets/isaid            # TODO(A3.0.4): point at the downloaded set
+  annotation_file: annotations.json
+  images_dir: images
+  categories: [ship]              # TODO(A3.0.4): verify the exact string (see step 2 above).
+                                  # `ship` and `small_vehicle` are the two candidate ablation
+                                  # classes — dense, touching, and sub-patch at full frame.
+  min_instances: 2                # the intra known/unknown split needs at least two
+  # --- FROZEN SUBSET — do not touch once set ---
+  train_images: 10                # intra pool + cross-image support pool
+  interval_images: 40             # inter targets; keep the total ~50 so a sweep point stays minutes
+  known_ratio: 0.3
+  seed: 42
+
+foveate:
+  # Baseline = the cv4e configuration, so an ablation delta is measured against a known point.
+  foreground_extractor: insid3
+  insid3_tau_fg: 0.0
+  insid3_aggt: 0.1
+  insid3_crop_reference: true
+  insid3_top_k_exemplars: 1
+  insid3_dynamic_tau_fg: true
+  insid3_dynamic_aggt: true
+  insid3_tau_fg_scale: 0.3
+  insid3_aggt_scale: 0.3
+  debias: true
+  debias_subspace_dim: 8
+  crop_sim_floor: 0.3
+  confidence_reid_mode: full
+  reid_top_k: 0
+  instance_extractor: kmeans
+  zoom_split_retry_eps: 0.01
+  nms_iou: 0.5
+  nms_containment: 0.7
+  min_crop: 16
+  max_total_embeds: 512
+  # --- A1.2 guards: all OFF here, so this run is the control arm the sweep moves away from ---
+  crop_dilate: 0                  # patches of safety margin on the child bbox
+  otsu_min_separability: 0.0      # 0 = trust every Otsu cut (start the sweep at 0.8, see A1.2)
+  otsu_unimodal_fallback: accept_all
+  otsu_hysteresis_lo: 0.0
+
+eval:
+  targets: [intra, inter]
+  max_exemplars: 5                # FROZEN like the subset: bank size changes results, and `null`
+                                  # (unbounded) is the known runtime blow-up
+  limit: null
+  visualize: 4
+  cascade_trace: 2
+  zoom_diag: all                  # GT-aware over/under-zoom on EVERY image — the point of this
+                                  # harness (pays the observer's internals cost; that is the trade)
+
+mlflow:
+  enabled: true
+  experiment_name: foveate-a1
+  tracking_uri: null
+
+# The A1.2 sweep this harness exists for. Run with experiments.ablations.
+# Keys MUST be dotted config paths or the axis silently does nothing.
+sweep:
+  foveate.crop_dilate: [0, 1, 2]
+  foveate.pad_frac: [0.08, 0.15, 0.25]

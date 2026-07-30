@@ -68,8 +68,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.ndimage import binary_dilation
 
-from foveate import features as featlib
+from foveate import features as featlib, mask_refine
 from foveate.config import Config
 from foveate.extract import build_instance_extractor, component_label_map
 from foveate.foreground import build_extractor
@@ -125,12 +126,23 @@ def _grid_bbox(comp):
     return rows.min(), rows.max() + 1, cols.min(), cols.max() + 1
 
 
-def _child_box(comp, box, pad_frac):
-    """Pixel bbox (in original coords) of a grid component within ``box``, padded."""
+def _child_box(comp, box, pad_frac, dilate: float = 0.0):
+    """Pixel bbox (in original coords) of a grid component within ``box``, padded.
+
+    ``dilate`` (``cfg.crop_dilate``, in **patches**) widens the grid bbox before it is converted to
+    pixels — a fixed, scale-independent safety margin on the Where step's outermost patch, which is
+    exactly where its threshold is least certain. ``pad_frac`` cannot play that role: being relative,
+    it shrinks along with the crop just as the quantization error stays constant.
+    """
     y0, y1, x0, x1 = box
     ch, cw = y1 - y0, x1 - x0
     hp, wp = comp.shape
     rmin, rmax, cmin, cmax = _grid_bbox(comp)
+    if dilate:
+        # Fractional: the grid bbox under-states the object by up to half a patch on each side
+        # (a patch is foreground when its *centre* is inside), so 0.5 is the exact correction.
+        rmin = max(0.0, rmin - dilate); rmax = min(float(hp), rmax + dilate)
+        cmin = max(0.0, cmin - dilate); cmax = min(float(wp), cmax + dilate)
     py0 = y0 + int(np.floor(rmin / hp * ch)); py1 = y0 + int(np.ceil(rmax / hp * ch))
     px0 = x0 + int(np.floor(cmin / wp * cw)); px1 = x0 + int(np.ceil(cmax / wp * cw))
     pady, padx = int(round((py1 - py0) * pad_frac)), int(round((px1 - px0) * pad_frac))
@@ -181,6 +193,85 @@ def _mask_overlap(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     union = int(np.logical_or(a, b).sum())
     smaller = min(int(a.sum()), int(b.sum())) or 1
     return inter / union, inter / smaller
+
+
+def _touches_border(mask: np.ndarray, box) -> bool:
+    """Does this instance's mask reach the edge of the crop it was found in?
+
+    A component touching its crop border is *provably* only partially in frame — the object
+    continues outside the crop — so the emitted mask is a fragment, not an instance.
+    """
+    y0, y1, x0, x1 = box
+    sub = mask[y0:y1, x0:x1]
+    if sub.size == 0:
+        return False
+    return bool(sub[0].any() or sub[-1].any() or sub[:, 0].any() or sub[:, -1].any())
+
+
+def _merge_fragments(instances: list[Instance], gap: int) -> tuple[list[Instance], int]:
+    """Union detections that are pieces of one object cut apart by crop boundaries.
+
+    **Why NMS cannot do this.** Suppression compares a pair by IoU or containment and *deletes* the
+    weaker one. Two halves of an instance found in two different crops are **disjoint**: their IoU is
+    ~0 and neither contains the other, so no suppression rule relates them at all — and deleting one
+    would be wrong anyway, because each holds pixels the other lacks. The repair is a **union**, and
+    the pair is recognised by geometry (adjacent) plus provenance (at least one piece is clipped by
+    its own crop border), not by overlap.
+
+    Merged score is the maximum over the pieces: a piece that does *not* touch a border was seen
+    whole, so its confidence is the trustworthy one.
+    """
+    if len(instances) < 2:
+        return instances, 0
+
+    masks = [inst.mask.astype(bool) for inst in instances]
+    partial = [_touches_border(m, inst.box) for m, inst in zip(masks, instances)]
+    boxes = []
+    for m in masks:
+        ys, xs = np.where(m)
+        boxes.append((ys.min(), ys.max() + 1, xs.min(), xs.max() + 1) if ys.size else (0, 0, 0, 0))
+
+    parent = list(range(len(instances)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    struct = np.ones((2 * gap + 1, 2 * gap + 1), dtype=bool)
+    for i in range(len(instances)):
+        for j in range(i + 1, len(instances)):
+            if not (partial[i] or partial[j]):
+                continue                      # both were seen whole → different objects
+            bi, bj = boxes[i], boxes[j]       # cheap reject: tight boxes further apart than the gap
+            if (bi[0] > bj[1] + gap or bj[0] > bi[1] + gap
+                    or bi[2] > bj[3] + gap or bj[2] > bi[3] + gap):
+                continue
+            y0 = max(0, min(bi[0], bj[0]) - gap); y1 = max(bi[1], bj[1]) + gap
+            x0 = max(0, min(bi[2], bj[2]) - gap); x1 = max(bi[3], bj[3]) + gap
+            a = masks[i][y0:y1, x0:x1]
+            b = masks[j][y0:y1, x0:x1]
+            if (a & b).any() or (binary_dilation(a, structure=struct) & b).any():
+                parent[find(i)] = find(j)
+
+    groups: dict[int, list[int]] = {}
+    for i in range(len(instances)):
+        groups.setdefault(find(i), []).append(i)
+    if len(groups) == len(instances):
+        return instances, 0
+
+    out = []
+    for members in groups.values():
+        if len(members) == 1:
+            out.append(instances[members[0]])
+            continue
+        merged = np.logical_or.reduce([masks[i] for i in members]).astype(np.uint8)
+        best = max(members, key=lambda i: instances[i].score)
+        ys, xs = np.where(merged)
+        box = (int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1)
+        out.append(Instance(merged, box, instances[best].depth, instances[best].score))
+    return out, len(instances) - len(out)
 
 
 def _nms(instances: list[Instance], iou_thresh: float, contain_thresh: float
@@ -302,6 +393,8 @@ def cascade(
             extractor.set_target_foreground(gt_foreground)
         if hasattr(stop, "set_target_instances"):
             stop.set_target_instances(gt_foreground)
+        if hasattr(instance_extractor, "set_target_instances"):
+            instance_extractor.set_target_instances(gt_foreground)
 
     # Re-identification score g: a standalone scorer over the exemplar bank, independent of the
     # Where extractor above. "cls" reuses the extractor's already-embedded exemplar CLS for free;
@@ -334,6 +427,13 @@ def cascade(
             return
         full = np.zeros((H, W), np.uint8)
         full[y0:y1, x0:x1] = mask_local
+        if cfg.mask_refine != "none":
+            # Snap the patch staircase to the image's own boundaries. Done here, on the crop the
+            # instance was found in, where the object is largest in pixels — the best conditions
+            # this instance will ever get for a colour-based refinement.
+            refined = mask_refine.refine_mask(full[y0:y1, x0:x1].astype(bool),
+                                              image[y0:y1, x0:x1], cfg)
+            full[y0:y1, x0:x1] = refined.astype(np.uint8)
         leaves.append(Instance(full, region.box, region.depth, score))
         stats.leaves += 1
 
@@ -361,7 +461,7 @@ def cascade(
         pr = _Region(parent.box, parent.depth)
         merged = np.logical_or.reduce(parent.comps)
         if cfg.emit_components:
-            comps = instance_extractor.components(merged)
+            comps = instance_extractor.components(merged, box=parent.box)
             for c, score in zip(comps, _component_scores(comps, parent.reid, merged.shape)):
                 emit(pr, c, score, feat=parent.feat)
         else:
@@ -428,11 +528,11 @@ def cascade(
                         and stop.accept(parent.reid, parent.box)
                         and stop.allow_retry(parent.reid, reid_scores[members[0]])):
                     comp = parent.comps[0]
-                    subs = instance_extractor.split(parent.feat, comp)
+                    subs = instance_extractor.split(parent.feat, comp, box=parent.box)
                     if len(subs) >= 2:
                         # Same no-progress guard as the convergence split: a sub-box equal to
                         # the parent's box would re-embed the identical crop forever.
-                        pairs = [(s, _child_box(s, parent.box, cfg.pad_frac)) for s in subs]
+                        pairs = [(s, _child_box(s, parent.box, cfg.pad_frac, cfg.crop_dilate)) for s in subs]
                         pairs = [(s, b) for s, b in pairs if b != parent.box]
                         subs = [s for s, _ in pairs]
                         sub_boxes = [b for _, b in pairs]
@@ -488,7 +588,7 @@ def cascade(
             gr = gates[i] if gates[i] is not None else extractor.predict(
                 feat, cls=cls, box=r.box, return_internals=observer is not None)
             fg = gr.foreground
-            comps = instance_extractor.components(fg)      # Extract: instance candidates on the crop
+            comps = instance_extractor.components(fg, box=r.box)   # Extract: candidates on the crop
             n = len(comps)
 
             floor = (r.box[1] - r.box[0]) <= cfg.min_crop or (r.box[3] - r.box[2]) <= cfg.min_crop
@@ -508,7 +608,7 @@ def cascade(
                 # identical components and splits again — an infinite loop only the embed
                 # budget stops (and a self-referential trace event that hangs the trajectory
                 # tools). Emit such a component as-is; recurse only into genuinely tighter ones.
-                boxes_all = [_child_box(c, r.box, cfg.pad_frac) for c in comps]
+                boxes_all = [_child_box(c, r.box, cfg.pad_frac, cfg.crop_dilate) for c in comps]
                 kept = [(c, b) for c, b in zip(comps, boxes_all) if b != r.box]
                 for c, b in zip(comps, boxes_all):
                     if b == r.box:
@@ -521,7 +621,7 @@ def cascade(
                     decision = "leaf-cap"
             else:                                         # single component
                 comp = comps[0]
-                child = _child_box(comp, r.box, cfg.pad_frac)
+                child = _child_box(comp, r.box, cfg.pad_frac, cfg.crop_dilate)
                 if _box_area(child) / max(_box_area(r.box), 1) < cfg.shrink_stop:
                     decision, children, child_comps = "zoom", [child], [comp]  # strictly tighter
                 elif not stop.accept(reid_score, r.box):    # converged, below the floor → not the class
@@ -538,12 +638,12 @@ def cascade(
                     # sub-crop only if it re-identifies the exemplar more strongly than this crop.
                     # If neither beats it (they got worse, or the blob is unsplittable), the cascade
                     # falls back and emits this crop — the crop that led to the split — as ``reid-stop``.
-                    subs = instance_extractor.split(feat, comp)
+                    subs = instance_extractor.split(feat, comp, box=r.box)
                     if len(subs) >= 2:
                         # Drop a sub-crop whose padded box clips back to THIS crop's box: it
                         # makes no geometric progress (identical crop → identical CLS →
                         # identical split), so pursuing it loops until the embed budget.
-                        pairs = [(s, _child_box(s, r.box, cfg.pad_frac)) for s in subs]
+                        pairs = [(s, _child_box(s, r.box, cfg.pad_frac, cfg.crop_dilate)) for s in subs]
                         pairs = [(s, b) for s, b in pairs if b != r.box]
                     else:
                         pairs = []
@@ -613,6 +713,12 @@ def cascade(
     # Dedup: independent branches (especially the two sub-crops of a k=2 split whose boxes nest)
     # can converge on the same object and emit it twice. A final score-ranked NMS keeps the best
     # detection of each object. Disable by setting both thresholds to 1.0.
+    # Fragment merge first, suppression second: a crop boundary can cut one object into disjoint
+    # pieces that NMS is blind to (IoU ~ 0, no containment), and merging them before the score-ranked
+    # pass means the union — not an arbitrary piece — is what competes for survival.
+    if cfg.merge_fragments:
+        leaves, n_merged = _merge_fragments(leaves, cfg.merge_fragment_gap)
+        stats.merged += n_merged
     if cfg.nms_iou < 1.0 or cfg.nms_containment < 1.0:
         leaves, n_suppressed = _nms(leaves, cfg.nms_iou, cfg.nms_containment)
         stats.suppressed += n_suppressed

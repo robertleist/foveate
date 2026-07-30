@@ -43,7 +43,7 @@ import numpy as np
 import torch
 from scipy.ndimage import generate_binary_structure, label
 
-from foveate import clustering, individuation, merge
+from foveate import clustering, features as featlib, individuation, merge
 
 _CONN8 = generate_binary_structure(2, 2)   # 8-connectivity: don't over-split single instances
 _CONN4 = generate_binary_structure(2, 1)   # 4-connectivity: split diagonally-touching blobs
@@ -78,11 +78,15 @@ class InstanceExtractor(Protocol):
 
     can_split: bool
 
-    def components(self, foreground: np.ndarray) -> list[np.ndarray]:
-        """Instance candidates in a ``(Hp, Wp)`` bool foreground → list of bool grids (may be empty)."""
+    def components(self, foreground: np.ndarray, box=None) -> list[np.ndarray]:
+        """Instance candidates in a ``(Hp, Wp)`` bool foreground → list of bool grids (may be empty).
+
+        ``box`` is the crop's ``(y0, y1, x0, x1)`` pixel box in original-image coordinates. Only the
+        oracle needs it (to look up the GT for this crop); every other extractor ignores it.
+        """
         ...
 
-    def split(self, feat, component: np.ndarray) -> list[np.ndarray]:
+    def split(self, feat, component: np.ndarray, box=None) -> list[np.ndarray]:
         """Force one converged ``component`` into ≥ 2 sub-grids; ``[component]`` = unsplittable."""
         ...
 
@@ -100,14 +104,14 @@ class ConnectedComponentsExtractor:
         self.cfg = cfg
         self._struct = _extract_structure(cfg.extract_connectivity)
 
-    def components(self, foreground: np.ndarray) -> list[np.ndarray]:
+    def components(self, foreground: np.ndarray, box=None) -> list[np.ndarray]:
         fg = np.asarray(foreground, dtype=bool)
         if not fg.any():
             return []
         labels, n = label(fg, structure=self._struct)
         return [labels == cid for cid in range(1, n + 1)]
 
-    def split(self, feat, component: np.ndarray) -> list[np.ndarray]:
+    def split(self, feat, component: np.ndarray, box=None) -> list[np.ndarray]:
         """No internal boundary is ever drawn → always "unsplittable"."""
         return [np.asarray(component, dtype=bool)]
 
@@ -122,7 +126,7 @@ class KMeansExtractor(ConnectedComponentsExtractor):
 
     can_split = True
 
-    def split(self, feat, component: np.ndarray) -> list[np.ndarray]:
+    def split(self, feat, component: np.ndarray, box=None) -> list[np.ndarray]:
         return _split_kmeans(feat, component)
 
 
@@ -137,7 +141,7 @@ class AgglomerativeExtractor(ConnectedComponentsExtractor):
 
     can_split = True
 
-    def split(self, feat, component: np.ndarray) -> list[np.ndarray]:
+    def split(self, feat, component: np.ndarray, box=None) -> list[np.ndarray]:
         labels = clustering.agglomerative_oversegment(feat, component, self.cfg.cluster_tau)
         return [labels == i for i in np.unique(labels) if i != 0]
 
@@ -153,7 +157,7 @@ class WatershedExtractor(ConnectedComponentsExtractor):
 
     can_split = True
 
-    def split(self, feat, component: np.ndarray) -> list[np.ndarray]:
+    def split(self, feat, component: np.ndarray, box=None) -> list[np.ndarray]:
         cfg = self.cfg
         labels = clustering.agglomerative_oversegment(feat, component, cfg.cluster_tau)
         indiv = individuation.individuate(
@@ -166,6 +170,103 @@ class WatershedExtractor(ConnectedComponentsExtractor):
             similarity_threshold=cfg.merge_similarity, boundary_threshold=cfg.merge_boundary,
         )
         return [merged == i for i in np.unique(merged) if i != 0]
+
+
+class OracleInstanceExtractor(ConnectedComponentsExtractor):
+    """``oracle`` — the ground-truth instance decomposition of whatever foreground it is given.
+
+    The Extract-slot upper bound, and deliberately **not** the same thing as the ``oracle_cc``
+    *Where* extractor. ``oracle_cc`` replaces the foreground itself (GT region, with seams carved);
+    this replaces only the *decomposition* of a foreground that some other Where stage produced. So
+    a real Where can be paired with a perfect Extract, and the resulting gap is attributable to one
+    slot instead of two.
+
+    Both operations intersect the GT instances with the foreground they are handed, never adding
+    patches the Where stage did not find — that is what keeps the slots separate.
+
+    Needs the target's GT instance-label map (``set_target_instances``, forwarded by the cascade
+    from ``cascade(gt_foreground=...)``) and the crop ``box`` to look up the right region.
+    """
+
+    can_split = True
+
+    def __init__(self, cfg) -> None:
+        super().__init__(cfg)
+        self._labels: np.ndarray | None = None      # (H, W) int32 GT instance labels, 0 = background
+
+    def set_target_instances(self, gt_foreground: np.ndarray) -> None:
+        """Install this image's GT. A bool union mask degrades to one instance (label 1)."""
+        labels = np.asarray(gt_foreground)
+        if labels.dtype == bool:
+            labels = labels.astype(np.int32)
+        self._labels = labels.astype(np.int32)
+
+    def _grid(self, box, shape) -> np.ndarray:
+        """GT instance labels of ``box``, nearest-neighbour sampled onto a ``shape`` patch grid.
+
+        Shares :func:`foveate.features.resize_labels_to_grid` with the Where stage so the two can
+        never disagree: sampling the GT at two different points half a patch apart made patches that
+        Where called foreground read as *background* here, which dropped whole instances from the
+        decomposition without any error.
+        """
+        if self._labels is None:
+            raise RuntimeError(
+                "OracleInstanceExtractor used before set_target_instances — the cascade must "
+                "receive gt_foreground for the oracle Extract slot."
+            )
+        if box is None:                              # no crop context → whole image
+            box = (0, self._labels.shape[0], 0, self._labels.shape[1])
+        y0, y1, x0, x1 = box
+        sub = self._labels[y0:y1, x0:x1]
+        gh, gw = shape
+        if sub.size == 0:
+            return np.zeros(shape, dtype=np.int32)
+        return featlib.resize_labels_to_grid(sub.astype(np.int32), (gh, gw))
+
+    def _by_instance(self, region: np.ndarray, box) -> list[np.ndarray]:
+        """Split a bool ``region`` into one grid per GT instance overlapping it.
+
+        With ``oracle_coverage="any"`` a patch belongs to **every** instance it touches, so an
+        instance smaller than a patch still gets a component of its own instead of being absorbed
+        into whichever neighbour happened to own the patch centre. Components may therefore overlap
+        — that is correct here: they are *crop proposals*, and two objects sharing a patch genuinely
+        need two crops.
+        """
+        region = np.asarray(region, dtype=bool)
+        if not region.any():
+            return []
+        if self._labels is None:
+            self._grid(box, region.shape)            # raises the "no GT injected" error
+        y0, y1, x0, x1 = box if box is not None else (0, self._labels.shape[0],
+                                                      0, self._labels.shape[1])
+        sub = self._labels[y0:y1, x0:x1]
+        out = []
+        if str(getattr(self.cfg, "oracle_coverage", "any")) == "any":
+            for lab in np.unique(sub):
+                if lab == 0:
+                    continue
+                part = region & featlib.resize_mask_to_grid(sub == lab, region.shape, mode="any")
+                if part.any():
+                    out.append(part)
+            return out or [region]
+        grid = self._grid(box, region.shape)
+        for lab in np.unique(grid[region]):
+            if lab == 0:                             # background patches: not an instance
+                continue
+            part = region & (grid == lab)
+            if part.any():
+                out.append(part)
+        # A foreground that covers only background GT (a false positive of the Where stage) has no
+        # instances to report; hand it back whole so the Stop slot still gets to reject it.
+        return out or [region]
+
+    def components(self, foreground: np.ndarray, box=None) -> list[np.ndarray]:
+        return self._by_instance(np.asarray(foreground, dtype=bool), box)
+
+    def split(self, feat, component: np.ndarray, box=None) -> list[np.ndarray]:
+        parts = self._by_instance(component, box)
+        # One GT instance in this clump ⇒ genuinely unsplittable, which is the correct answer.
+        return parts if len(parts) >= 2 else [np.asarray(component, dtype=bool)]
 
 
 def _split_kmeans(feat, comp_grid) -> list[np.ndarray]:
@@ -194,6 +295,7 @@ _EXTRACTORS = {
     "kmeans": KMeansExtractor,
     "agglomerative": AgglomerativeExtractor,
     "watershed": WatershedExtractor,
+    "oracle": OracleInstanceExtractor,
 }
 
 
