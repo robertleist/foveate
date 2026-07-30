@@ -1,0 +1,78 @@
+# SUPERSEDED as the ablation venue (roadmap A3.0, 2026-07-30) — kept only as a LOCAL SMOKE TEST.
+#
+# The corals set is hand-made and UNPUBLISHED, so ablations run here are not reproducible by anyone
+# else — disqualifying for CVPR. Tuning moved to iSAID (public, COCO-format instance masks, dense
+# sub-patch objects in large images); LIVECell is the Extract-axis guard.
+#
+# What this config is still good for: exercising the full pipeline end-to-end on real DINOv3 with
+# `eval.zoom_diag` on, without a download. Do NOT report numbers from it, and do not tune on it.
+run_name: corals_smoke
+
+backbone:
+  type: dino
+  model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+  image_size: 768
+
+data:
+  name: coco                      # the corals dataset is COCO-format
+  label: corals
+  root: datasets/corals_coco      # local checkout; the cv4e configs use /data/robert/hifmb_corals
+  annotation_file: annotations.json
+  images_dir: images
+  categories: [Coral Fragment]
+  min_instances: 2
+  # --- FROZEN SPLIT — do not touch (A3.0) ---
+  train_images: 10                # intra pool + cross-image support pool
+  interval_images: -1             # evaluate inter on all 45 remaining images
+  known_ratio: 0.3
+  seed: 42
+
+foveate:
+  # Baseline = the cv4e corals configuration, so an ablation delta is measured against a known point.
+  foreground_extractor: insid3
+  insid3_tau_fg: 0.0
+  insid3_aggt: 0.1
+  insid3_crop_reference: true
+  insid3_top_k_exemplars: 1
+  insid3_dynamic_tau_fg: true
+  insid3_dynamic_aggt: true
+  insid3_tau_fg_scale: 0.3
+  insid3_aggt_scale: 0.3
+  debias: true
+  debias_subspace_dim: 8
+  crop_sim_floor: 0.3
+  confidence_reid_mode: full
+  reid_top_k: 0
+  instance_extractor: kmeans
+  zoom_split_retry_eps: 0.01
+  nms_iou: 0.5
+  nms_containment: 0.7
+  min_crop: 16
+  max_total_embeds: 512
+  # --- A1.2 guards: all OFF here, so this run is the control arm the sweep moves away from ---
+  crop_dilate: 0                  # patches of safety margin on the child bbox
+  otsu_min_separability: 0.0      # 0 = trust every Otsu cut (start the sweep at 0.8, see A1.2)
+  otsu_unimodal_fallback: accept_all
+  otsu_hysteresis_lo: 0.0
+
+eval:
+  targets: [intra, inter]
+  max_exemplars: 5                # FROZEN like the split: the bank size changes results, and
+                                  # `null` (unbounded) is the known runtime blow-up — a whole-pool
+                                  # bank is re-scored against every crop (see ILR+G note).
+  limit: null
+  visualize: 4
+  cascade_trace: 2
+  zoom_diag: all                  # the point of this harness: GT-aware over/under-zoom on EVERY
+                                  # image (pays the observer's internals cost — that is the trade)
+
+mlflow:
+  enabled: true
+  experiment_name: foveate-a1
+  tracking_uri: null
+
+# The A1.2 sweep this harness exists for. Run with experiments.ablations.
+# Keys MUST be dotted config paths or the axis silently does nothing.
+sweep:
+  foveate.crop_dilate: [0, 1, 2]
+  foveate.pad_frac: [0.08, 0.15, 0.25]

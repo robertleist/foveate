@@ -161,6 +161,7 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
     # Images to harvest the insid3 aggregate-score histogram over (None → reuse cascade_trace,
     # which already runs the gate with internals; int/"all" to sample more).
     gate_hist = eval_cfg.get("gate_hist")
+    zoom_diag = eval_cfg.get("zoom_diag")
 
     intra_ds, inter_ds = build_datasets(data_cfg)
 
@@ -214,7 +215,7 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
             items = iter_intra_items(intra_ds, max_exemplars=max_exemplars, limit=limit)
             result.update(_evaluate(method, items, output_dir / "intra", "intra",
                                     visualize=visualize, cascade_trace=cascade_trace,
-                                    gate_hist=gate_hist, total=limit))
+                                    gate_hist=gate_hist, zoom_diag=zoom_diag, total=limit))
         if "inter" in targets:
             if inter_ds is None:
                 print("[run] inter eval requested but interval_images == 0; skipping.")
@@ -223,7 +224,7 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
                 items = iter_inter_items(inter_ds, support, max_exemplars=max_exemplars, limit=limit)
                 result.update(_evaluate(method, items, output_dir / "inter", "inter",
                                         visualize=visualize, cascade_trace=cascade_trace,
-                                    gate_hist=gate_hist, total=limit))
+                                        gate_hist=gate_hist, zoom_diag=zoom_diag, total=limit))
 
         (output_dir / "metrics.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         print(json.dumps(result, indent=2))
@@ -252,6 +253,16 @@ def _method_device(method: Method):
     """The method's compute device (``method.backbone.device`` or ``method.device``), or None."""
     backbone = getattr(method, "backbone", None)
     return getattr(backbone, "device", None) or getattr(method, "device", None)
+
+
+def _backbone_input_side(method: Method, default: float = 768.0) -> float:
+    """The backbone's square input side — the unit the zoom diagnostics bin crop sizes in.
+
+    A crop wider than this is *downsampled* into the encoder, so zooming still buys pixels; below
+    it the crop is upsampled and zoom buys only framing (roadmap 0, A1.4).
+    """
+    backbone = getattr(method, "backbone", None)
+    return float(getattr(backbone, "image_size", default) or default)
 
 
 def _cuda_device(method: Method):
@@ -311,7 +322,8 @@ def _aggregate_threshold(method: Method) -> float | None:
 
 def _evaluate(method: Method, items, output_dir: Path, prefix: str,
               visualize: Any = False, cascade_trace: Any = False,
-              gate_hist: Any = None, total: int | None = None) -> dict[str, Any]:
+              gate_hist: Any = None, zoom_diag: Any = None,
+              total: int | None = None) -> dict[str, Any]:
     """Predict over ``items``, save per-image masks, and return ``{prefix}_<metric>`` results."""
     output_dir.mkdir(parents=True, exist_ok=True)
     predictions: list[evallib.ImagePrediction] = []
@@ -331,18 +343,24 @@ def _evaluate(method: Method, items, output_dir: Path, prefix: str,
     # the cascade-trace budget (those images already run the gate with internals, so it's free);
     # bump ``eval.gate_hist`` to sample more (each extra image pays the internals cost).
     hist_budget = _budget(cascade_trace if gate_hist is None else gate_hist)
+    # GT-aware over/under-zoom diagnostics (roadmap A1.1). Same deal: free on images that already
+    # carry a trace, so it defaults to the cascade-trace budget. Set ``eval.zoom_diag: all`` for a
+    # diagnostic run — every image then pays the observer's internals cost, which is the point.
+    diag_budget = _budget(cascade_trace if zoom_diag is None else zoom_diag)
     viz_dir = output_dir / "viz"
     trace_dir = output_dir / "viz" / "cascade"
     traj_dir = output_dir / "viz" / "trajectory"
     gate_combined: list[float] = []
+    diag_total = None
 
     bar = _progress(items, desc=prefix, total=total)
     for item in bar:
         want_trace = n_items < trace_budget
         want_hist = n_items < hist_budget
-        # Collect an observer trace whenever we render the contact sheet OR harvest gate stats;
-        # a hist-only trace is reduced to floats and dropped right after the call.
-        trace: list | None = [] if (want_trace or want_hist) else None
+        want_diag = n_items < diag_budget
+        # Collect an observer trace whenever we render the contact sheet OR harvest gate stats OR
+        # score the zoom against the GT; a stats-only trace is reduced and dropped right after.
+        trace: list | None = [] if (want_trace or want_hist or want_diag) else None
         pred, n_embeds, elapsed = _discover_one(method, item, trace=trace)
         predictions.append(pred)
         gts.append(item.gt_masks)
@@ -366,6 +384,11 @@ def _evaluate(method: Method, items, output_dir: Path, prefix: str,
                 save_final_crops(item, pred, viz_dir / "crops")
         if want_hist and trace:
             gate_combined.extend(_harvest_combined(trace))
+        if want_diag and trace:
+            from experiments.zoom_diagnostics import zoom_diagnostics
+            d = zoom_diagnostics(trace, item.gt_masks, item.exemplar_masks, item.image.shape[:2],
+                                 image_size=_backbone_input_side(method))
+            diag_total = d if diag_total is None else diag_total.merge(d)
         if want_trace and trace:   # non-empty only when the method drove the observer (foveate)
             from experiments.visualize import save_cascade_trace
             from experiments.trajectories import save_cls_trajectory
@@ -410,6 +433,15 @@ def _evaluate(method: Method, items, output_dir: Path, prefix: str,
             out[f"{prefix}_gate_combined_{name}"] = val
         if agg_thr is not None:
             out[f"{prefix}_gate_combined_frac_below_alpha"] = float((v < agg_thr).mean())
+
+    # GT-aware zoom diagnostics: over-zoom / under-zoom / slow-zoom rates and the foreground
+    # precision-recall-by-crop-size table (roadmap A1.1). These say *why* an AP moved — a Where
+    # change that trades recall for precision at leaf scale shows up here before it shows up in AP.
+    if diag_total is not None and diag_total.n_events:
+        out.update(diag_total.to_metrics(prefix))
+        (output_dir / f"{prefix}_zoom_diagnostics.txt").write_text(diag_total.report(),
+                                                                  encoding="utf-8")
+        print(diag_total.report())
 
     # Inference time. ``mean_runtime_s`` is kept for continuity; median is the more robust
     # per-image figure for the paper (the first image pays one-off warmup), and throughput is

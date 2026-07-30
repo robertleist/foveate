@@ -1,0 +1,81 @@
+# Track-A ablation harness — the GENERAL tuning venue (roadmap A3.0). THE PARITY GUARD.
+#
+# Both tuning venues are carved out of ONE dataset (LVIS val) so that they differ in the *regime*
+# and nothing else: same images, same annotators, same label space. A separate dense dataset would
+# confound "small and dense" with "different domain", and a knob tuned on it would be
+# un-attributable. Its sibling is `lvis_general_a1.yaml` — the parity guard. Every ablation row
+# reports BOTH, and a knob is accepted only if it does not hurt the general venue.
+#
+# Slice: >= 2 instances of the class per image, NO size restriction — ordinary LVIS images. This is
+# the venue that stops us buying dense-regime AP with general-regime AP: a knob that wins on
+# `lvis_dense_a1` but loses here is rejected, and we find that out in minutes rather than in October.
+# Exhaustively-annotated (image, class) pairs only: LVIS is federated, and ignoring that would score
+# unlabelled-but-real instances as false positives.
+#
+# Rebuild the slice (deterministic, seed 42):
+#   python -m experiments.build_lvis_slices --root datasets/lvis
+run_name: lvis_general_a1
+
+backbone:
+  type: dino
+  model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+  image_size: 768
+
+data:
+  name: coco                      # LVIS ships COCO-format instance masks
+  label: lvis-general
+  root: datasets/lvis             # junction -> C:\Users\role01-admin\datasets\lvis
+  annotation_file: slices/lvis_general.json
+  images_dir: images
+  categories: []                  # empty = every class in the slice (one per image by construction)
+  min_instances: 2                # the intra known/unknown split needs at least two
+  # --- FROZEN — changing any of these invalidates every prior ablation number ---
+  train_images: 10                # intra pool + cross-image support pool
+  interval_images: 40             # inter targets
+  known_ratio: 0.3
+  seed: 42
+
+foveate:
+  foreground_extractor: insid3
+  insid3_tau_fg: 0.0
+  insid3_aggt: 0.1
+  insid3_crop_reference: true
+  insid3_top_k_exemplars: 1
+  insid3_dynamic_tau_fg: true
+  insid3_dynamic_aggt: true
+  insid3_tau_fg_scale: 0.3
+  insid3_aggt_scale: 0.3
+  debias: true
+  debias_subspace_dim: 8
+  crop_sim_floor: 0.3
+  confidence_reid_mode: full
+  reid_top_k: 0
+  instance_extractor: kmeans
+  zoom_split_retry_eps: 0.01
+  nms_iou: 0.5
+  nms_containment: 0.7
+  min_crop: 16
+  max_total_embeds: 512
+  # --- A1.2 guards: all OFF here, so this run is the control arm the sweep moves away from ---
+  crop_dilate: 0
+  otsu_min_separability: 0.0
+  otsu_unimodal_fallback: accept_all
+  otsu_hysteresis_lo: 0.0
+
+eval:
+  targets: [intra, inter]
+  max_exemplars: 5                # FROZEN: bank size changes results; `null` is the runtime blow-up
+  limit: null
+  visualize: 4
+  cascade_trace: 2
+  zoom_diag: all                  # GT-aware over/under-zoom on every image
+
+mlflow:
+  enabled: true
+  experiment_name: foveate-a1
+  tracking_uri: null
+
+# The A1.2 sweep this harness exists for. Run with experiments.ablations.
+sweep:
+  foveate.crop_dilate: [0, 1, 2]
+  foveate.pad_frac: [0.08, 0.15, 0.25]

@@ -4,7 +4,27 @@ Breadth-first, batched, connected-components fixed point over a frontier of crop
 embedded once and answers two questions (paper Sec. 3): *where is the concept?* and, once the crop
 has converged, *is this a single instance?* Both are guided by the exemplar bank via the
 re-identification score ``g`` (mean crop similarity to the bank, Eq. 2), where crop similarity is
-the cosine of two CLS tokens (Eq. 1). For each crop:
+the cosine of two CLS tokens (Eq. 1).
+
+**Three swappable slots.** This module owns the *loop* — batching, geometry, budget, termination —
+and delegates every *policy* to one of three strategy interfaces, each with its own registry and its
+own oracle (so an ablation attributes the remaining error to a slot):
+
+===============  =========================  ==========================================
+Slot             Module / config key        Question
+===============  =========================  ==========================================
+**Where**        :mod:`foveate.foreground`  which patches of this crop are the concept?
+                 ``foreground_extractor``
+**Extract**      :mod:`foveate.extract`     which instances does that foreground hold?
+                 ``instance_extractor``
+**Stop**         :mod:`foveate.stop`        descend, emit or reject?
+                 ``stop_rule``
+===============  =========================  ==========================================
+
+Two things stay here on purpose: the **size floor** ρ (``min_crop``) and the strict box shrink, which
+together are the termination *invariant* — the recursion is finite whatever the slots do — and the
+no-geometric-progress guards (a child box equal to its parent's), which protect the loop, not the
+science. For each crop:
 
 1. **Where** — re-embed (batched per level) and **extract the concept foreground** with the
    configured foreground extractor (INSID3 by default, the exemplar bank as an alternative) → the
@@ -34,8 +54,8 @@ the cosine of two CLS tokens (Eq. 1). For each crop:
      it contains; gating each sub-crop on "beat the parent" would wrongly discard the novel sibling
      (concept-like, but a different instance, so scoring below that inflated parent). Confirm-then-floor
      keeps it. (A single-child *zoom*, by contrast, still uses the strict beat-the-parent peak guard.)
-   The other exits: below ``config.crop_sim_floor`` → not the concept → reject; ``split_mode="none"``
-   → accepted whole (splitting disabled).
+   The other exits: the Stop rule rejects the crop (below ``config.crop_sim_floor``) → not the
+   concept; or the Extract slot cannot split (``instance_extractor="cc"``) → accepted whole.
 
    So the only stopping signals are re-identification (``g``) and the size floor ρ (``min_crop``): a
    crop at or below it is emitted without splitting further. No depth cap, no split margin.
@@ -48,22 +68,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-import torch
-from scipy.ndimage import generate_binary_structure, label
+from scipy.ndimage import binary_dilation
 
-from foveate import clustering, features as featlib, individuation, merge
+from foveate import features as featlib, mask_refine
 from foveate.config import Config
+from foveate.extract import build_instance_extractor, component_label_map
 from foveate.foreground import build_extractor
 from foveate.reid import build_reid_scorer
+from foveate.stop import build_stop_rule
 from foveate.types import Instance, Stats
-
-_CONN8 = generate_binary_structure(2, 2)   # 8-connectivity: don't over-split single instances
-_CONN4 = generate_binary_structure(2, 1)   # 4-connectivity: split diagonally-touching blobs
-
-
-def _extract_structure(connectivity: int):
-    """Connectivity structuring element for the Extract (connected-components) stage."""
-    return _CONN4 if int(connectivity) == 4 else _CONN8
 
 
 @dataclass
@@ -113,12 +126,23 @@ def _grid_bbox(comp):
     return rows.min(), rows.max() + 1, cols.min(), cols.max() + 1
 
 
-def _child_box(comp, box, pad_frac):
-    """Pixel bbox (in original coords) of a grid component within ``box``, padded."""
+def _child_box(comp, box, pad_frac, dilate: float = 0.0):
+    """Pixel bbox (in original coords) of a grid component within ``box``, padded.
+
+    ``dilate`` (``cfg.crop_dilate``, in **patches**) widens the grid bbox before it is converted to
+    pixels — a fixed, scale-independent safety margin on the Where step's outermost patch, which is
+    exactly where its threshold is least certain. ``pad_frac`` cannot play that role: being relative,
+    it shrinks along with the crop just as the quantization error stays constant.
+    """
     y0, y1, x0, x1 = box
     ch, cw = y1 - y0, x1 - x0
     hp, wp = comp.shape
     rmin, rmax, cmin, cmax = _grid_bbox(comp)
+    if dilate:
+        # Fractional: the grid bbox under-states the object by up to half a patch on each side
+        # (a patch is foreground when its *centre* is inside), so 0.5 is the exact correction.
+        rmin = max(0.0, rmin - dilate); rmax = min(float(hp), rmax + dilate)
+        cmin = max(0.0, cmin - dilate); cmax = min(float(wp), cmax + dilate)
     py0 = y0 + int(np.floor(rmin / hp * ch)); py1 = y0 + int(np.ceil(rmax / hp * ch))
     px0 = x0 + int(np.floor(cmin / wp * cw)); px1 = x0 + int(np.ceil(cmax / wp * cw))
     pady, padx = int(round((py1 - py0) * pad_frac)), int(round((px1 - px0) * pad_frac))
@@ -171,6 +195,85 @@ def _mask_overlap(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     return inter / union, inter / smaller
 
 
+def _touches_border(mask: np.ndarray, box) -> bool:
+    """Does this instance's mask reach the edge of the crop it was found in?
+
+    A component touching its crop border is *provably* only partially in frame — the object
+    continues outside the crop — so the emitted mask is a fragment, not an instance.
+    """
+    y0, y1, x0, x1 = box
+    sub = mask[y0:y1, x0:x1]
+    if sub.size == 0:
+        return False
+    return bool(sub[0].any() or sub[-1].any() or sub[:, 0].any() or sub[:, -1].any())
+
+
+def _merge_fragments(instances: list[Instance], gap: int) -> tuple[list[Instance], int]:
+    """Union detections that are pieces of one object cut apart by crop boundaries.
+
+    **Why NMS cannot do this.** Suppression compares a pair by IoU or containment and *deletes* the
+    weaker one. Two halves of an instance found in two different crops are **disjoint**: their IoU is
+    ~0 and neither contains the other, so no suppression rule relates them at all — and deleting one
+    would be wrong anyway, because each holds pixels the other lacks. The repair is a **union**, and
+    the pair is recognised by geometry (adjacent) plus provenance (at least one piece is clipped by
+    its own crop border), not by overlap.
+
+    Merged score is the maximum over the pieces: a piece that does *not* touch a border was seen
+    whole, so its confidence is the trustworthy one.
+    """
+    if len(instances) < 2:
+        return instances, 0
+
+    masks = [inst.mask.astype(bool) for inst in instances]
+    partial = [_touches_border(m, inst.box) for m, inst in zip(masks, instances)]
+    boxes = []
+    for m in masks:
+        ys, xs = np.where(m)
+        boxes.append((ys.min(), ys.max() + 1, xs.min(), xs.max() + 1) if ys.size else (0, 0, 0, 0))
+
+    parent = list(range(len(instances)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    struct = np.ones((2 * gap + 1, 2 * gap + 1), dtype=bool)
+    for i in range(len(instances)):
+        for j in range(i + 1, len(instances)):
+            if not (partial[i] or partial[j]):
+                continue                      # both were seen whole → different objects
+            bi, bj = boxes[i], boxes[j]       # cheap reject: tight boxes further apart than the gap
+            if (bi[0] > bj[1] + gap or bj[0] > bi[1] + gap
+                    or bi[2] > bj[3] + gap or bj[2] > bi[3] + gap):
+                continue
+            y0 = max(0, min(bi[0], bj[0]) - gap); y1 = max(bi[1], bj[1]) + gap
+            x0 = max(0, min(bi[2], bj[2]) - gap); x1 = max(bi[3], bj[3]) + gap
+            a = masks[i][y0:y1, x0:x1]
+            b = masks[j][y0:y1, x0:x1]
+            if (a & b).any() or (binary_dilation(a, structure=struct) & b).any():
+                parent[find(i)] = find(j)
+
+    groups: dict[int, list[int]] = {}
+    for i in range(len(instances)):
+        groups.setdefault(find(i), []).append(i)
+    if len(groups) == len(instances):
+        return instances, 0
+
+    out = []
+    for members in groups.values():
+        if len(members) == 1:
+            out.append(instances[members[0]])
+            continue
+        merged = np.logical_or.reduce([masks[i] for i in members]).astype(np.uint8)
+        best = max(members, key=lambda i: instances[i].score)
+        ys, xs = np.where(merged)
+        box = (int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1)
+        out.append(Instance(merged, box, instances[best].depth, instances[best].score))
+    return out, len(instances) - len(out)
+
+
 def _nms(instances: list[Instance], iou_thresh: float, contain_thresh: float
          ) -> tuple[list[Instance], int]:
     """Greedy, score-ranked NMS dropping duplicate detections of the *same* object.
@@ -200,120 +303,6 @@ def _nms(instances: list[Instance], iou_thresh: float, contain_thresh: float
             kept_masks.append(m)
     kept.sort()                                        # back to emission order for a stable result
     return [instances[i] for i in kept], len(instances) - len(kept)
-
-
-def _split_component(feat, comp_grid, cfg):
-    """Split a converged clump into sub-component grids — dispatched by ``cfg.split_mode``.
-
-    ``"kmeans"`` (default) always proposes a 2-way split so the re-id survivor rule, not the
-    splitter, decides whether to keep it; ``"watershed"`` uses the marker-controlled pipeline
-    and ``"agglomerative"`` clusters the clump's foreground patches directly — both can return a
-    single component, i.e. "unsplittable", in which case the caller emits the parent.
-    """
-    if cfg.split_mode == "kmeans":
-        return _split_kmeans(feat, comp_grid)
-    if cfg.split_mode == "agglomerative":
-        return _split_agglomerative(feat, comp_grid, cfg)
-    return _split_watershed(feat, comp_grid, cfg)
-
-
-def _split_kmeans(feat, comp_grid):
-    """k=2 KMeans on the component's foreground patch features → two sub-masks.
-
-    Unlike watershed, this *always* yields a 2-way partition when the component has >= 2 patches,
-    so "always try to split" is guaranteed and the re-id survivor rule does the accepting/rejecting.
-    Features are L2-normalized, so euclidean KMeans ≈ spherical (cosine) clustering.
-    """
-    ys, xs = np.where(comp_grid)
-    if ys.size < 2:
-        return [comp_grid.astype(bool)]                      # single patch → unsplittable
-    from sklearn.cluster import KMeans
-
-    X = feat[torch.from_numpy(comp_grid).to(feat.device)].detach().cpu().numpy()  # (M, D)
-    lab = KMeans(n_clusters=2, n_init=5, random_state=0).fit_predict(X)
-    subs = []
-    for c in (0, 1):
-        g = np.zeros(comp_grid.shape, dtype=bool)
-        g[ys[lab == c], xs[lab == c]] = True
-        if g.any():
-            subs.append(g)
-    return subs if len(subs) == 2 else [comp_grid.astype(bool)]
-
-
-def _split_agglomerative(feat, comp_grid, cfg):
-    """Connectivity-constrained agglomerative split of a clump → sub-component grids (>= 1).
-
-    Clusters the clump's foreground patches with the same cosine-distance / spatial-graph
-    agglomeration used for over-segmentation, cutting at ``cfg.cluster_tau``. Unlike watershed
-    there is no elevation/marker machinery — the feature clustering *is* the split, so a lower
-    ``cluster_tau`` yields more, finer sub-crops. A homogeneous clump stays one cluster (returns a
-    single grid → the caller emits the parent).
-    """
-    labels = clustering.agglomerative_oversegment(feat, comp_grid, cfg.cluster_tau)
-    return [labels == i for i in np.unique(labels) if i != 0]
-
-
-def _split_watershed(feat, comp_grid, cfg):
-    """Marker-controlled watershed split for a seamless clump → sub-component grids (>= 1)."""
-    labels = clustering.agglomerative_oversegment(feat, comp_grid, cfg.cluster_tau)
-    indiv = individuation.individuate(
-        feat, comp_grid, labels, mode=cfg.marker_mode, alpha=cfg.elevation_alpha,
-        beta=cfg.elevation_beta, marker_min_distance=cfg.marker_min_distance,
-        smooth_sigma=cfg.boundary_smooth_sigma,
-    )
-    merged = merge.merge_instances(
-        feat, indiv.instances, indiv.feature_boundary,
-        similarity_threshold=cfg.merge_similarity, boundary_threshold=cfg.merge_boundary,
-    )
-    return [merged == i for i in np.unique(merged) if i != 0]
-
-
-def _reid_survivors(parent_reid: float, child_scores) -> list[int]:
-    """Indices of children that re-identify the exemplar *more strongly* than the parent.
-
-    Strict ``>``: a child only continues zooming if its re-id score ``g`` genuinely improves on the
-    crop it came from. An empty result means no child beat the parent — the parent was the ``g``
-    peak, so the cascade stops and emits it (the ``reid-stop`` rule). Any child that ties or falls
-    below the parent is dropped. This is the **single-object zoom** guard; splits use
-    :func:`_survivors`.
-    """
-    return [i for i, s in enumerate(child_scores) if s > parent_reid]
-
-
-def _survivors(parent_reid: float, child_scores, *, crop_sim_floor: float) -> list[int]:
-    """Which of a parent's children to pursue — zoom and split handled differently.
-
-    **One child (zoom)** → the over-zoom peak guard: keep it only if its re-id score ``g`` strictly
-    beats the crop it came from (:func:`_reid_survivors`). Descending a single object, ``g`` should
-    keep rising; when it stops rising we have passed the peak and emit the parent.
-
-    **Several children (a split)** → the parent's ``g`` is a *biased baseline*. If the crop already
-    contains a strong exemplar match, its ``g`` is pulled up by that sub-region, so gating each child
-    on "beat the parent" wrongly discards a genuinely novel sibling instance that is concept-like but
-    (being a *different* instance) scores lower than that inflated parent. Instead:
-
-    1. **Confirm the split is real.** Its BEST child must *strictly* beat the parent's ``g``.
-       Isolating a real object from a mixed crop *raises* ``g`` — the other instance and the
-       background that were diluting the parent's CLS token drop away — so a genuine clump always has
-       a sub-crop above the parent. A single object, by contrast, only yields *partial* sub-crops
-       that score *below* the whole (and flat/tied ``g`` never beats the parent), so its split is not
-       confirmed → keep nothing and the caller emits the parent. This stops a uniform blob
-       over-segmenting.
-    2. **Keep every child that improves on the parent OR clears the crop similarity floor τ_C.** A
-       child that *improved* on the parent has found a better crop and must never be discarded — even
-       when it is still below the floor (it will keep zooming and can rise above it). The floor
-       additionally rescues a genuinely novel sibling that is concept-like but scores *below* the
-       exemplar-biased parent. Only a child that falls below **both** the parent and the floor is
-       pruned.
-    """
-    if len(child_scores) <= 1:
-        return _reid_survivors(parent_reid, child_scores)
-    if max(child_scores) > parent_reid:                       # isolating a real object raised g
-        # Never discard a child that improved on the parent (even below the floor); additionally
-        # keep any child that clears the floor. Prune only children below BOTH parent and floor.
-        return [i for i, s in enumerate(child_scores)
-                if s > parent_reid or s >= crop_sim_floor]
-    return []                                                # no sub-crop beat the parent → emit it
 
 
 def cascade(
@@ -391,12 +380,21 @@ def cascade(
         extractor = build_extractor(cfg)
         extractor.set_reference(backbone, ref_image, exemplar_masks, negative_masks, cfg)
         stats.n_embeds += 1
-    # Oracle Where ablation: hand the target's GT class foreground to the extractor (transient
-    # per-image state, so a cached inter-protocol extractor is simply refreshed each image). Only the
-    # oracle extractor exposes ``set_target_foreground``; the others never see the GT.
-    if gt_foreground is not None and hasattr(extractor, "set_target_foreground"):
-        extractor.set_target_foreground(gt_foreground)
-    extract_struct = _extract_structure(cfg.extract_connectivity)   # Extract: CC connectivity
+    # Extract (slot 2) and Stop (slot 3) — the other two swappable stages. Both are built per call
+    # (they are cheap, config-only objects) and hold this image's transient oracle state, if any.
+    instance_extractor = build_instance_extractor(cfg)
+    stop = build_stop_rule(cfg)
+
+    # Oracle ablations: hand the target's GT to whichever slot asks for it (transient per-image
+    # state, so a cached inter-protocol extractor is simply refreshed each image). Only the oracle
+    # Where extractor / Stop rule expose these hooks; every other implementation never sees the GT.
+    if gt_foreground is not None:
+        if hasattr(extractor, "set_target_foreground"):
+            extractor.set_target_foreground(gt_foreground)
+        if hasattr(stop, "set_target_instances"):
+            stop.set_target_instances(gt_foreground)
+        if hasattr(instance_extractor, "set_target_instances"):
+            instance_extractor.set_target_instances(gt_foreground)
 
     # Re-identification score g: a standalone scorer over the exemplar bank, independent of the
     # Where extractor above. "cls" reuses the extractor's already-embedded exemplar CLS for free;
@@ -429,6 +427,13 @@ def cascade(
             return
         full = np.zeros((H, W), np.uint8)
         full[y0:y1, x0:x1] = mask_local
+        if cfg.mask_refine != "none":
+            # Snap the patch staircase to the image's own boundaries. Done here, on the crop the
+            # instance was found in, where the object is largest in pixels — the best conditions
+            # this instance will ever get for a colour-based refinement.
+            refined = mask_refine.refine_mask(full[y0:y1, x0:x1].astype(bool),
+                                              image[y0:y1, x0:x1], cfg)
+            full[y0:y1, x0:x1] = refined.astype(np.uint8)
         leaves.append(Instance(full, region.box, region.depth, score))
         stats.leaves += 1
 
@@ -450,14 +455,13 @@ def cascade(
         scaled by its area fraction of the crop's dominant component; a whole (border-free) component
         keeps ``g`` unchanged, so genuine non-touching instances are unaffected.
         """
-        if parent.reid < cfg.crop_sim_floor:
+        if not stop.accept(parent.reid, parent.box):
             stats.discarded += 1
             return
         pr = _Region(parent.box, parent.depth)
         merged = np.logical_or.reduce(parent.comps)
         if cfg.emit_components:
-            labels, n = label(merged, structure=extract_struct)
-            comps = [labels == cid for cid in range(1, n + 1)]
+            comps = instance_extractor.components(merged, box=parent.box)
             for c, score in zip(comps, _component_scores(comps, parent.reid, merged.shape)):
                 emit(pr, c, score, feat=parent.feat)
         else:
@@ -490,7 +494,7 @@ def cascade(
         reid_scores = [reid_scorer.score(feat, cls, gates[i].foreground if gates[i] else None)
                        for i, (feat, cls) in enumerate(embedded)]
 
-        # reid-stop: pursue children by the :func:`_survivors` rule — a single zoom child must beat
+        # reid-stop: pursue children by the Stop rule (:mod:`foveate.stop`) — a single zoom child must beat
         # the crop it came from (over-zoom peak guard), while a SPLIT's children are kept whenever
         # the split is confirmed real (best child strictly beats the parent) and they clear the class
         # floor, so a novel sibling instance is not discarded just for scoring below a biased parent.
@@ -504,8 +508,9 @@ def cascade(
             else:
                 groups.setdefault(id(r.parent), (r.parent, []))[1].append(i)
         for parent, members in groups.values():
-            keep = set(_survivors(parent.reid, [reid_scores[i] for i in members],
-                                  crop_sim_floor=cfg.crop_sim_floor))
+            keep = set(stop.survivors(parent.reid, parent.box,
+                                      [reid_scores[i] for i in members],
+                                      [frontier[i].box for i in members]))
             better = [members[j] for j in keep]
             dropped = [members[j] for j in range(len(members)) if j not in keep]
             retried = False
@@ -519,15 +524,15 @@ def cascade(
                 # like a convergence split (``max child > parent`` → pursue, else emit the parent
                 # there). Only single-component (zoom) parents qualify; a retry yields a multi-child
                 # split parent, which never retries again → no unbounded chain.
-                if (len(members) == 1 and parent.allow_retry and cfg.split_mode != "none"
-                        and cfg.zoom_split_retry_eps > 0 and parent.reid >= cfg.crop_sim_floor
-                        and 0.0 <= parent.reid - reid_scores[members[0]] < cfg.zoom_split_retry_eps):
+                if (len(members) == 1 and parent.allow_retry and instance_extractor.can_split
+                        and stop.accept(parent.reid, parent.box)
+                        and stop.allow_retry(parent.reid, reid_scores[members[0]])):
                     comp = parent.comps[0]
-                    subs = _split_component(parent.feat, comp, cfg)
+                    subs = instance_extractor.split(parent.feat, comp, box=parent.box)
                     if len(subs) >= 2:
                         # Same no-progress guard as the convergence split: a sub-box equal to
                         # the parent's box would re-embed the identical crop forever.
-                        pairs = [(s, _child_box(s, parent.box, cfg.pad_frac)) for s in subs]
+                        pairs = [(s, _child_box(s, parent.box, cfg.pad_frac, cfg.crop_dilate)) for s in subs]
                         pairs = [(s, b) for s, b in pairs if b != parent.box]
                         subs = [s for s, _ in pairs]
                         sub_boxes = [b for _, b in pairs]
@@ -583,8 +588,8 @@ def cascade(
             gr = gates[i] if gates[i] is not None else extractor.predict(
                 feat, cls=cls, box=r.box, return_internals=observer is not None)
             fg = gr.foreground
-            labels, n = (label(fg, structure=extract_struct) if fg.any()
-                         else (np.zeros_like(fg, dtype=int), 0))
+            comps = instance_extractor.components(fg, box=r.box)   # Extract: candidates on the crop
+            n = len(comps)
 
             floor = (r.box[1] - r.box[0]) <= cfg.min_crop or (r.box[3] - r.box[2]) <= cfg.min_crop
             decision, children = "empty", []
@@ -595,18 +600,17 @@ def cascade(
                 pass
             elif floor:                                   # SIZE floor (px) — the only non-CLS stop
                 decision = "leaf-cap"
-                for cid in range(1, n + 1):
-                    emit(r, labels == cid, reid_score, feat=feat)
+                for c in comps:
+                    emit(r, c, reid_score, feat=feat)
             elif n >= 2:                                  # multiple instances → tighter crops
                 # A component whose padded bbox clips back to THIS crop's box makes no
                 # geometric progress: re-enqueuing it re-embeds the identical crop, finds the
                 # identical components and splits again — an infinite loop only the embed
                 # budget stops (and a self-referential trace event that hangs the trajectory
                 # tools). Emit such a component as-is; recurse only into genuinely tighter ones.
-                comps_all = [labels == cid for cid in range(1, n + 1)]
-                boxes_all = [_child_box(c, r.box, cfg.pad_frac) for c in comps_all]
-                kept = [(c, b) for c, b in zip(comps_all, boxes_all) if b != r.box]
-                for c, b in zip(comps_all, boxes_all):
+                boxes_all = [_child_box(c, r.box, cfg.pad_frac, cfg.crop_dilate) for c in comps]
+                kept = [(c, b) for c, b in zip(comps, boxes_all) if b != r.box]
+                for c, b in zip(comps, boxes_all):
                     if b == r.box:
                         emit(r, c, reid_score, feat=feat)
                 if kept:
@@ -616,16 +620,16 @@ def cascade(
                 else:                                     # nothing tightenable → all emitted
                     decision = "leaf-cap"
             else:                                         # single component
-                comp = labels == 1
-                child = _child_box(comp, r.box, cfg.pad_frac)
+                comp = comps[0]
+                child = _child_box(comp, r.box, cfg.pad_frac, cfg.crop_dilate)
                 if _box_area(child) / max(_box_area(r.box), 1) < cfg.shrink_stop:
                     decision, children, child_comps = "zoom", [child], [comp]  # strictly tighter
-                elif reid_score < cfg.crop_sim_floor:       # converged, below the floor → not the class
+                elif not stop.accept(reid_score, r.box):    # converged, below the floor → not the class
                     if cfg.discard_rejected:
                         decision = "discard"; stats.discarded += 1
                     else:
                         decision = "leaf"; emit(r, comp, reid_score, feat=feat)
-                elif cfg.split_mode == "none":
+                elif not instance_extractor.can_split:
                     decision = "leaf"; emit(r, comp, reid_score, feat=feat)   # splitting disabled → whole
                 else:
                     # Cannot zoom in (converged) → NEVER accept as a leaf on the spot. ALWAYS split
@@ -634,12 +638,12 @@ def cascade(
                     # sub-crop only if it re-identifies the exemplar more strongly than this crop.
                     # If neither beats it (they got worse, or the blob is unsplittable), the cascade
                     # falls back and emits this crop — the crop that led to the split — as ``reid-stop``.
-                    subs = _split_component(feat, comp, cfg)
+                    subs = instance_extractor.split(feat, comp, box=r.box)
                     if len(subs) >= 2:
                         # Drop a sub-crop whose padded box clips back to THIS crop's box: it
                         # makes no geometric progress (identical crop → identical CLS →
                         # identical split), so pursuing it loops until the embed budget.
-                        pairs = [(s, _child_box(s, r.box, cfg.pad_frac)) for s in subs]
+                        pairs = [(s, _child_box(s, r.box, cfg.pad_frac, cfg.crop_dilate)) for s in subs]
                         pairs = [(s, b) for s, b in pairs if b != r.box]
                     else:
                         pairs = []
@@ -656,7 +660,7 @@ def cascade(
                         decision = "leaf"; emit(r, comp, reid_score, feat=feat)
 
             if decision == "leaf-cap":
-                instance_grids = [labels == cid for cid in range(1, n + 1)]
+                instance_grids = comps
             elif decision in ("split", "zoom"):
                 instance_grids = child_comps
             elif decision == "clump-split":
@@ -668,7 +672,11 @@ def cascade(
 
             ev = dict(level=level_idx, depth=r.depth, box=r.box, decision=decision,
                       n_components=int(n), reid_score=reid_score, feat=feat, fg=fg,
-                      comp_labels=labels, children=list(children),
+                      # The component *label image* is a viz-only view of ``comps`` — build it only
+                      # when someone is watching (the cascade itself works on the component list).
+                      comp_labels=(component_label_map(comps, fg.shape) if observer is not None
+                                   else None),
+                      children=list(children),
                       internals=(gr.internals if observer is not None else {}),
                       instance_grids=instance_grids)
             if child_comps:                               # zoom / split / clump-split: g-gated here
@@ -705,6 +713,12 @@ def cascade(
     # Dedup: independent branches (especially the two sub-crops of a k=2 split whose boxes nest)
     # can converge on the same object and emit it twice. A final score-ranked NMS keeps the best
     # detection of each object. Disable by setting both thresholds to 1.0.
+    # Fragment merge first, suppression second: a crop boundary can cut one object into disjoint
+    # pieces that NMS is blind to (IoU ~ 0, no containment), and merging them before the score-ranked
+    # pass means the union — not an arbitrary piece — is what competes for survival.
+    if cfg.merge_fragments:
+        leaves, n_merged = _merge_fragments(leaves, cfg.merge_fragment_gap)
+        stats.merged += n_merged
     if cfg.nms_iou < 1.0 or cfg.nms_containment < 1.0:
         leaves, n_suppressed = _nms(leaves, cfg.nms_iou, cfg.nms_containment)
         stats.suppressed += n_suppressed

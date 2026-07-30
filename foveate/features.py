@@ -79,14 +79,53 @@ def embed_batch(
     return out
 
 
-def resize_mask_to_grid(mask: np.ndarray, grid_hw: tuple[int, int]) -> np.ndarray:
-    """Nearest-neighbour resize a full-res binary ``mask`` onto the patch grid.
+def resize_labels_to_grid(labels: np.ndarray, grid_hw: tuple[int, int]) -> np.ndarray:
+    """Sample an integer label map onto the patch grid at each **patch centre**.
 
-    ``grid_hw`` is ``(Hp, Wp)``; ``cv2.resize`` takes ``(width, height)``.
+    Patch ``j`` of a ViT covers pixels ``[j·P, (j+1)·P)``, and every consumer that maps a patch back
+    to pixels (``cascade._child_box``, ``features.upsample_mask``) uses exactly that interval. The
+    sample point must therefore be the interval's **centre**.
+
+    ``cv2.INTER_NEAREST`` does *not* do this: it samples at ``j·scale``, the interval's **left
+    edge**. Marking a patch by its left edge and then reconstructing it as the interval starting
+    there shifts every derived box by **half a patch**, in both axes. At a large downscale that is
+    most of a small object — it was silently moving the cascade's child crops off their instances,
+    and it is why padding the crop appeared to help so much.
     """
     hp, wp = grid_hw
-    resized = cv2.resize(mask.astype(np.uint8), (wp, hp), interpolation=cv2.INTER_NEAREST)
-    return resized.astype(bool)
+    h, w = labels.shape[:2]
+    rows = np.clip(((np.arange(hp) + 0.5) * h / hp).astype(np.intp), 0, h - 1)
+    cols = np.clip(((np.arange(wp) + 0.5) * w / wp).astype(np.intp), 0, w - 1)
+    return labels[rows[:, None], cols[None, :]]
+
+
+def resize_mask_to_grid(mask: np.ndarray, grid_hw: tuple[int, int], *,
+                        mode: str = "center") -> np.ndarray:
+    """Resize a full-res binary ``mask`` onto the patch grid. ``grid_hw`` is ``(Hp, Wp)``.
+
+    ``mode="center"``
+        A patch is foreground when its **centre** is inside the mask. The faithful downsample, and
+        the right choice when the grid must *represent* the mask (e.g. an exemplar's own region).
+    ``mode="any"``
+        A patch is foreground when it contains **any** mask pixel. The right choice when the grid is
+        a **proposal** — "the concept may be here, go and look" — because centre sampling silently
+        deletes anything smaller than a patch: an object below one patch wide misses every centre,
+        so it gets no patch, no component, and no crop, and the recursion never learns it exists.
+        Under ``"any"`` every object marks at least one patch, and the patch-interval box is
+        guaranteed to *contain* the object rather than under-cover it.
+
+    See :func:`resize_labels_to_grid` for why the sample point is the patch centre and not
+    ``cv2.INTER_NEAREST``'s left edge.
+    """
+    m = np.asarray(mask)
+    if mode == "any":
+        hp, wp = grid_hw
+        # INTER_AREA averages the source pixels falling in each cell, so > 0 ⇔ the cell contains at
+        # least one mask pixel. (It degrades to nearest when upsampling, which is what we want.)
+        return cv2.resize(m.astype(np.float32), (wp, hp), interpolation=cv2.INTER_AREA) > 0.0
+    if mode != "center":
+        raise ValueError(f"unknown resize mode {mode!r}; expected 'center' or 'any'")
+    return resize_labels_to_grid(m.astype(np.uint8), grid_hw).astype(bool)
 
 
 def upsample_mask(mask: np.ndarray, size_wh: tuple[int, int], *, bilinear: bool = False) -> np.ndarray:

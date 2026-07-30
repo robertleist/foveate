@@ -627,7 +627,8 @@ if run and ref_image is not None and exemplar_masks:
 
     # Producer note per decision — what the node did with its extracted instances.
     _split_name = {"kmeans": "k=2 means", "watershed": "watershed",
-                   "agglomerative": "agglomerative"}.get(cfg.split_mode, cfg.split_mode)
+                   "agglomerative": "agglomerative"}.get(cfg.instance_extractor,
+                                                         cfg.instance_extractor)
     def _producer(decision: str, n_grids: int) -> str:
         return {
             "split": f"EXTRACT: connected components found {n_grids} instances → recurse",

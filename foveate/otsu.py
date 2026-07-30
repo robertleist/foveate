@@ -111,6 +111,50 @@ class OtsuExtractor:
             sim = float(np.mean(sims[sel]))
         return self._protos[sel].to(device), sel, sim
 
+    # ------------------------------------------------------------------ binarize
+    def _binarize(self, sim_grid: np.ndarray, score_map: np.ndarray, tau: float):
+        """Otsu cut + the two scale guards (roadmap A1.2) → ``(foreground, mode, eta)``.
+
+        Both guards exist because a *single* cut on a *unimodal* map is the over-zoom mechanism: as
+        the cascade descends, the concept fills more of the crop, the similarity map loses its
+        background mode, and Otsu — which always returns a cut — slices the object itself.
+
+        * **Separability guard** (``otsu_min_separability``) detects that regime and refuses the cut.
+        * **Hysteresis** (``otsu_hysteresis_lo``) softens it everywhere else: the Otsu cut seeds, and
+          patches within the margin below it join iff they are connected to a seed.
+
+        Both default to off, so the extractor is bit-identical to its pre-A1.2 self unless asked.
+        """
+        cfg = self.cfg
+        eta = thresholding.separability(sim_grid, tau)
+        if cfg.otsu_min_separability > 0.0 and eta < cfg.otsu_min_separability:
+            fallback = str(cfg.otsu_unimodal_fallback)
+            if fallback == "accept_all":
+                # No fg/bg structure left to find: the concept *is* the crop. Say so and let the
+                # geometry converge — do not invent a boundary inside the object.
+                return np.ones_like(sim_grid, dtype=bool), "unimodal:accept_all", eta
+            if fallback == "percentile":
+                tau = float(np.percentile(sim_grid, cfg.gate_percentile))
+                return self._grow(sim_grid, score_map, tau), "unimodal:percentile", eta
+            # "otsu": keep the cut — the control arm that separates *detecting* the regime from
+            # *acting* on it, so an ablation can attribute the change to either.
+            return self._grow(sim_grid, score_map, tau), "unimodal:otsu", eta
+        return self._grow(sim_grid, score_map, tau), "otsu", eta
+
+    def _grow(self, sim_grid: np.ndarray, score_map: np.ndarray, tau: float) -> np.ndarray:
+        """Threshold at ``tau``, optionally growing into connected near-threshold patches."""
+        lo_margin = float(self.cfg.otsu_hysteresis_lo)
+        if lo_margin <= 0.0:
+            return sim_grid >= tau
+        # Hysteresis runs on the min-max-normalized map so the margin is a fraction of THIS crop's
+        # similarity range — cosine ranges vary per crop, so an absolute margin is not comparable.
+        lo_v, hi_v = float(sim_grid.min()), float(sim_grid.max())
+        if hi_v - lo_v < 1e-12:
+            return sim_grid >= tau
+        tau_n = (tau - lo_v) / (hi_v - lo_v)
+        return thresholding.hysteresis(score_map, tau_n, tau_n - lo_margin,
+                                       connectivity=self.cfg.extract_connectivity)
+
     # ------------------------------------------------------------------- predict
     def predict(
         self, target_feat: torch.Tensor, *, cls: torch.Tensor | None = None,
@@ -132,16 +176,18 @@ class OtsuExtractor:
         sim_grid = sims.reshape(hp, wp).detach().cpu().numpy()               # (Hp, Wp)
 
         tau = thresholding.otsu(sim_grid)
-        foreground = sim_grid >= tau
         score_map = np.clip(_minmax(sim_grid), 0.0, 1.0)
+        foreground, mode, eta = self._binarize(sim_grid, score_map, tau)
 
         internals: dict = {}
         if return_internals:
             internals = {
                 "forward_sim": score_map,                # per-patch similarity map (heatmap)
-                "candidate_mask": foreground,            # Otsu-thresholded foreground
+                "candidate_mask": sim_grid >= tau,       # the raw Otsu cut, before the A1.2 guards
                 "foreground": foreground,
                 "otsu_threshold": float(tau),
+                "otsu_separability": float(eta),         # eta: how bimodal the map actually was
+                "otsu_mode": mode,                       # which rule produced the foreground
                 "selected_exemplars": list(sel),
                 "select_sim": sim,
                 "tau_used": float(tau),                  # reuse the Where "foreground on crop" caption

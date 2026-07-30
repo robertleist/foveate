@@ -1,21 +1,12 @@
 import numpy as np
 import pytest
 
-import torch
-
 from foveate import Config, cascade
-from foveate.cascade import (
-    _CONN4, _CONN8, _component_scores, _extract_structure, _reid_survivors, _mask_overlap, _nms,
-    _split_kmeans, _survivors,
-)
+from foveate.cascade import _component_scores, _mask_overlap, _nms
 from foveate.types import Instance
 
-
-def test_extract_structure_selects_connectivity():
-    """The Extract stage maps connectivity 4/8 to the right structuring element."""
-    assert _extract_structure(4) is _CONN4
-    assert _extract_structure(8) is _CONN8
-    assert _extract_structure(99) is _CONN8              # anything else → 8-connectivity default
+# The Extract and Stop slots are covered by tests/test_extract.py and tests/test_stop.py; what is
+# tested here is the cascade *loop* — how it drives those slots.
 
 
 def test_cascade_runs_with_otsu_where(backbone, two_squares):
@@ -89,83 +80,17 @@ def _inst(mask: np.ndarray, score: float) -> Instance:
     return Instance(mask.astype(np.uint8), box, 0, score)
 
 
-def test_split_kmeans_partitions_two_feature_clusters():
-    """k=2 on features splits a component into two disjoint sub-masks that cover it exactly."""
-    hp = wp = 6
-    feat = torch.zeros(hp, wp, 4)
-    feat[:, :3, 0] = 1.0                 # left half → one feature axis
-    feat[:, 3:, 1] = 1.0                 # right half → another
-    comp = np.ones((hp, wp), dtype=bool)
-    subs = _split_kmeans(feat, comp)
-    assert len(subs) == 2
-    assert not (subs[0] & subs[1]).any()                 # disjoint
-    assert (subs[0] | subs[1]).sum() == comp.sum()       # partition the whole component
-    assert {int(subs[0].sum()), int(subs[1].sum())} == {hp * 3}  # the two halves
-
-
-def test_split_kmeans_single_patch_unsplittable():
-    feat = torch.zeros(4, 4, 3); feat[0, 0, 0] = 1.0
-    comp = np.zeros((4, 4), dtype=bool); comp[0, 0] = True
-    subs = _split_kmeans(feat, comp)
-    assert len(subs) == 1 and bool(subs[0][0, 0])
-
-
-def test_cls_survivors_stop_rule():
-    # No child beats the parent → empty → the parent is the CLS peak (reid-stop fires).
-    assert _reid_survivors(0.8, [0.7, 0.8, 0.75]) == []      # ties (0.8) do NOT survive
-    # Only children strictly above the parent continue; the lower-sim sibling is dropped.
-    assert _reid_survivors(0.6, [0.7, 0.5, 0.9]) == [0, 2]
-    # A single worse child (the plain zoom case) → stop and emit the predecessor.
-    assert _reid_survivors(0.75, [0.6]) == []
-    # A single better child → keep zooming, parent superseded.
-    assert _reid_survivors(0.5, [0.55]) == [0]
-
-
-def test_survivors_single_child_is_strict_zoom_guard():
-    """One child (zoom) uses the strict beat-the-parent peak guard — the floor is irrelevant."""
-    assert _survivors(0.8, [0.7], crop_sim_floor=0.5) == []      # over-zoomed → stop
-    assert _survivors(0.5, [0.55], crop_sim_floor=0.5) == [0]    # improved → keep zooming
-
-
-def test_survivors_keeps_novel_sibling_below_biased_parent():
-    """A crop holds the exemplar AND a novel instance, so its parent CLS (0.85) is inflated by the
-    exemplar but still diluted below the *isolated* exemplar sub-crop (0.90). The novel sub-crop
-    (0.62) scores below the parent but above the class floor — it must be KEPT, not discarded."""
-    keep = _survivors(0.85, [0.90, 0.62], crop_sim_floor=0.5)
-    assert keep == [0, 1]                       # child 0 (>parent) confirms; child 1 clears the floor
-
-
-def test_survivors_drops_below_floor_sibling():
-    """A confirmed split still drops any sub-crop that fails the class floor (not the class)."""
-    assert _survivors(0.85, [0.90, 0.30], crop_sim_floor=0.5) == [0]
-
-
-def test_survivors_keeps_improved_child_below_floor():
-    """Regression: a child that IMPROVED on its (low) parent must survive even when it is still
-    below the class floor — it found a better crop and keeps zooming toward the floor. Parent 0.081,
-    floor 0.30: the 0.154 child beat the parent, so it must be PURSUED, not pruned for being below
-    the floor (the old rule kept only ``s >= floor`` and wrongly dropped it)."""
-    assert _survivors(0.081, [0.154, 0.05], crop_sim_floor=0.30) == [0]   # 0.05 below both → pruned
-    # a strong sibling (0.40) confirms the split; the weaker 0.154 still improved on the parent → kept
-    assert _survivors(0.081, [0.40, 0.154], crop_sim_floor=0.30) == [0, 1]
-
-
-def test_survivors_rejects_fragmented_single_object():
-    """Splitting a single object → every half is a weaker partial view (best <= parent) → the split
-    is not confirmed → keep nothing so the caller emits the parent."""
-    assert _survivors(0.90, [0.80, 0.75], crop_sim_floor=0.5) == []    # partial halves, both worse
-    assert _survivors(0.90, [0.90, 0.90], crop_sim_floor=0.5) == []    # flat/tied CLS never confirms
-
-
 def test_cls_worse_children_are_traced(backbone, two_squares, monkeypatch):
     """Dropped (reid-worse) children must be emitted as terminal ``reid-worse`` events so the
     trajectory / tool can show why the cascade stopped."""
     import importlib
     C = importlib.import_module("foveate.cascade")  # module handle (the `cascade` attr on the
                                                     # package is the function, so fetch the module)
+    import foveate.stop as stop_mod
 
-    # Force "no child ever survives" → the reid-stop path fires and every child is dropped.
-    monkeypatch.setattr(C, "_survivors",
+    # Force "no child ever survives" → the reid-stop path fires and every child is dropped. Patching
+    # the Stop slot's rule (which ReidStopRule resolves at call time) is the seam now.
+    monkeypatch.setattr(stop_mod, "survivors",
                         lambda parent_reid, child_scores, *, crop_sim_floor: [])
     img, ex = two_squares
     events = []

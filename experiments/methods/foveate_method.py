@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 import numpy as np
 
+from experiments import eval as evallib
 from experiments.datasets import EvalItem
 from experiments.methods.base import (
     Method,
@@ -58,12 +59,16 @@ class FoveateMethod(Method):
     def predict(
         self, item: EvalItem, observer: Callable[[dict], None] | None = None
     ) -> MethodPrediction:
-        # Oracle Where ablation: feed the cascade the target's GT class foreground as an instance-
-        # label map (0 = bg, i = the i-th GT instance). ``oracle`` uses only its union (>0), while
-        # ``oracle_cc`` also uses the per-instance ids to pre-separate touching instances. Only these
-        # extractors consume it — for every other it stays None so the discovery is honest.
+        # Oracle ablations: feed the cascade the target's GT class foreground as an instance-label
+        # map (0 = bg, i = the i-th GT instance). The oracle *Where* extractors consume it —
+        # ``oracle`` uses only its union (>0), ``oracle_cc`` also uses the per-instance ids to
+        # pre-separate touching instances — and so does the oracle *Stop* rule (box<->instance
+        # isolation in place of g). For every other slot combination it stays None so the discovery
+        # is honest.
+        oracle = (self.foveate_config.foreground_extractor in ("oracle", "oracle_cc")
+                  or self.foveate_config.stop_rule == "oracle")
         gt_foreground = None
-        if self.foveate_config.foreground_extractor in ("oracle", "oracle_cc") and len(item.gt_masks):
+        if oracle and len(item.gt_masks):
             gt_foreground = np.zeros(item.image.shape[:2], dtype=np.int32)
             for i, m in enumerate(item.gt_masks, start=1):
                 gt_foreground[m.astype(bool)] = i          # later instances win on overlap
@@ -76,13 +81,19 @@ class FoveateMethod(Method):
         if instances:
             masks = np.stack([inst.mask.astype(bool) for inst in instances])
             scores = np.array([inst.score for inst in instances], dtype=np.float64)
-            # Detection box = the final crop insid3 converged on (Instance.box is (y0,y1,x0,x1)),
-            # reordered to the eval's [x0,y0,x1,y1]. This is scored for box AP instead of the
-            # tight mask box.
-            boxes = np.array(
-                [(inst.box[2], inst.box[0], inst.box[3], inst.box[1]) for inst in instances],
-                dtype=np.float64,
-            )
+            # Detection box for box AP. ``"mask"`` (default) = the tight box of the emitted mask,
+            # which is what every detection benchmark compares against — COCO-FSOD, RF20-VL and
+            # CD-FSOD are all box AP, and the GT side is always a tight box. ``"crop"`` reports the
+            # final crop the cascade converged on instead: useful as a *diagnostic* of how well the
+            # recursion frames an object, but it is padded by ``pad_frac``/``crop_dilate``, so
+            # scoring it as a detection penalises us for our own padding.
+            if str(self.foveate_config.report_boxes) == "crop":
+                boxes = np.array(
+                    [(inst.box[2], inst.box[0], inst.box[3], inst.box[1]) for inst in instances],
+                    dtype=np.float64,
+                )
+            else:
+                boxes = evallib.masks_to_boxes(masks)
         else:
             masks = np.zeros((0, h, w), dtype=bool)
             scores = np.zeros((0,), dtype=np.float64)
