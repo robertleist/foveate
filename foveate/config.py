@@ -34,7 +34,17 @@ class Config:
     otsu_reduce: str = "mean"             # reduce the per-patch similarity over the K exemplars:
                                           # mean | max
 
-    # --- EXTRACT: connected components that propose tighter crops ---
+    # --- EXTRACT: which instances does the foreground hold? (slot 2 of 3, foveate.extract) ---
+    instance_extractor: str = "kmeans"    # cc | kmeans | agglomerative | watershed — how a crop's
+                                          # foreground becomes instance candidates. All share the
+                                          # connected-components proposal; they differ in how a
+                                          # CONVERGED component is split (an internal boundary CC
+                                          # cannot draw): kmeans (k=2 on features, always splits, so
+                                          # the Stop slot decides) | agglomerative (cluster the
+                                          # clump's patches at cluster_tau) | watershed (marker-
+                                          # controlled, geometric waist) | cc (never split — a
+                                          # converged crop is accepted whole). Legacy key/value:
+                                          # ``split_mode``, whose "none" == "cc".
     extract_connectivity: int = 8         # 4 | 8 pixel/patch connectivity for the CC on the
                                           # foreground grid (8 = don't over-split single instances)
 
@@ -85,6 +95,13 @@ class Config:
                                           # without splitting further (paper Sec. 3, Algorithm 1)
     pad_frac: float = 0.08               # padding fraction around child crops
     shrink_stop: float = 0.9             # converge when child/crop area ratio >= this
+    stop_rule: str = "reid"               # STOP slot (slot 3 of 3, foveate.stop): reid | oracle —
+                                          # what decides descend / emit / reject. "reid" is the paper
+                                          # rule (peak guard + confirm-then-floor on g, floored by
+                                          # crop_sim_floor below). "oracle" keeps that exact rule but
+                                          # swaps g for a GT box<->instance isolation score, bounding
+                                          # the rule's headroom independently of the signal; it needs
+                                          # the target GT, supplied via cascade(gt_foreground=...).
     crop_sim_floor: float = 0.5           # tau_C: crop similarity floor (paper Sec. 3). A converged
                                          # crop whose re-id score g is below this is not the concept
                                          # -> reject; split children are kept only if g >= tau_C.
@@ -143,10 +160,9 @@ class Config:
                                          # nms_iou and nms_containment to 1.0 to disable NMS.
     embed_batch_size: int = 8            # crops per backbone forward
     max_total_embeds: int = 512          # global embed budget (safety cap)
-    split_mode: str = "kmeans"           # how a converged clump is split: kmeans (k=2 on features,
-                                         # always splits) | watershed (marker-controlled) |
-                                         # agglomerative (cluster foreground patches at cluster_tau) |
-                                         # none
+                                         # (the converged-clump splitter moved to the Extract slot:
+                                         # ``instance_extractor`` above; ``split_mode`` still works
+                                         # as a config key via _ALIASES, with "none" == "cc")
 
     # --- prototype bank ---
     prototype_reduction: str = "all"     # all | mean | cluster | kmeans
@@ -178,6 +194,7 @@ class Config:
     _ALIASES = {
         "cls_threshold": "crop_sim_floor",          # tau_C, crop similarity floor
         "cls_top_k": "reid_top_k",                  # re-identification score g top-k
+        "split_mode": "instance_extractor",         # the Extract slot (value "none" == "cc")
         "insid3_tau": "insid3_tau_fg",              # tau_fg
         "insid3_aggregate_threshold": "insid3_aggt",  # AggT
         "insid3_dynamic_tau": "insid3_dynamic_tau_fg",

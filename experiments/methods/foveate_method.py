@@ -58,12 +58,16 @@ class FoveateMethod(Method):
     def predict(
         self, item: EvalItem, observer: Callable[[dict], None] | None = None
     ) -> MethodPrediction:
-        # Oracle Where ablation: feed the cascade the target's GT class foreground as an instance-
-        # label map (0 = bg, i = the i-th GT instance). ``oracle`` uses only its union (>0), while
-        # ``oracle_cc`` also uses the per-instance ids to pre-separate touching instances. Only these
-        # extractors consume it — for every other it stays None so the discovery is honest.
+        # Oracle ablations: feed the cascade the target's GT class foreground as an instance-label
+        # map (0 = bg, i = the i-th GT instance). The oracle *Where* extractors consume it —
+        # ``oracle`` uses only its union (>0), ``oracle_cc`` also uses the per-instance ids to
+        # pre-separate touching instances — and so does the oracle *Stop* rule (box<->instance
+        # isolation in place of g). For every other slot combination it stays None so the discovery
+        # is honest.
+        oracle = (self.foveate_config.foreground_extractor in ("oracle", "oracle_cc")
+                  or self.foveate_config.stop_rule == "oracle")
         gt_foreground = None
-        if self.foveate_config.foreground_extractor in ("oracle", "oracle_cc") and len(item.gt_masks):
+        if oracle and len(item.gt_masks):
             gt_foreground = np.zeros(item.image.shape[:2], dtype=np.int32)
             for i, m in enumerate(item.gt_masks, start=1):
                 gt_foreground[m.astype(bool)] = i          # later instances win on overlap

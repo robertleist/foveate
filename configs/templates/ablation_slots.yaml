@@ -1,0 +1,80 @@
+# Ablation: the WHERE x EXTRACT x STOP cross-product — the cascade's three swappable slots.
+#
+#   python -m experiments.ablations --config configs/templates/ablation_slots.yaml
+#
+# This is the *smoke grid*: the offline synthetic dataset + MockBackbone, so all 24 points run in
+# minutes with no weights and no downloads. Its two jobs:
+#
+#   1. prove every slot combination actually runs (a registry/interface regression net), and
+#   2. shape the headroom table — each slot has an ORACLE, so the gap between a real implementation
+#      and its oracle attributes the remaining error to that slot:
+#
+#        WHERE   insid3 | otsu            vs. oracle (perfect foreground)
+#                                         vs. oracle_cc (perfect foreground + instance seams,
+#                                             i.e. also bounds the EXTRACT slot's components step)
+#        EXTRACT kmeans | cc | watershed  (cc = never split, the no-individuation floor)
+#        STOP    reid                     vs. oracle (same rule, GT box<->instance isolation for g)
+#
+# Swap in the real backbone + a real dataset to turn it into the paper's decomposition table; keep
+# the grid shape.
+run_name: ablation-slots
+
+backbone:
+  type: mock
+  image_size: 224
+  patch_size: 14
+
+data:
+  name: synthetic
+  label: synthetic                 # dataset name for MLflow logging/filtering
+  categories: []
+  min_instances: 2
+  train_images: 6
+  known_ratio: 0.5
+  seed: 0
+  options:
+    n_images: 6
+    image_size: 128
+    n_instances: 4
+    n_categories: 2
+
+foveate:
+  standardize: false        # MockBackbone features are colour-based; z-scoring destroys the signal
+  # --- WHERE (slot 1, foveate.foreground) — swept below ---
+  foreground_extractor: insid3
+  insid3_crop_reference: true
+  insid3_top_k_exemplars: 1
+  gate_threshold: 0.4       # bank extractor only
+  otsu_top_k: 1             # otsu extractor only
+  debias: false             # mock features carry no DINOv3 positional bias
+  # --- EXTRACT (slot 2, foveate.extract) — swept below ---
+  instance_extractor: kmeans   # legacy key `split_mode` still works ("none" == "cc")
+  extract_connectivity: 8
+  cluster_tau: 0.18            # granularity for agglomerative / watershed markers
+  boundary_smooth_sigma: 0.0   # watershed only
+  # --- STOP (slot 3, foveate.stop) — swept below ---
+  stop_rule: reid
+  crop_sim_floor: 0.0       # floor at 0 so the WHERE/EXTRACT gap is not masked by rejections.
+                            #   Ignored when stop_rule=oracle (that rule carries its own floor:
+                            #   "the box contains a GT instance").
+  zoom_split_retry_eps: 0.01
+  # --- duplicate suppression (final NMS; both 1.0 = off) ---
+  nms_iou: 0.5
+  nms_containment: 0.7
+  # --- recursion / cost (the termination invariant lives in the cascade, not in a slot) ---
+  min_crop: 24
+  cascade_min_instance_area: 4
+
+eval:
+  max_exemplars: 2          # bank size (eval knob); per-crop pooling is insid3_top_k_exemplars
+
+mlflow:
+  enabled: true
+  experiment_name: foveate-ablations
+
+# 4 x 3 x 2 = 24 runs. Both oracle slots consume the target GT, which the method supplies
+# automatically whenever an oracle Where extractor or the oracle Stop rule is selected.
+sweep:
+  foveate.foreground_extractor: [insid3, otsu, oracle, oracle_cc]
+  foveate.instance_extractor: [kmeans, cc, watershed]
+  foveate.stop_rule: [reid, oracle]
