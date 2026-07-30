@@ -1,4 +1,7 @@
-"""EXTRACT slot (:mod:`foveate.extract`) — components, splitters and the registry."""
+"""EXTRACT slot (:mod:`foveate.extract`) — the contract, the composite, and the registry.
+
+The grouping half lives in tests/test_grouping.py, the oracle in tests/test_extract_oracle.py.
+"""
 
 import numpy as np
 import pytest
@@ -6,36 +9,13 @@ import torch
 
 from foveate import Config, cascade
 from foveate.extract import (
-    _CONN4,
-    _CONN8,
-    ConnectedComponentsExtractor,
-    KMeansExtractor,
-    _extract_structure,
-    _split_kmeans,
-    build_instance_extractor,
+    CompositeExtractor,
+    ExtractResult,
+    OracleExtractor,
+    build_extractor,
     component_label_map,
+    resolve_extractor_name,
 )
-
-
-def test_extract_structure_selects_connectivity():
-    """The Extract stage maps connectivity 4/8 to the right structuring element."""
-    assert _extract_structure(4) is _CONN4
-    assert _extract_structure(8) is _CONN8
-    assert _extract_structure(99) is _CONN8              # anything else → 8-connectivity default
-
-
-def test_components_separates_two_blobs_and_honours_connectivity():
-    """Two diagonally-touching blobs: one component under 8-connectivity, two under 4."""
-    fg = np.zeros((6, 6), dtype=bool)
-    fg[1:3, 1:3] = True
-    fg[3:5, 3:5] = True                                  # touches the first only diagonally
-    assert len(build_instance_extractor(Config(extract_connectivity=8)).components(fg)) == 1
-    assert len(build_instance_extractor(Config(extract_connectivity=4)).components(fg)) == 2
-
-
-def test_components_of_empty_foreground_is_empty():
-    ie = build_instance_extractor(Config())
-    assert ie.components(np.zeros((4, 4), dtype=bool)) == []
 
 
 def test_component_label_map_round_trips():
@@ -46,68 +26,90 @@ def test_component_label_map_round_trips():
     assert lab[0, 0] == 1 and lab[2, 2] == 2 and lab.sum() == 3   # 0 elsewhere
 
 
-def test_cc_extractor_never_splits():
-    """``cc`` (≡ the legacy ``split_mode: none``) advertises no split and returns the component whole."""
-    ie = build_instance_extractor(Config(instance_extractor="cc"))
-    assert isinstance(ie, ConnectedComponentsExtractor) and not ie.can_split
-    comp = np.ones((4, 4), dtype=bool)
-    subs = ie.split(torch.zeros(4, 4, 3), comp)
-    assert len(subs) == 1 and subs[0].all()
+# --------------------------------------------------------------------------- the contract
+def test_extract_returns_instances_and_the_region_they_decompose(backbone, two_squares):
+    """One call, one answer: instance grids plus the region the extractor calls the concept."""
+    img, ex = two_squares
+    cfg = Config(foreground_extractor="otsu", debias=False)
+    extractor = build_extractor(cfg)
+    extractor.set_reference(backbone, img, ex, None, cfg)
+
+    from foveate import features as featlib
+    (feat, cls), = featlib.embed_batch(backbone, [img], standardize=cfg.standardize)
+    res = extractor.extract(feat, cls=cls, box=(0, 128, 0, 128))
+
+    assert isinstance(res, ExtractResult)
+    assert res.foreground.shape == feat.shape[:2] and res.foreground.dtype == bool
+    assert res.score_map.shape == res.foreground.shape
+    assert all(g.shape == res.foreground.shape and g.dtype == bool for g in res.instances)
+    # Every instance lies inside the region — the composite decomposes a foreground, never repairs it.
+    for g in res.instances:
+        assert not (g & ~res.foreground).any()
 
 
-def test_split_kmeans_partitions_two_feature_clusters():
-    """k=2 on features splits a component into two disjoint sub-masks that cover it exactly."""
-    hp = wp = 6
-    feat = torch.zeros(hp, wp, 4)
-    feat[:, :3, 0] = 1.0                 # left half → one feature axis
-    feat[:, 3:, 1] = 1.0                 # right half → another
-    comp = np.ones((hp, wp), dtype=bool)
-    subs = _split_kmeans(feat, comp)
-    assert len(subs) == 2
-    assert not (subs[0] & subs[1]).any()                 # disjoint
-    assert (subs[0] | subs[1]).sum() == comp.sum()       # partition the whole component
-    assert {int(subs[0].sum()), int(subs[1].sum())} == {hp * 3}  # the two halves
+def test_internals_are_only_paid_for_when_someone_is_watching(backbone, two_squares):
+    img, ex = two_squares
+    cfg = Config(debias=False)
+    extractor = build_extractor(cfg)
+    extractor.set_reference(backbone, img, ex, None, cfg)
+    from foveate import features as featlib
+    (feat, cls), = featlib.embed_batch(backbone, [img], standardize=cfg.standardize)
+    assert extractor.extract(feat, cls=cls, box=(0, 128, 0, 128)).internals == {}
+    assert extractor.extract(feat, cls=cls, box=(0, 128, 0, 128),
+                             return_internals=True).internals
 
 
-def test_split_kmeans_single_patch_unsplittable():
-    feat = torch.zeros(4, 4, 3); feat[0, 0, 0] = 1.0
-    comp = np.zeros((4, 4), dtype=bool); comp[0, 0] = True
-    subs = _split_kmeans(feat, comp)
-    assert len(subs) == 1 and bool(subs[0][0, 0])
+# --------------------------------------------------------------------------- composite
+def test_composite_exposes_both_halves_for_the_ablation():
+    ex = build_extractor(Config(foreground_extractor="otsu", instance_extractor="cc"))
+    assert isinstance(ex, CompositeExtractor)
+    from foveate.grouping import ConnectedComponents
+    from foveate.otsu import OtsuExtractor
+    assert isinstance(ex.where, OtsuExtractor)
+    assert isinstance(ex.grouping, ConnectedComponents)
 
 
-def test_kmeans_extractor_delegates_to_split_kmeans():
-    """The registry's default is the k=2 splitter, and it splits (``can_split`` is not a lie)."""
-    ie = build_instance_extractor(Config())
-    assert isinstance(ie, KMeansExtractor) and ie.can_split
-    feat = torch.zeros(4, 4, 3)
-    feat[:, :2, 0] = 1.0
-    feat[:, 2:, 1] = 1.0
-    assert len(ie.split(feat, np.ones((4, 4), dtype=bool))) == 2
+def test_composite_forwards_the_exemplar_bank(backbone, two_squares):
+    """``g`` is built off the extractor's bank, so the composite has to hand its Where half's up."""
+    img, ex = two_squares
+    cfg = Config(debias=False)
+    extractor = build_extractor(cfg)
+    extractor.set_reference(backbone, img, ex, None, cfg)
+    assert extractor.exemplar_cls is extractor.where.exemplar_cls
+    assert extractor.exemplar_cls.shape[0] == 1
 
 
-@pytest.mark.parametrize("name", ["cc", "none", "kmeans", "agglomerative", "watershed"])
-def test_registry_builds_every_name(name):
-    ie = build_instance_extractor(Config(instance_extractor=name))
-    assert isinstance(ie, ConnectedComponentsExtractor)               # all share the CC proposal
-    assert ie.can_split == (name not in ("cc", "none"))
-
-
+# --------------------------------------------------------------------------- registry / resolution
 def test_registry_rejects_unknown_name():
-    with pytest.raises(ValueError, match="Unknown instance_extractor"):
-        build_instance_extractor(Config(instance_extractor="does-not-exist"))
+    with pytest.raises(ValueError, match="Unknown extractor"):
+        build_extractor(Config(extractor="does-not-exist"))
 
 
-def test_legacy_split_mode_key_maps_to_the_extract_slot():
-    """Every existing YAML says ``split_mode``; the alias must keep working, ``none`` included."""
-    assert Config.from_dict({"split_mode": "watershed"}).instance_extractor == "watershed"
-    assert Config.from_dict({"split_mode": "none"}).instance_extractor == "none"
-    assert Config().instance_extractor == "kmeans"                    # unchanged default
+def test_explicit_extractor_key_wins():
+    assert resolve_extractor_name(Config(extractor="oracle")) == "oracle"
+    assert isinstance(build_extractor(Config(extractor="oracle")), OracleExtractor)
+    # ...even against a legacy pair that would otherwise resolve the other way
+    assert resolve_extractor_name(
+        Config(extractor="composite", instance_extractor="oracle")) == "composite"
+
+
+@pytest.mark.parametrize("legacy, expected", [
+    # An oracular DECOMPOSITION collapses into the one monolithic oracle...
+    (dict(instance_extractor="oracle"), "oracle"),
+    (dict(foreground_extractor="oracle", instance_extractor="oracle"), "oracle"),
+    (dict(foreground_extractor="oracle_cc"), "oracle"),          # itself a Where+group method
+    # ...while a perfect Where paired with a real grouping stays the Where-headroom ablation.
+    (dict(foreground_extractor="oracle", instance_extractor="kmeans"), "composite"),
+    (dict(foreground_extractor="insid3", instance_extractor="kmeans"), "composite"),
+    (dict(), "composite"),
+])
+def test_legacy_key_pair_resolves_without_changing_meaning(legacy, expected):
+    assert resolve_extractor_name(Config(**legacy)) == expected
 
 
 @pytest.mark.parametrize("name", ["kmeans", "agglomerative", "cc"])
-def test_cascade_runs_with_each_extractor(backbone, two_squares, name):
-    """Each Extract slot value drives the whole cascade end-to-end."""
+def test_cascade_runs_with_each_grouping(backbone, two_squares, name):
+    """Each grouping value drives the whole cascade end-to-end."""
     img, ex = two_squares
     cfg = Config(instance_extractor=name, min_crop=24, cascade_min_instance_area=4)
     instances, stats = cascade(backbone, img, ex, config=cfg)
@@ -115,17 +117,18 @@ def test_cascade_runs_with_each_extractor(backbone, two_squares, name):
     assert all(inst.mask.shape == img.shape[:2] for inst in instances)
 
 
-def test_cc_extractor_never_attempts_a_split(backbone, two_squares):
-    """``can_split=False`` must short-circuit BOTH split paths — the convergence split and the
-    marginal-peak retry — while the cascade still discovers instances. The retry is what fires on
-    this fixture (``zoom_split_retry_eps=1.0``), so it is the sharper of the two to gate on."""
+def test_cc_grouping_never_produces_more_instances_than_components(backbone, two_squares):
+    """``cc`` cannot invent an internal boundary, so a crop never yields more instances than the
+    foreground has connected components — while the cascade still discovers both squares."""
     img, ex = two_squares
-    base = dict(min_crop=24, cascade_min_instance_area=4, zoom_split_retry_eps=1.0)
-    ev_km, ev_cc = [], []
-    cascade(backbone, img, ex, config=Config(instance_extractor="kmeans", **base),
-            observer=ev_km.append)
-    inst_cc, _ = cascade(backbone, img, ex, config=Config(instance_extractor="cc", **base),
-                         observer=ev_cc.append)
-    assert any(e["decision"] == "clump-split" for e in ev_km)      # the splitter does fire...
-    assert not any(e["decision"] == "clump-split" for e in ev_cc)  # ...and ``cc`` never does
-    assert inst_cc                                                 # still discovers instances
+    events = []
+    inst, _ = cascade(backbone, img, ex, observer=events.append,
+                      config=Config(instance_extractor="cc", min_crop=24,
+                                    cascade_min_instance_area=4))
+    assert inst
+    from scipy.ndimage import label
+    for e in events:
+        fg = e.get("fg")
+        if fg is None or not np.size(fg):
+            continue
+        assert e["n_components"] <= label(np.asarray(fg, bool))[1]

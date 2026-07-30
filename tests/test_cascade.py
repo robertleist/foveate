@@ -2,11 +2,10 @@ import numpy as np
 import pytest
 
 from foveate import Config, cascade
-from foveate.cascade import _component_scores, _mask_overlap, _nms
-from foveate.types import Instance
+from foveate.cascade import _component_scores
 
-# The Extract and Stop slots are covered by tests/test_extract.py and tests/test_stop.py; what is
-# tested here is the cascade *loop* — how it drives those slots.
+# The three slots are covered by tests/test_extract.py, tests/test_stop.py and
+# tests/test_merge_rule.py; what is tested here is the cascade *loop* — how it drives them.
 
 
 def test_cascade_runs_with_otsu_where(backbone, two_squares):
@@ -52,14 +51,18 @@ def test_cascade_runs_with_oracle_where(backbone, two_squares):
         assert (m & gt).sum() > (m & ~gt).sum()
 
 
-def test_cascade_runs_with_oracle_cc_where(backbone, two_squares):
-    """The Oracle+CC extractor runs end-to-end off an injected instance-label map."""
+@pytest.mark.parametrize("cfg_kwargs", [
+    dict(extractor="oracle"),                            # the monolithic GT extractor
+    dict(foreground_extractor="oracle_cc"),              # the legacy spelling that resolves to it
+    dict(instance_extractor="oracle"),                   # ...and the other one
+])
+def test_cascade_runs_with_the_monolithic_oracle(backbone, two_squares, cfg_kwargs):
+    """Every spelling of "the decomposition is oracular" drives the cascade off the injected GT."""
     img, ex = two_squares
     labels = np.zeros(img.shape[:2], dtype=np.int32)     # two GT instances (the red squares)
     labels[20:40, 20:40] = 1
     labels[80:100, 80:100] = 2
-    cfg = Config(foreground_extractor="oracle_cc", debias=False, min_crop=24,
-                 cascade_min_instance_area=4)
+    cfg = Config(debias=False, min_crop=24, cascade_min_instance_area=4, **cfg_kwargs)
     instances, stats = cascade(backbone, img, ex, config=cfg, gt_foreground=labels)
     assert stats.n_embeds > 0
     assert all(inst.mask.shape == img.shape[:2] for inst in instances)
@@ -72,12 +75,6 @@ def test_cascade_runs_with_both_connectivities(backbone, two_squares):
         cfg = Config(extract_connectivity=conn, min_crop=24, cascade_min_instance_area=4)
         instances, stats = cascade(backbone, img, ex, config=cfg)
         assert stats.n_embeds > 0
-
-
-def _inst(mask: np.ndarray, score: float) -> Instance:
-    ys, xs = np.where(mask)
-    box = (int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1)
-    return Instance(mask.astype(np.uint8), box, 0, score)
 
 
 def test_cls_worse_children_are_traced(backbone, two_squares, monkeypatch):
@@ -105,39 +102,6 @@ def test_cls_worse_children_are_traced(backbone, two_squares, monkeypatch):
     assert any(e["decision"] == "reid-stop" for e in events)  # the predecessor was emitted instead
 
 
-def test_mask_overlap_iou_and_containment():
-    H = W = 20
-    big = np.zeros((H, W), bool); big[2:18, 2:18] = True        # area 256
-    small = np.zeros((H, W), bool); small[6:14, 6:14] = True    # area 64, fully inside big
-    iou, contain = _mask_overlap(big, small)
-    assert abs(contain - 1.0) < 1e-9                            # the smaller is fully contained
-    assert iou < 0.5                                            # ...but IoU is low (nested) → needs contain
-    disjoint = np.zeros((H, W), bool); disjoint[0:2, 0:2] = True
-    assert _mask_overlap(big, disjoint) == (0.0, 0.0)
-
-
-def test_nms_suppresses_nested_duplicate_keeps_higher_score():
-    """The nested-split failure mode: two detections of one object, one tight (higher CLS) inside a
-    looser one. NMS keeps the higher-scoring (tighter) detection and drops the nested duplicate."""
-    H = W = 24
-    loose = np.zeros((H, W), bool); loose[2:22, 2:22] = True
-    tight = np.zeros((H, W), bool); tight[7:17, 7:17] = True    # nested inside loose
-    far = np.zeros((H, W), bool); far[0:4, 20:24] = True        # disjoint → survives
-    kept, n = _nms([_inst(loose, 0.7), _inst(tight, 0.9), _inst(far, 0.6)], 0.5, 0.7)
-    assert n == 1
-    masks = {int(k.mask.sum()) for k in kept}
-    assert masks == {int(tight.sum()), int(far.sum())}         # loose (nested dup) suppressed
-
-
-def test_nms_keeps_distinct_instances():
-    """Disjoint instances must never be merged (the clean two-instance case)."""
-    H = W = 24
-    a = np.zeros((H, W), bool); a[2:8, 2:8] = True
-    b = np.zeros((H, W), bool); b[16:22, 16:22] = True
-    kept, n = _nms([_inst(a, 0.8), _inst(b, 0.7)], 0.5, 0.7)
-    assert n == 0 and len(kept) == 2
-
-
 def test_nms_disabled_when_thresholds_are_one(backbone, two_squares):
     """Both thresholds at 1.0 turns NMS off — no leaf is suppressed."""
     img, ex = two_squares
@@ -154,34 +118,48 @@ def test_new_acceptance_config_defaults():
     assert cfg.boundary_smooth_sigma == 0.0
 
 
-def test_converged_split_does_not_regress_two_instances(backbone, two_squares):
-    """The always-split-at-convergence + CLS-survivor rule must not regress the clean
-    two-instance case (the two squares are separate components, so they split cleanly)."""
+def test_two_separate_instances_are_not_regressed(backbone, two_squares):
+    """The clean case the whole cascade exists for: two separate components, two instances out."""
     img, ex = two_squares
     cfg = Config(min_crop=24, cascade_min_instance_area=4)
     instances, stats = cascade(backbone, img, ex, config=cfg)
     assert len(instances) == 2
 
 
-def test_zoom_split_retry_attempts_split_on_marginal_peak(backbone, two_squares):
-    """A zoom that peaks by <= eps tries a k=2 split of the parent before emitting. With a large
-    eps the retry fires (a ``clump-split`` appears where a plain ``reid-stop`` would be), yet the
-    strict split-confirm still falls back to emitting the parent — so no over-split / duplicates."""
+def test_the_forced_split_retry_is_gone(backbone, two_squares):
+    """``zoom_split_retry_eps`` hedged the always-split-then-confirm dance, which the two-slot
+    contract removed: the extractor decides the instance count, so there is nothing to retry. The key
+    keeps resolving (every frozen config sets it) but must no longer change the run."""
     img, ex = two_squares
-    off = Config(min_crop=24, cascade_min_instance_area=4, zoom_split_retry_eps=0.0)
-    ev0 = []; inst0, st0 = cascade(backbone, img, ex, config=off, observer=ev0.append)
-    on = Config(min_crop=24, cascade_min_instance_area=4, zoom_split_retry_eps=1.0)
-    ev1 = []; inst1, st1 = cascade(backbone, img, ex, config=on, observer=ev1.append)
+    base = dict(min_crop=24, cascade_min_instance_area=4)
+    ev0 = []; inst0, st0 = cascade(backbone, img, ex, observer=ev0.append,
+                                   config=Config(zoom_split_retry_eps=0.0, **base))
+    ev1 = []; inst1, st1 = cascade(backbone, img, ex, observer=ev1.append,
+                                   config=Config(zoom_split_retry_eps=1.0, **base))
+    assert st0.n_embeds == st1.n_embeds and len(inst0) == len(inst1) == 2
+    assert [e["decision"] for e in ev0] == [e["decision"] for e in ev1]
+    assert not any(e["decision"] == "clump-split" for e in ev0 + ev1)
 
-    assert not any(e["decision"] == "clump-split" for e in ev0)   # disabled → no retry split
-    assert any(e["decision"] == "clump-split" for e in ev1)       # enabled → a marginal peak retried
-    assert st1.n_embeds > st0.n_embeds                            # the retry paid for 2 sub-crops
-    assert len(inst0) == 2 and len(inst1) == 2                    # correctness preserved either way
+
+def test_the_fixed_point_ends_a_branch_that_stopped_changing(backbone, two_squares):
+    """A crop whose extraction reproduces the instance it was cropped for is emitted there.
+
+    Tightening the tolerance to 1.0 effectively disables the fixed point, so the descent then runs
+    on until the geometric shrink or the peak guard stops it — strictly more crops, same instances.
+    """
+    img, ex = two_squares
+    base = dict(min_crop=8, cascade_min_instance_area=4)
+    on, st_on = cascade(backbone, img, ex,
+                        config=Config(stop_fixed_point_iou=0.5, **base))
+    off, st_off = cascade(backbone, img, ex,
+                          config=Config(stop_fixed_point_iou=1.0, **base))
+    assert st_on.n_embeds < st_off.n_embeds
+    assert len(on) == len(off) == 2
 
 
 def test_emit_components_splits_multi_component_parent(backbone, two_squares):
-    """``emit_components`` splits an emitted parent's OR-merged foreground into connected
-    components. Here the embed budget is cut off (``max_total_embeds=2``) right after the root
+    """``emit_components`` emits an emitted parent's instances separately instead of OR-merging
+    them into one mask. Here the embed budget is cut off (``max_total_embeds=2``) right after the root
     splits into the two red squares but before their child crops are processed, so the flush
     falls back to emitting the parent — whose two components don't touch. Default fuses them into
     one instance; ``emit_components`` recovers both."""
@@ -232,10 +210,10 @@ def test_reid_masked_modes_run_and_discover_targets(backbone, two_squares, mode)
         assert not (cy < 60 and cx > 60), "discovered the blue distractor"
 
 
-def test_reid_mode_masked_is_independent_of_where_extractor(backbone, two_squares):
-    """The masked re-id score g is decoupled from the Where stage: it drives the cascade even with
-    a non-INSID3 foreground extractor (here otsu), because build_reid_scorer builds its own
-    exemplar bank rather than borrowing the extractor's."""
+def test_reid_mode_masked_is_independent_of_the_extractor(backbone, two_squares):
+    """The masked re-id score g is decoupled from the Extract slot: it drives the cascade even with
+    a non-INSID3 Where half (here otsu), because build_reid_scorer builds its own exemplar bank
+    rather than borrowing the extractor's."""
     img, ex = two_squares
     cfg = Config(reid_mode="mean", foreground_extractor="otsu", debias=False,
                  crop_sim_floor=0.0, min_crop=24, cascade_min_instance_area=4)

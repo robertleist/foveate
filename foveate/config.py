@@ -20,13 +20,24 @@ class Config:
     # --- features ---
     standardize: bool = True              # z-score feature dims before L2-norm
 
-    # --- WHERE: foreground extraction strategy ---
-    foreground_extractor: str = "insid3"  # insid3 | otsu | bank | oracle | oracle_cc — how "where is
-                                          # the concept" is decided. "oracle" returns the GROUND-TRUTH
-                                          # foreground (upper-bound Where ablation); "oracle_cc" also
-                                          # carves seams between distinct GT instances so connected
-                                          # components pre-separate touching ones. Both need the target
-                                          # GT, supplied via cascade(gt_foreground=...) by the runner.
+    # --- EXTRACT: which instances of the concept are on this crop? (slot 1 of 3, foveate.extract) ---
+    extractor: str | None = None          # composite | oracle. None (default) DERIVES it from the
+                                          # pre-two-slot key pair below, so every existing YAML keeps
+                                          # working: "oracle" when the DECOMPOSITION was oracular
+                                          # (instance_extractor: oracle, or foreground_extractor:
+                                          # oracle_cc — itself a Where+group method), "composite"
+                                          # otherwise. A plain foreground_extractor: oracle therefore
+                                          # stays a composite with a perfect Where, so the
+                                          # Where-headroom ablation keeps its meaning.
+
+    # --- EXTRACT / composite: the Where half — which patches are the concept? ---
+    foreground_extractor: str = "insid3"  # insid3 | otsu | bank | oracle | oracle_cc (alias key:
+                                          # `where`). Only consulted by the composite extractor.
+                                          # "oracle" returns the GROUND-TRUTH foreground (upper-bound
+                                          # Where ablation); "oracle_cc" also carves seams between
+                                          # distinct GT instances so connected components pre-separate
+                                          # touching ones. Both need the target GT, supplied via
+                                          # cascade(gt_foreground=...) by the runner.
 
     # --- WHERE: Otsu extractor (cheap baseline; paper Sec. 3 "Where") ---
     otsu_top_k: int = 1                   # per crop, build the similarity map from the K exemplars
@@ -55,17 +66,18 @@ class Config:
                                           # Recovers the dim rim a single cut shaves off — the
                                           # cheapest over-zoom fix. 0 = off (single cut).
 
-    # --- EXTRACT: which instances does the foreground hold? (slot 2 of 3, foveate.extract) ---
-    instance_extractor: str = "kmeans"    # cc | kmeans | agglomerative | watershed — how a crop's
-                                          # foreground becomes instance candidates. All share the
-                                          # connected-components proposal; they differ in how a
-                                          # CONVERGED component is split (an internal boundary CC
-                                          # cannot draw): kmeans (k=2 on features, always splits, so
-                                          # the Stop slot decides) | agglomerative (cluster the
-                                          # clump's patches at cluster_tau) | watershed (marker-
-                                          # controlled, geometric waist) | cc (never split — a
-                                          # converged crop is accepted whole). Legacy key/value:
-                                          # ``split_mode``, whose "none" == "cc".
+    # --- EXTRACT / composite: the grouping half — which instances does that foreground hold? ---
+    instance_extractor: str = "kmeans"    # cc | kmeans | agglomerative | watershed (alias key:
+                                          # `grouping`; legacy key `split_mode`, whose "none" ==
+                                          # "cc"). All share the connected-components proposal; they
+                                          # differ in whether they cut a component that already FILLS
+                                          # the crop — the only moment an internal boundary can add
+                                          # instances, because below it the cascade's own zoom will
+                                          # ask again at a larger effective resolution (see
+                                          # foveate.grouping): kmeans (k=2 on features, always cuts,
+                                          # so the Stop slot's peak guard decides) | agglomerative
+                                          # (cluster the patches at cluster_tau) | watershed (marker-
+                                          # controlled, geometric waist) | cc (never cut).
     extract_connectivity: int = 8         # 4 | 8 pixel/patch connectivity for the CC on the
                                           # foreground grid (8 = don't over-split single instances)
 
@@ -155,13 +167,23 @@ class Config:
                                          # inherit. "any" also makes the patch-interval box CONTAIN
                                          # the object instead of under-covering it, so crop_dilate
                                          # stops being needed. "center" kept for the ablation.
-    stop_rule: str = "reid"               # STOP slot (slot 3 of 3, foveate.stop): reid | oracle —
+    stop_rule: str = "reid"               # STOP slot (slot 2 of 3, foveate.stop): reid | oracle —
                                           # what decides descend / emit / reject. "reid" is the paper
-                                          # rule (peak guard + confirm-then-floor on g, floored by
+                                          # rule (fixed point + peak guard on g, floored by
                                           # crop_sim_floor below). "oracle" keeps that exact rule but
                                           # swaps g for a GT box<->instance isolation score, bounding
                                           # the rule's headroom independently of the signal; it needs
                                           # the target GT, supplied via cascade(gt_foreground=...).
+    stop_fixed_point_iou: float = 0.9     # the FIXED POINT tolerance: a child crop stops when its
+                                          # extraction is the single instance it was cropped for, at
+                                          # or above this IoU in original-image coordinates. Not a
+                                          # difference-of-opinion threshold — parent and child crops
+                                          # have different pixel extents, so the same object is a
+                                          # coarser mask on the parent's patch grid than on the
+                                          # child's, and this is the tolerance for that
+                                          # re-quantization. 1.0 effectively disables it (only the
+                                          # geometric shrink_stop and the peak guard then stop the
+                                          # descent); lower values stop earlier and cost mask detail.
     crop_sim_floor: float = 0.5           # tau_C: crop similarity floor (paper Sec. 3). A converged
                                          # crop whose re-id score g is below this is not the concept
                                          # -> reject; split children are kept only if g >= tau_C.
@@ -194,11 +216,11 @@ class Config:
                                          # patches of best cosine to the exemplar patch set (the "mean
                                          # cosine sim of the masked foreground features"). Reuses the
                                          # masked-family debias/top-k knobs.
-    zoom_split_retry_eps: float = 0.01   # when a zoom peaks by only a hair (parent g beats the
-                                         # child by less than this), the crop may be a CLUMP that
-                                         # tightening onto one component can't improve — so try ONE
-                                         # k=2 split of the parent before emitting it. If the split
-                                         # doesn't improve either, the parent is emitted. 0 disables.
+    zoom_split_retry_eps: float = 0.01   # DEPRECATED / unused: it hedged a hair-thin zoom peak by
+                                         # forcing ONE extra k=2 split, which only existed because
+                                         # the splitter could not decide an instance count. The
+                                         # extractor now returns the instances, so there is nothing
+                                         # to retry; kept for config compat.
     clump_area_factor: float = 1.5       # DEPRECATED / unused: convergence now ALWAYS attempts a
                                          # split (no tiny-blob fast path); kept for config compat
     split_margin: float = 0.0            # DEPRECATED / unused: a split is confirmed when its BEST
@@ -230,7 +252,25 @@ class Config:
     mask_upsample: str = "nearest"       # how a leaf's patch-grid mask is upsampled to pixels:
                                          # nearest (blocky patch staircase) | bilinear (smooth the
                                          # boundary — resize as float, re-binarize at 0.5)
-    # --- deduplication (final NMS on emitted leaves) ---
+    # --- MERGE: how the emitted leaves combine (slot 3 of 3, foveate.merge_rule) ---
+    merge_rule: str = "nms"              # nms | soft | none. "nms" (default) is the behaviour of
+                                         # record: greedy score-ranked suppression by mask IoU AND
+                                         # containment, after the optional fragment union below.
+                                         # "soft" decays an overlapping detection's score instead of
+                                         # deleting it (soft-NMS, Bodla et al.) — it keeps the
+                                         # second-best detection of a crowded region alive, which is
+                                         # where hard suppression costs recall. NOTE: this is the
+                                         # standard, extractor-agnostic soft rule, NOT the
+                                         # semantic-aware soft merge of "No Time to Train!" — that
+                                         # needs an extractor's own semantic scores and belongs next
+                                         # to an NTT extractor as its own entry. "none" emits the
+                                         # recursion's leaves untouched (the diagnostic arm).
+    merge_soft_sigma: float = 0.5        # soft rule only: Gaussian decay width, s <- s * exp(-o^2/s)
+                                         # where o is the larger of IoU and containment against an
+                                         # already-kept detection. Smaller = harsher.
+    merge_soft_score_floor: float = 1e-3  # soft rule only: drop a detection once its decayed score
+                                         # falls below this (the soft analogue of deletion)
+    # --- deduplication (inputs to the nms / soft merge rules) ---
     merge_fragments: bool = False        # union detections that are pieces of ONE object cut apart
                                          # by a crop boundary. NMS cannot do this: two halves found
                                          # in two crops are DISJOINT (IoU ~ 0, no containment), so no
@@ -247,9 +287,6 @@ class Config:
                                          # nms_iou and nms_containment to 1.0 to disable NMS.
     embed_batch_size: int = 8            # crops per backbone forward
     max_total_embeds: int = 512          # global embed budget (safety cap)
-                                         # (the converged-clump splitter moved to the Extract slot:
-                                         # ``instance_extractor`` above; ``split_mode`` still works
-                                         # as a config key via _ALIASES, with "none" == "cc")
 
     # --- prototype bank ---
     prototype_reduction: str = "all"     # all | mean | cluster | kmeans
@@ -281,7 +318,9 @@ class Config:
     _ALIASES = {
         "cls_threshold": "crop_sim_floor",          # tau_C, crop similarity floor
         "cls_top_k": "reid_top_k",                  # re-identification score g top-k
-        "split_mode": "instance_extractor",         # the Extract slot (value "none" == "cc")
+        "split_mode": "instance_extractor",         # the composite's grouping (value "none" == "cc")
+        "where": "foreground_extractor",            # the composite's Where half (short spelling)
+        "grouping": "instance_extractor",           # the composite's grouping half (short spelling)
         "insid3_tau": "insid3_tau_fg",              # tau_fg
         "insid3_aggregate_threshold": "insid3_aggt",  # AggT
         "insid3_dynamic_tau": "insid3_dynamic_tau_fg",

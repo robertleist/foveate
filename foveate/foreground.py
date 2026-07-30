@@ -117,7 +117,12 @@ def normalize_reference(
 
 
 def build_extractor(cfg) -> ForegroundExtractor:
-    """Instantiate the **Where** extractor selected by ``cfg.foreground_extractor``.
+    """Instantiate the **Where** stage selected by ``cfg.foreground_extractor``.
+
+    This is the first half of :class:`foveate.extract.CompositeExtractor` (and the whole foreground
+    stage of the single-pass :mod:`foveate.pipeline` / :mod:`foveate.refine`), not a cascade slot of
+    its own — the cascade asks one question per crop and gets instances back. See
+    :mod:`foveate.extract`.
 
     ``"insid3"`` -> the official INSID3 algorithm (clusters + forward/backward matching);
     ``"otsu"`` -> Otsu on the similarity map to the top-k exemplars (the cheap Where baseline);
@@ -149,3 +154,7 @@ def build_extractor(cfg) -> ForegroundExtractor:
 
         return OracleCCExtractor(cfg)
     raise ValueError(f"unknown foreground_extractor {name!r}")
+
+
+#: Reads better from the composite extractor, where this is explicitly the ``where`` half.
+build_where = build_extractor

@@ -1,4 +1,4 @@
-"""STOP slot (:mod:`foveate.stop`) — the survivor rule, the floor, the retry gate, the oracle."""
+"""STOP slot (:mod:`foveate.stop`) — the fixed point, the peak guard, the floor, the oracle."""
 
 import numpy as np
 import pytest
@@ -8,6 +8,7 @@ from foveate.stop import (
     OracleStopRule,
     ReidStopRule,
     build_stop_rule,
+    instance_set_unchanged,
     reid_survivors,
     survivors,
 )
@@ -85,12 +86,61 @@ def test_reid_rule_accept_is_the_floor():
     assert not rule.accept(0.49, _BOX)
 
 
-def test_reid_rule_retry_gate_only_fires_on_a_hair_thin_peak():
-    rule = build_stop_rule(Config(zoom_split_retry_eps=0.01))
-    assert rule.allow_retry(0.80, 0.795)          # parent beat the child by 0.005 < eps → retry
-    assert not rule.allow_retry(0.80, 0.70)       # a clear peak → no retry
-    assert not rule.allow_retry(0.80, 0.85)       # the child WON (negative margin) → not this path
-    assert not build_stop_rule(Config(zoom_split_retry_eps=0.0)).allow_retry(0.80, 0.795)  # disabled
+# ---------------------------------------------------------------------------
+# The fixed point: did re-extracting at the finer scale change the answer?
+# ---------------------------------------------------------------------------
+def _square(shape, y0, y1, x0, x1):
+    g = np.zeros(shape, dtype=bool)
+    g[y0:y1, x0:x1] = True
+    return g
+
+
+def test_fixed_point_fires_when_the_child_returns_the_instance_it_was_cropped_for():
+    """Parent proposed one object; the child crop re-extracts the same object → nothing left to do.
+
+    The two grids have different pixel extents (the child crop is a quarter of the parent's box),
+    which is exactly why the comparison has to happen in original-image coordinates.
+    """
+    parent_box, child_box = (0, 80, 0, 80), (0, 40, 0, 40)
+    seed = _square((8, 8), 0, 4, 0, 4)                    # the object, on the parent's grid
+    child = _square((8, 8), 0, 8, 0, 8)                   # the same object, filling the child crop
+    assert instance_set_unchanged([child], child_box, seed, parent_box, iou=0.9)
+
+
+def test_fixed_point_does_not_fire_when_the_child_separated_two_instances():
+    parent_box, child_box = (0, 80, 0, 80), (0, 40, 0, 40)
+    seed = _square((8, 8), 0, 4, 0, 4)
+    two = [_square((8, 8), 0, 3, 0, 8), _square((8, 8), 5, 8, 0, 8)]
+    assert not instance_set_unchanged(two, child_box, seed, parent_box, iou=0.9)
+
+
+def test_fixed_point_does_not_fire_while_the_answer_is_still_moving():
+    """A child that returns a much smaller mask than the seed is still zooming, not converged."""
+    parent_box, child_box = (0, 80, 0, 80), (0, 40, 0, 40)
+    seed = _square((8, 8), 0, 4, 0, 4)                    # covers the whole child crop
+    shrunk = _square((8, 8), 0, 3, 0, 3)                  # ...the child keeps only a corner of it
+    assert not instance_set_unchanged([shrunk], child_box, seed, parent_box, iou=0.9)
+    assert instance_set_unchanged([shrunk], child_box, seed, parent_box, iou=0.1)  # loose → fires
+
+
+def test_fixed_point_is_the_same_question_for_both_rules():
+    """It asks whether the extractor's answer moved — no ground truth can improve on that, so the
+    oracle inherits it and only the peak guard's *signal* is swapped."""
+    parent_box, child_box = (0, 80, 0, 80), (0, 40, 0, 40)
+    seed, child = _square((8, 8), 0, 4, 0, 4), _square((8, 8), 0, 8, 0, 8)
+    for name in ("reid", "oracle"):
+        rule = build_stop_rule(Config(stop_rule=name))
+        assert rule.converged([child], child_box, seed, parent_box)
+
+
+def test_fixed_point_tolerance_is_configurable():
+    parent_box, child_box = (0, 80, 0, 80), (0, 40, 0, 40)
+    seed = _square((8, 8), 0, 4, 0, 4)
+    slightly_smaller = _square((8, 8), 0, 7, 0, 7)        # IoU ~0.77 against the seed
+    assert build_stop_rule(Config(stop_fixed_point_iou=0.7)).converged(
+        [slightly_smaller], child_box, seed, parent_box)
+    assert not build_stop_rule(Config(stop_fixed_point_iou=0.9)).converged(
+        [slightly_smaller], child_box, seed, parent_box)
 
 
 # ---------------------------------------------------------------------------
@@ -148,11 +198,6 @@ def test_oracle_without_gt_is_inert():
     assert rule._isolation((0, 10, 0, 10)) == 0.0
     assert not rule.accept(0.9, (0, 10, 0, 10))
     assert rule.survivors(0.5, _BOX, [0.9], [_BOX]) == []
-
-
-def test_oracle_never_retries():
-    rule = build_stop_rule(Config(stop_rule="oracle", zoom_split_retry_eps=1.0))
-    assert not rule.allow_retry(0.80, 0.795)
 
 
 def test_registry_rejects_unknown_stop_rule():

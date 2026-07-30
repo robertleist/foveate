@@ -1,19 +1,24 @@
-# Ablation: the WHERE x EXTRACT x STOP cross-product — the cascade's three swappable slots.
+# Ablation: the EXTRACT x STOP x MERGE cross-product — the cascade's three swappable slots.
 #
 #   python -m experiments.ablations --config configs/templates/ablation_slots.yaml
 #
-# This is the *smoke grid*: the offline synthetic dataset + MockBackbone, so all 24 points run in
+# This is the *smoke grid*: the offline synthetic dataset + MockBackbone, so all 30 points run in
 # minutes with no weights and no downloads. Its two jobs:
 #
 #   1. prove every slot combination actually runs (a registry/interface regression net), and
-#   2. shape the headroom table — each slot has an ORACLE, so the gap between a real implementation
-#      and its oracle attributes the remaining error to that slot:
+#   2. shape the headroom table. The Extract slot has an ORACLE, so the gap between a real extractor
+#      and it attributes the remaining error to extraction rather than to the recursion:
 #
-#        WHERE   insid3 | otsu            vs. oracle (perfect foreground)
-#                                         vs. oracle_cc (perfect foreground + instance seams,
-#                                             i.e. also bounds the EXTRACT slot's components step)
-#        EXTRACT kmeans | cc | watershed  (cc = never split, the no-individuation floor)
-#        STOP    reid                     vs. oracle (same rule, GT box<->instance isolation for g)
+#        EXTRACT  composite(where x grouping)  vs. oracle (the GT instances of every crop)
+#                 where    insid3 | otsu       (and oracle, the perfect-region arm)
+#                 grouping kmeans | cc | watershed   (cc = never cut, the no-individuation floor)
+#        STOP     reid                         vs. oracle (same rule, GT box<->instance isolation
+#                                                  in place of g)
+#        MERGE    nms | soft | none
+#
+# The two axes of the composite are swept as one product below, because a monolithic extractor has
+# no `where`/`grouping` of its own — that is the whole point of the two-slot contract, and it is why
+# `extractor` is the slot key and the pair is an implementation detail of one of its values.
 #
 # Swap in the real backbone + a real dataset to turn it into the paper's decomposition table; keep
 # the grid shape.
@@ -40,29 +45,32 @@ data:
 
 foveate:
   standardize: false        # MockBackbone features are colour-based; z-scoring destroys the signal
-  # --- WHERE (slot 1, foveate.foreground) — swept below ---
-  foreground_extractor: insid3
+  # --- EXTRACT (slot 1, foveate.extract) — swept below ---
+  extractor: composite      # composite | oracle. Left unset it is derived from the legacy pair.
+  #   the composite's two halves (foveate.foreground x foveate.grouping)
+  foreground_extractor: insid3   # alias key: `where`
+  instance_extractor: kmeans     # alias key: `grouping`; legacy `split_mode` ("none" == "cc")
   insid3_crop_reference: true
   insid3_top_k_exemplars: 1
-  gate_threshold: 0.4       # bank extractor only
-  otsu_top_k: 1             # otsu extractor only
+  gate_threshold: 0.4       # bank Where only
+  otsu_top_k: 1             # otsu Where only
   debias: false             # mock features carry no DINOv3 positional bias
-  # --- EXTRACT (slot 2, foveate.extract) — swept below ---
-  instance_extractor: kmeans   # legacy key `split_mode` still works ("none" == "cc")
   extract_connectivity: 8
-  cluster_tau: 0.18            # granularity for agglomerative / watershed markers
+  cluster_tau: 0.18            # granularity for agglomerative / watershed cuts
   boundary_smooth_sigma: 0.0   # watershed only
-  # --- STOP (slot 3, foveate.stop) — swept below ---
+  # --- STOP (slot 2, foveate.stop) — swept below ---
   stop_rule: reid
-  crop_sim_floor: 0.0       # floor at 0 so the WHERE/EXTRACT gap is not masked by rejections.
+  crop_sim_floor: 0.0       # floor at 0 so the EXTRACT gap is not masked by rejections.
                             #   Ignored when stop_rule=oracle (that rule carries its own floor:
                             #   "the box contains a GT instance").
-  zoom_split_retry_eps: 0.01
-  # --- duplicate suppression (final NMS; both 1.0 = off) ---
+  stop_fixed_point_iou: 0.9  # the fixed point: stop when re-extracting returns the same instance
+  # --- MERGE (slot 3, foveate.merge_rule) — swept below ---
+  merge_rule: nms
   nms_iou: 0.5
   nms_containment: 0.7
   # --- recursion / cost (the termination invariant lives in the cascade, not in a slot) ---
   min_crop: 24
+  shrink_stop: 0.9
   cascade_min_instance_area: 4
 
 eval:
@@ -72,9 +80,16 @@ mlflow:
   enabled: true
   experiment_name: foveate-ablations
 
-# 4 x 3 x 2 = 24 runs. Both oracle slots consume the target GT, which the method supplies
-# automatically whenever an oracle Where extractor or the oracle Stop rule is selected.
+# 3 where x 3 grouping x 2 stop = 18 runs over the COMPOSITE extractor. The monolithic arms are not
+# in this product on purpose: `extractor: oracle` has no `where`/`grouping`, so sweeping them
+# against it would log 8 duplicate rows. Add those arms as separate invocations:
+#
+#   ... --set foveate.extractor=oracle --set 'sweep={"foveate.stop_rule": [reid, oracle]}'
+#   ... --set 'sweep={"foveate.merge_rule": [nms, soft, none]}'
+#
+# The oracle Stop rule and an oracle Extract both consume the target GT, which the method supplies
+# automatically whenever either is selected.
 sweep:
-  foveate.foreground_extractor: [insid3, otsu, oracle, oracle_cc]
+  foveate.foreground_extractor: [insid3, otsu, oracle]
   foveate.instance_extractor: [kmeans, cc, watershed]
   foveate.stop_rule: [reid, oracle]

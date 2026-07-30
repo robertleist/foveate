@@ -89,6 +89,24 @@ class OracleExtractor:
         self._gt_labels = labels
         self._gt = labels > 0
 
+    @property
+    def gt_labels(self) -> "np.ndarray | None":
+        """The injected ``(H, W)`` instance-label map, or ``None`` before ``set_target_foreground``.
+
+        Read by the monolithic :class:`foveate.extract.OracleExtractor`, which composes this class
+        for the exemplar bank and the mask → grid path and adds the per-instance decomposition.
+        """
+        return self._gt_labels
+
+    def _cls_bank(self) -> "np.ndarray | None":
+        """The exemplar CLS stack as numpy, or ``None`` when no reference was set.
+
+        The monolithic Extract-slot oracle composes this class for its foreground alone and reads
+        ``g`` from its own scorer, so a bank-less instance is a legitimate state — ``predict`` must
+        not require a reference it does not use.
+        """
+        return None if self.exemplar_cls is None else self.exemplar_cls.cpu().numpy()
+
     # ------------------------------------------------------------------- predict
     def predict(
         self, target_feat: torch.Tensor, *, cls: torch.Tensor | None = None,
@@ -130,7 +148,7 @@ class OracleExtractor:
         return GateResult(
             foreground=foreground,
             score_map=score_map,
-            exemplar_cls=self.exemplar_cls.cpu().numpy(),
+            exemplar_cls=self._cls_bank(),
             internals=internals,
         )
 
@@ -208,6 +226,6 @@ class OracleCCExtractor(OracleExtractor):
         return GateResult(
             foreground=foreground,
             score_map=score_map,
-            exemplar_cls=self.exemplar_cls.cpu().numpy(),
+            exemplar_cls=self._cls_bank(),
             internals=internals,
         )

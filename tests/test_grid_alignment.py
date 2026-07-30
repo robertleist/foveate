@@ -8,19 +8,22 @@ never got detected. These tests exist so they cannot come back.
    samples the **left edge**, which offsets every derived crop box by half a patch.
 2. **Two conventions in one pipeline.** The Where stage and the Extract oracle sampled the ground
    truth at points half a patch apart, so patches Where called foreground read as background in
-   Extract and whole instances vanished from the decomposition.
+   Extract and whole instances vanished from the decomposition. There is one oracle now (the Extract
+   slot is one slot), so the two cannot diverge — but the invariant is still pinned below: its
+   foreground and its instances must be the same region, decomposed.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
+import torch
 
 from foveate import features as featlib
 from foveate.backbones.mock import MockBackbone
 from foveate.cascade import _child_box, cascade
 from foveate.config import Config
-from foveate.extract import build_instance_extractor
+from foveate.extract import build_extractor
 
 
 # --------------------------------------------------------------------------- sampling point
@@ -83,18 +86,25 @@ def test_left_edge_sampling_loses_object_coverage():
     assert mask[y0:y1, x0:x1].sum() / mask.sum() < 0.6
 
 
-# --------------------------------------------------------------------------- the two oracles agree
-def test_where_and_extract_oracles_see_the_same_instances():
-    """The bug that dropped instances: Where finds N components, Extract must return N."""
+# ------------------------------------------------------------ foreground and instances agree
+def test_oracle_foreground_and_instances_are_the_same_region():
+    """The bug that dropped instances: the region says N objects, the decomposition must return N.
+
+    It used to be two objects sampling the GT half a patch apart; it is one object now, so what is
+    pinned is that its own two outputs still agree — and with the shared ``resize_mask_to_grid``.
+    """
     n = 512
     labels = np.zeros((n, n), np.int32)
     for i, (y, x) in enumerate([(40, 40), (40, 200), (40, 380), (300, 100), (300, 300)], start=1):
         labels[y:y + 50, x:x + 50] = i
 
-    fg = featlib.resize_mask_to_grid(labels > 0, (14, 14))
-    ex = build_instance_extractor(Config(instance_extractor="oracle"))
+    ex = build_extractor(Config(extractor="oracle"))
     ex.set_target_instances(labels)
-    assert len(ex.components(fg, box=(0, n, 0, n))) == 5
+    res = ex.extract(torch.zeros(14, 14, 1), box=(0, n, 0, n))
+    assert len(res.instances) == 5
+    assert np.array_equal(np.logical_or.reduce(res.instances), res.foreground)
+    assert np.array_equal(res.foreground,
+                          featlib.resize_mask_to_grid(labels > 0, (14, 14), mode="any"))
 
 
 # --------------------------------------------------------------------------- end to end

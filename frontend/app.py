@@ -626,17 +626,13 @@ if run and ref_image is not None and exemplar_masks:
                       "final NMS.")
 
     # Producer note per decision — what the node did with its extracted instances.
-    _split_name = {"kmeans": "k=2 means", "watershed": "watershed",
-                   "agglomerative": "agglomerative"}.get(cfg.instance_extractor,
-                                                         cfg.instance_extractor)
     def _producer(decision: str, n_grids: int) -> str:
         return {
-            "split": f"EXTRACT: connected components found {n_grids} instances → recurse",
-            "clump-split": f"Converged → {_split_name} split into {n_grids} sub-crops; kept if the "
-                           f"best beats the parent (g), then every sub-crop above τ_C "
-                           f"(novel siblings included), else this crop is emitted",
-            "zoom": "1 component, not converged → zoom in",
-            "leaf": "Converged & unsplittable (or splitting off) → accepted as 1 instance",
+            "split": f"EXTRACT proposed {n_grids} instances → one child crop each, g-gated next "
+                     f"level (best must beat the parent, then every child above τ_C)",
+            "zoom": "1 instance, the crop can still tighten onto it → zoom in",
+            "leaf": "Fixed point (re-extraction returned the same instance) or nothing left to "
+                    "frame → accepted as 1 instance",
             "leaf-cap": f"min-crop size floor ρ → emitted {n_grids} instance(s)",
             "reid-stop": "No split/zoom child beat this crop → emit it as the instance",
             "discard": "Below the crop similarity floor τ_C → discarded",

@@ -1,0 +1,153 @@
+"""MERGE slot (:mod:`foveate.merge_rule`) — nms, soft, none."""
+
+import numpy as np
+import pytest
+
+from foveate import Config, cascade
+from foveate.merge_rule import (
+    NmsMerge,
+    NoMerge,
+    SoftMerge,
+    build_merge_rule,
+    mask_overlap,
+    nms,
+)
+from foveate.types import Instance
+
+
+def _inst(mask: np.ndarray, score: float) -> Instance:
+    ys, xs = np.where(mask)
+    box = (int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1)
+    return Instance(mask.astype(np.uint8), box, 0, score)
+
+
+def _half_overlapping_pair():
+    """Two equal-area detections at exactly the NMS IoU threshold, neither contained in the other.
+
+    Equal areas 300, intersection 200 → IoU 0.50 (hard NMS deletes) and containment 0.67 (below the
+    0.7 containment threshold, so it is a genuine partial overlap and not a nested duplicate).
+    """
+    H = W = 24
+    a = np.zeros((H, W), bool); a[0:20, 0:15] = True
+    b = np.zeros((H, W), bool); b[0:20, 5:20] = True
+    return a, b
+
+
+def _nested_trio():
+    """A tight detection inside a looser one, plus a disjoint third."""
+    H = W = 24
+    loose = np.zeros((H, W), bool); loose[2:22, 2:22] = True
+    tight = np.zeros((H, W), bool); tight[7:17, 7:17] = True    # nested inside loose
+    far = np.zeros((H, W), bool); far[0:4, 20:24] = True        # disjoint
+    return loose, tight, far
+
+
+def test_mask_overlap_iou_and_containment():
+    H = W = 20
+    big = np.zeros((H, W), bool); big[2:18, 2:18] = True        # area 256
+    small = np.zeros((H, W), bool); small[6:14, 6:14] = True    # area 64, fully inside big
+    iou, contain = mask_overlap(big, small)
+    assert abs(contain - 1.0) < 1e-9                            # the smaller is fully contained
+    assert iou < 0.5                                            # ...but IoU is low (nested)
+    disjoint = np.zeros((H, W), bool); disjoint[0:2, 0:2] = True
+    assert mask_overlap(big, disjoint) == (0.0, 0.0)
+
+
+# --------------------------------------------------------------------------- nms
+def test_nms_suppresses_nested_duplicate_keeps_higher_score():
+    """The nested-split failure mode: two detections of one object, one tight (higher g) inside a
+    looser one. NMS keeps the higher-scoring (tighter) detection and drops the nested duplicate."""
+    loose, tight, far = _nested_trio()
+    kept, n = nms([_inst(loose, 0.7), _inst(tight, 0.9), _inst(far, 0.6)], 0.5, 0.7)
+    assert n == 1
+    assert {int(k.mask.sum()) for k in kept} == {int(tight.sum()), int(far.sum())}
+
+
+def test_nms_keeps_distinct_instances():
+    """Disjoint instances must never be merged (the clean two-instance case)."""
+    H = W = 24
+    a = np.zeros((H, W), bool); a[2:8, 2:8] = True
+    b = np.zeros((H, W), bool); b[16:22, 16:22] = True
+    kept, n = nms([_inst(a, 0.8), _inst(b, 0.7)], 0.5, 0.7)
+    assert n == 0 and len(kept) == 2
+
+
+def test_nms_rule_reports_what_it_removed():
+    loose, tight, far = _nested_trio()
+    rule = build_merge_rule(Config())
+    assert isinstance(rule, NmsMerge)
+    kept, merged, suppressed = rule.merge([_inst(loose, 0.7), _inst(tight, 0.9), _inst(far, 0.6)])
+    assert (len(kept), merged, suppressed) == (2, 0, 1)
+
+
+def test_nms_thresholds_at_one_suppress_nothing():
+    loose, tight, far = _nested_trio()
+    rule = build_merge_rule(Config(nms_iou=1.0, nms_containment=1.0))
+    kept, _, suppressed = rule.merge([_inst(loose, 0.7), _inst(tight, 0.9), _inst(far, 0.6)])
+    assert len(kept) == 3 and suppressed == 0
+
+
+# --------------------------------------------------------------------------- soft
+def test_soft_keeps_a_partial_overlap_that_nms_deletes_but_demotes_it():
+    """Where hard suppression costs recall: two objects overlapping above the IoU threshold. Soft
+    keeps the weaker one and ranks it below the stronger, rather than removing it."""
+    a, b = _half_overlapping_pair()
+    pair = [_inst(a, 0.9), _inst(b, 0.6)]
+
+    hard, _, n_hard = build_merge_rule(Config()).merge(pair)
+    soft, _, n_soft = build_merge_rule(Config(merge_rule="soft")).merge(pair)
+    assert isinstance(build_merge_rule(Config(merge_rule="soft")), SoftMerge)
+    assert len(hard) == 1 and n_hard == 1
+    assert len(soft) == 2 and n_soft == 0
+    assert soft[0].score == pytest.approx(0.9)              # the winner is untouched
+    assert 0.0 < soft[1].score < 0.6                        # the overlapping one is decayed
+
+
+def test_soft_still_deletes_a_fully_contained_duplicate():
+    """A mask entirely inside a kept one carries no pixels of its own — decaying it is not enough."""
+    loose, tight, far = _nested_trio()
+    kept, _, suppressed = build_merge_rule(Config(merge_rule="soft")).merge(
+        [_inst(loose, 0.7), _inst(tight, 0.9), _inst(far, 0.6)])
+    assert suppressed == 1
+    assert {int(k.mask.sum()) for k in kept} == {int(tight.sum()), int(far.sum())}
+
+
+def test_soft_sigma_controls_how_hard_the_decay_is():
+    a, b = _half_overlapping_pair()
+    pair = [_inst(a, 0.9), _inst(b, 0.6)]
+    gentle, _, _ = build_merge_rule(Config(merge_rule="soft", merge_soft_sigma=2.0)).merge(pair)
+    harsh, _, _ = build_merge_rule(Config(merge_rule="soft", merge_soft_sigma=0.1)).merge(pair)
+    assert gentle[1].score > harsh[1].score
+
+
+# --------------------------------------------------------------------------- none / registry
+def test_none_is_the_identity():
+    loose, tight, far = _nested_trio()
+    rule = build_merge_rule(Config(merge_rule="none"))
+    assert isinstance(rule, NoMerge)
+    given = [_inst(loose, 0.7), _inst(tight, 0.9), _inst(far, 0.6)]
+    assert rule.merge(given) == (given, 0, 0)
+
+
+def test_registry_rejects_unknown_merge_rule():
+    with pytest.raises(ValueError, match="Unknown merge_rule"):
+        build_merge_rule(Config(merge_rule="does-not-exist"))
+
+
+# --------------------------------------------------------------------------- end to end
+def test_merge_none_never_suppresses_in_the_cascade(backbone, two_squares):
+    img, ex = two_squares
+    _, stats = cascade(backbone, img, ex,
+                       config=Config(merge_rule="none", min_crop=24,
+                                     cascade_min_instance_area=4))
+    assert stats.suppressed == 0 and stats.merged == 0
+
+
+@pytest.mark.parametrize("name", ["nms", "soft", "none"])
+def test_every_merge_rule_drives_the_cascade(backbone, two_squares, name):
+    img, ex = two_squares
+    instances, stats = cascade(backbone, img, ex,
+                               config=Config(merge_rule=name, min_crop=24,
+                                             cascade_min_instance_area=4))
+    assert stats.n_embeds > 0
+    assert all(inst.mask.shape == img.shape[:2] for inst in instances)

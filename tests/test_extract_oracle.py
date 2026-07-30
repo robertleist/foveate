@@ -1,12 +1,13 @@
-"""The Extract-slot oracle and the mask refinement step."""
+"""The monolithic Extract-slot oracle and the mask refinement step."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
+import torch
 
 from foveate.config import Config
-from foveate.extract import OracleInstanceExtractor, build_instance_extractor
+from foveate.extract import OracleExtractor, build_extractor
 from foveate.mask_refine import refine_mask
 
 
@@ -18,89 +19,86 @@ def _labels(hw, boxes):
     return out
 
 
+def _oracle(labels=None, **cfg):
+    ex = build_extractor(Config(extractor="oracle", **cfg))
+    if labels is not None:
+        ex.set_target_instances(labels)
+    return ex
+
+
+def _extract(ex, grid_hw, box):
+    """Run the oracle on a dummy patch grid of ``grid_hw`` over ``box`` → the instance list."""
+    return ex.extract(torch.zeros(*grid_hw, 1), box=box).instances
+
+
 # --------------------------------------------------------------------------- registry
-def test_oracle_is_registered_and_can_split():
-    ex = build_instance_extractor(Config(instance_extractor="oracle"))
-    assert isinstance(ex, OracleInstanceExtractor)
-    assert ex.can_split
+def test_oracle_is_registered():
+    assert isinstance(_oracle(), OracleExtractor)
 
 
 def test_using_the_oracle_without_gt_is_an_error_not_silent_nonsense():
-    ex = build_instance_extractor(Config(instance_extractor="oracle"))
-    with pytest.raises(RuntimeError, match="set_target_instances"):
-        ex.components(np.ones((4, 4), dtype=bool), box=(0, 8, 0, 8))
+    with pytest.raises(RuntimeError, match="set_target_foreground"):
+        _extract(_oracle(), (4, 4), (0, 8, 0, 8))
 
 
-# --------------------------------------------------------------------------- components
-def test_components_separates_touching_instances_that_cc_would_merge():
+# --------------------------------------------------------------------------- instances
+def test_returns_touching_instances_that_connected_components_would_merge():
     """Two adjacent instances form ONE connected component; the oracle still returns two."""
-    ex = build_instance_extractor(Config(instance_extractor="oracle"))
-    ex.set_target_instances(_labels((8, 8), [(0, 8, 0, 4), (0, 8, 4, 8)]))
-    fg = np.ones((4, 4), dtype=bool)                       # foreground covers both
-
-    cc = build_instance_extractor(Config(instance_extractor="cc")).components(fg)
-    assert len(cc) == 1                                    # connected components cannot cut inside
-
-    parts = ex.components(fg, box=(0, 8, 0, 8))
+    ex = _oracle(_labels((8, 8), [(0, 8, 0, 4), (0, 8, 4, 8)]))
+    parts = _extract(ex, (4, 4), (0, 8, 0, 8))
     assert len(parts) == 2
     assert not (parts[0] & parts[1]).any()                 # disjoint
-    assert (parts[0] | parts[1]).all()                     # and together they cover the foreground
+    assert (parts[0] | parts[1]).all()                     # and together they cover the region
 
 
-def test_components_never_adds_patches_the_where_stage_missed():
-    """The Extract slot decomposes a foreground; it must not repair one."""
-    ex = build_instance_extractor(Config(instance_extractor="oracle"))
-    ex.set_target_instances(_labels((8, 8), [(0, 8, 0, 4), (0, 8, 4, 8)]))
-    fg = np.zeros((4, 4), dtype=bool)
-    fg[:, :2] = True                                       # Where found only the left instance
-
-    parts = ex.components(fg, box=(0, 8, 0, 8))
-    assert len(parts) == 1
-    assert np.array_equal(parts[0], fg)                    # exactly what it was given, no more
+def test_the_region_is_exactly_the_union_of_the_instances():
+    ex = _oracle(_labels((8, 8), [(0, 4, 0, 4), (4, 8, 4, 8)]))
+    res = ex.extract(torch.zeros(4, 4, 1), box=(0, 8, 0, 8))
+    assert np.array_equal(np.logical_or.reduce(res.instances), res.foreground)
 
 
-def test_background_only_foreground_is_returned_whole_for_stop_to_reject():
-    ex = build_instance_extractor(Config(instance_extractor="oracle"))
-    ex.set_target_instances(np.zeros((8, 8), dtype=np.int32))   # no instances anywhere
-    fg = np.ones((4, 4), dtype=bool)
-    parts = ex.components(fg, box=(0, 8, 0, 8))
-    assert len(parts) == 1 and parts[0].all()
+def test_background_only_crop_is_returned_whole_for_stop_to_reject():
+    ex = _oracle(np.zeros((8, 8), dtype=np.int32))         # no instances anywhere
+    # The GT is empty, so the region is empty too and there is nothing to propose.
+    assert _extract(ex, (4, 4), (0, 8, 0, 8)) == []
 
 
-def test_empty_foreground_yields_no_components():
-    ex = build_instance_extractor(Config(instance_extractor="oracle"))
-    ex.set_target_instances(_labels((8, 8), [(0, 4, 0, 4)]))
-    assert ex.components(np.zeros((4, 4), dtype=bool), box=(0, 8, 0, 8)) == []
+def test_a_crop_with_no_gt_yields_no_instances():
+    ex = _oracle(_labels((16, 16), [(0, 4, 0, 4)]))
+    assert _extract(ex, (4, 4), (8, 16, 8, 16)) == []
 
 
 def test_box_selects_the_region_of_the_gt_that_is_looked_up():
     """A crop of the right half must see only the instance living there."""
-    ex = build_instance_extractor(Config(instance_extractor="oracle"))
-    ex.set_target_instances(_labels((8, 8), [(0, 8, 0, 4), (0, 8, 4, 8)]))
-    parts = ex.components(np.ones((4, 4), dtype=bool), box=(0, 8, 4, 8))
-    assert len(parts) == 1
-
-
-# --------------------------------------------------------------------------- split
-def test_split_returns_one_grid_per_instance_in_the_clump():
-    ex = build_instance_extractor(Config(instance_extractor="oracle"))
-    ex.set_target_instances(_labels((8, 8), [(0, 8, 0, 4), (0, 8, 4, 8)]))
-    subs = ex.split(None, np.ones((4, 4), dtype=bool), box=(0, 8, 0, 8))
-    assert len(subs) == 2
-
-
-def test_split_of_a_single_instance_reports_unsplittable():
-    ex = build_instance_extractor(Config(instance_extractor="oracle"))
-    ex.set_target_instances(_labels((8, 8), [(0, 8, 0, 8)]))
-    comp = np.ones((4, 4), dtype=bool)
-    subs = ex.split(None, comp, box=(0, 8, 0, 8))
-    assert len(subs) == 1 and np.array_equal(subs[0], comp)
+    ex = _oracle(_labels((8, 8), [(0, 8, 0, 4), (0, 8, 4, 8)]))
+    assert len(_extract(ex, (4, 4), (0, 8, 4, 8))) == 1
 
 
 def test_bool_gt_degrades_to_a_single_instance():
-    ex = build_instance_extractor(Config(instance_extractor="oracle"))
-    ex.set_target_instances(np.ones((8, 8), dtype=bool))
-    assert len(ex.components(np.ones((4, 4), dtype=bool), box=(0, 8, 0, 8))) == 1
+    ex = _oracle(np.ones((8, 8), dtype=bool))
+    assert len(_extract(ex, (4, 4), (0, 8, 0, 8))) == 1
+
+
+# --------------------------------------------------------------------------- coverage
+def test_any_coverage_keeps_an_instance_smaller_than_a_patch():
+    """The §A0.4 point: extraction is a PROPOSAL, so a sub-patch object must still mark a patch.
+
+    Centre sampling deletes it before the recursion can see it — no patch, no crop, no instance.
+    """
+    labels = _labels((64, 64), [(0, 60, 0, 60)])           # a big one...
+    labels[62:64, 62:64] = 2                               # ...and one smaller than a patch (8x8 px)
+    assert len(_extract(_oracle(labels, oracle_coverage="any"), (8, 8), (0, 64, 0, 64))) == 2
+    assert len(_extract(_oracle(labels, oracle_coverage="center"), (8, 8), (0, 64, 0, 64))) == 1
+
+
+def test_any_coverage_instances_may_overlap_on_a_shared_patch():
+    """Two objects sharing a patch both claim it — they genuinely need two crops."""
+    # 4 px patches; the boundary at x=9 falls inside patch column 2 (x 8..11), so both instances
+    # hold pixels in it.
+    labels = _labels((16, 16), [(0, 16, 0, 9), (0, 16, 9, 16)])
+    parts = _extract(_oracle(labels, oracle_coverage="any"), (4, 4), (0, 16, 0, 16))
+    assert len(parts) == 2
+    assert (parts[0] & parts[1]).any()
 
 
 # --------------------------------------------------------------------------- mask refinement

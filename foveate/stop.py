@@ -1,8 +1,8 @@
-"""STOP — descend, emit or reject (slot 3 of 3).
+"""STOP — descend, emit or reject (slot 2 of 3).
 
-The cascade is three swappable slots (see :mod:`foveate.cascade`): **Where**
-(:mod:`foveate.foreground`) finds the concept on a crop, **Extract** (:mod:`foveate.extract`) turns
-that foreground into instance candidates, and **Stop** (*this module*) decides what happens to them.
+The cascade is three swappable slots (see :mod:`foveate.cascade`): **Extract**
+(:mod:`foveate.extract`) proposes the instances on a crop, **Stop** (*this module*) decides what
+happens to them, and **Merge** (:mod:`foveate.merge_rule`) combines what the recursion emitted.
 
 Three decisions, and every one of them is a *policy* — which is why they belong behind one interface
 rather than inline in the loop:
@@ -10,15 +10,33 @@ rather than inline in the loop:
 ``accept(reid, box)``
     Is this crop the concept at all? The reject floor τ_C (``cfg.crop_sim_floor``). Not an *accept*
     threshold — clearing it only means "not disqualified".
+``converged(instances, box, seed, seed_box)``
+    Did zooming change the answer? The **fixed point**: a crop whose extraction is the single
+    instance it was cropped for has nothing left to gain, so it is emitted.
 ``survivors(...)``
-    Which children are pursued, and hence (when none are) where the cascade stops and emits.
-``allow_retry(...)``
-    May a hair-thin zoom peak try one split before being emitted?
+    Which children are pursued, and hence (when none are) where the cascade falls back and emits.
+    The **similarity peak guard**.
 
-What is deliberately **not** here: the size floor ρ (``cfg.min_crop``). That is the cascade's
-finiteness *invariant*, not a policy — zoom strictly shrinks the box and any crop at or below ρ is
-emitted, so the recursion terminates whatever a Stop rule does, including an adversarial one. Moving
-it behind this interface would let a plugin break termination.
+Why two conditions, and what they replaced
+------------------------------------------
+The pre-two-slot rule had a third mechanism: a converged crop was *always* split k=2 and the split
+was then confirmed by a re-identification lookahead. That existed only because k-means cannot decide
+an instance count — the splitter proposed and ``g`` disposed. An extractor that returns instances
+decides the count itself, so the confirm dance is gone and what remains is the pair the paper
+already claims:
+
+* the **fixed point** — the instance set is unchanged between parent and child. Compared in
+  original-image coordinates with an IoU tolerance, because parent and child crops have different
+  pixel extents and therefore different patch grids; the same object is a coarser mask in the parent
+  and a finer one in the child, so equality has to be approximate (``cfg.stop_fixed_point_iou``).
+* the **peak guard** — no child re-identifies the exemplar more strongly than the crop it came from.
+  This is what catches an extractor that is scale-invariant but *wrong*: it keeps returning a
+  confident answer at every scale, so the fixed point never fires, but ``g`` stops rising.
+
+What is deliberately **not** here: the size floor ρ (``cfg.min_crop``) and the strict box shrink.
+Those are the cascade's finiteness *invariant*, not a policy — zoom strictly shrinks the box and any
+crop at or below ρ is emitted, so the recursion terminates whatever a Stop rule does, including an
+adversarial one. Moving them behind this interface would let a plugin break termination.
 
 Selected by ``cfg.stop_rule``: ``"reid"`` (default, the paper's rule) or ``"oracle"`` (upper bound).
 """
@@ -29,11 +47,13 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
+from foveate import features as featlib
+
 _Box = tuple[int, int, int, int]
 
 
 # ---------------------------------------------------------------------------
-# The rule itself, as pure functions over scores (shared by every StopRule)
+# The rule itself, as pure functions (shared by every StopRule)
 # ---------------------------------------------------------------------------
 def reid_survivors(parent_reid: float, child_scores) -> list[int]:
     """Indices of children that re-identify the exemplar *more strongly* than the parent.
@@ -65,7 +85,7 @@ def survivors(parent_reid: float, child_scores, *, crop_sim_floor: float) -> lis
        a sub-crop above the parent. A single object, by contrast, only yields *partial* sub-crops
        that score *below* the whole (and flat/tied ``g`` never beats the parent), so its split is not
        confirmed → keep nothing and the caller emits the parent. This stops a uniform blob
-       over-segmenting.
+       over-segmenting, and it is what makes an appearance-blind cut (``group=kmeans``) safe.
     2. **Keep every child that improves on the parent OR clears the crop similarity floor τ_C.** A
        child that *improved* on the parent has found a better crop and must never be discarded — even
        when it is still below the floor (it will keep zooming and can rise above it). The floor
@@ -83,6 +103,27 @@ def survivors(parent_reid: float, child_scores, *, crop_sim_floor: float) -> lis
     return []                                                # no sub-crop beat the parent → emit it
 
 
+def instance_set_unchanged(
+    instances: list[np.ndarray], box: _Box, seed: np.ndarray, seed_box: _Box, *, iou: float
+) -> bool:
+    """Is this crop a fixed point — did re-extracting at the finer scale change the answer?
+
+    ``seed`` is the single instance grid (on the parent's crop ``seed_box``) that this crop was
+    derived from; ``instances`` is what the extractor returns on ``box``. The crop is a fixed point
+    when the extractor gives back **exactly that one instance**: more than one means zooming
+    genuinely separated something and the branch must continue, and a different single mask means the
+    answer is still moving.
+
+    The comparison is in original-image coordinates (:func:`foveate.features.grid_iou`) because the
+    two crops have different pixel extents, and it is approximate because the same object is a
+    coarser mask on the parent's grid than on the child's — ``iou`` is the tolerance for that
+    re-quantization, not for a difference of opinion.
+    """
+    if len(instances) != 1:
+        return False
+    return featlib.grid_iou(instances[0], box, seed, seed_box) >= iou
+
+
 # ---------------------------------------------------------------------------
 # Strategy interface
 # ---------------------------------------------------------------------------
@@ -90,13 +131,18 @@ def survivors(parent_reid: float, child_scores, *, crop_sim_floor: float) -> lis
 class StopRule(Protocol):
     """Strategy interface for the Stop stage.
 
-    Every method takes the crop **boxes** alongside the scores. The default rule ignores them (it
-    decides purely on ``g``); an oracle or a geometry-aware rule needs them. Keeping both in the
+    Every method takes the crop **boxes** alongside the scores. The default rule ignores them where
+    it can (it decides on ``g``); an oracle or a geometry-aware rule needs them. Keeping both in the
     signature is what lets the two be swapped without touching the cascade.
     """
 
     def accept(self, reid: float, box: _Box) -> bool:
         """Is this crop the concept (clears the reject floor)?"""
+        ...
+
+    def converged(self, instances: list[np.ndarray], box: _Box,
+                  seed: np.ndarray, seed_box: _Box) -> bool:
+        """Is the extraction on ``box`` a fixed point of the crop it was derived from?"""
         ...
 
     def survivors(
@@ -105,13 +151,22 @@ class StopRule(Protocol):
         """Indices of the children to pursue; empty ⇒ the parent was the peak → emit it."""
         ...
 
-    def allow_retry(self, parent_reid: float, child_reid: float) -> bool:
-        """May this marginal zoom peak attempt one k=2 split before being emitted?"""
-        ...
+
+class _FixedPointMixin:
+    """The fixed point, shared by every rule: it is geometry, not a signal.
+
+    An oracle Stop rule swaps the *signal* the peak guard runs on; whether re-extraction changed the
+    instance set is not a signal question, so both rules answer it the same way. A future rule is
+    free to override it.
+    """
+
+    def converged(self, instances, box, seed, seed_box) -> bool:
+        return instance_set_unchanged(instances, box, seed, seed_box,
+                                      iou=self.cfg.stop_fixed_point_iou)
 
 
-class ReidStopRule:
-    """``reid`` (default) — the paper's rule: re-identification ``g`` is the only stopping signal.
+class ReidStopRule(_FixedPointMixin):
+    """``reid`` (default) — the paper's rule: re-identification ``g`` is the stopping signal.
 
     A thin adapter over :func:`survivors` / :func:`reid_survivors` and the floor τ_C, so the
     behaviour of record lives in one testable place and the cascade holds no policy.
@@ -127,14 +182,8 @@ class ReidStopRule:
         # Module-level lookup (not a bound import) so tests can monkeypatch the rule in place.
         return survivors(parent_reid, child_scores, crop_sim_floor=self.cfg.crop_sim_floor)
 
-    def allow_retry(self, parent_reid: float, child_reid: float) -> bool:
-        """A zoom that peaked by only a HAIR may be sitting on a clump that tightening onto one
-        component cannot improve — so it is worth one k=2 split before emitting. ``0`` disables."""
-        eps = self.cfg.zoom_split_retry_eps
-        return eps > 0 and 0.0 <= parent_reid - child_reid < eps
 
-
-class OracleStopRule:
+class OracleStopRule(_FixedPointMixin):
     """``oracle`` — the upper bound on the *stopping rule*, holding the rule's shape fixed.
 
     The point of this ablation is to separate two questions the default rule conflates:
@@ -149,8 +198,11 @@ class OracleStopRule:
     ``reid`` and ``oracle`` under an otherwise identical configuration is attributable to the
     signal; no gap means the rule is what limits us.
 
+    The fixed point is inherited unchanged — it asks whether the extractor's answer moved, which no
+    ground truth can improve on.
+
     The GT is injected per image by the cascade (``cascade(..., gt_foreground=...)``, the same
-    payload the oracle *Where* extractor consumes) via :meth:`set_target_instances`. It must be an
+    payload the oracle *Extract* slot consumes) via :meth:`set_target_instances`. It must be an
     **int instance-label map** (``0`` = bg, ``i`` = the i-th GT instance) for the isolation score to
     mean anything; a bool union mask degenerates to a single "instance" (the union), which frames the
     whole class region rather than one object. Emitted confidences are untouched — this rule replaces
@@ -254,10 +306,6 @@ class OracleStopRule:
     def survivors(self, parent_reid, parent_box, child_scores, child_boxes) -> list[int]:
         return survivors(self._isolation(parent_box), [self._isolation(b) for b in child_boxes],
                          crop_sim_floor=self.floor)
-
-    def allow_retry(self, parent_reid: float, child_reid: float) -> bool:
-        """Never. The retry exists to hedge a *noisy* peak; an oracle score has no noise to hedge."""
-        return False
 
 
 #: ``cfg.stop_rule`` → implementation.
