@@ -26,6 +26,11 @@ from foveate import features as featlib
 from foveate.foreground import GateResult, normalize_reference
 
 
+def cfg_mode(cfg) -> str:
+    """Oracle downsampling semantics: ``any`` (proposal, default) or ``center``."""
+    return str(getattr(cfg, "oracle_coverage", "any"))
+
+
 def _mask_bbox(mask: np.ndarray, pad_frac: float) -> tuple[int, int, int, int]:
     """Padded bbox of a binary mask (patch-scale framing shared with the cascade's crops)."""
     ys, xs = np.where(mask)
@@ -103,8 +108,13 @@ class OracleExtractor:
         hp, wp, _ = target_feat.shape
         y0, y1, x0, x1 = box
         crop_gt = self._gt[y0:y1, x0:x1]
+        # ``any``-overlap, not centre sampling: the Where stage answers "where COULD the concept
+        # be", and the cascade then foveates onto what it proposes. Centre sampling deletes anything
+        # smaller than a patch before the recursion ever sees it, which is not a Where error the
+        # oracle should inherit — it is a downsampling artefact. Under any-overlap every instance
+        # marks at least one patch, so an upper-bound Where really is an upper bound.
         foreground = (
-            featlib.resize_mask_to_grid(crop_gt, (hp, wp))
+            featlib.resize_mask_to_grid(crop_gt, (hp, wp), mode=cfg_mode(self.cfg))
             if crop_gt.any() else np.zeros((hp, wp), dtype=bool)
         )
         score_map = foreground.astype(np.float32)                # perfect confidence: 1 on the GT
@@ -180,7 +190,7 @@ class OracleCCExtractor(OracleExtractor):
         # its source-pixel centre, so ``lab_grid > 0`` is exactly the plain oracle's union foreground
         # (same centre-pixel sampling) while carrying which instance each patch belongs to.
         if crop_labels.any():
-            lab_grid = cv2.resize(crop_labels, (wp, hp), interpolation=cv2.INTER_NEAREST)
+            lab_grid = featlib.resize_labels_to_grid(crop_labels, (hp, wp))
         else:
             lab_grid = np.zeros((hp, wp), dtype=crop_labels.dtype)
         foreground = (lab_grid > 0) & ~_instance_seams(lab_grid)
