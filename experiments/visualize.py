@@ -129,11 +129,10 @@ def save_item_overlay(item: EvalItem, pred: ImagePrediction, out_dir: Path) -> P
 # What each decision means, for the panel titles.
 _DECISIONS = {
     "empty": "gate fired on nothing",
-    "split": "≥2 components → zoom each",
-    "zoom": "1 component, still shrinking → zoom",
-    "leaf": "converged, unsplittable / splitting off → accepted instance",
-    "leaf-cap": "min-crop size floor → emit components",
-    "clump-split": "converged → k=2 split, g-gated next level",
+    "split": "≥2 instances extracted → zoom each",
+    "zoom": "1 instance, still shrinking → zoom",
+    "leaf": "fixed point / nothing left to frame → accepted instance",
+    "leaf-cap": "min-crop size floor → emit every instance",
     "discard": "converged but below the crop similarity floor τ_C → discarded",
     "reid-stop": "no split/zoom child beat this crop → emit it",
     "below-floor": "split sibling below both parent and τ_C → pruned (stronger siblings continue)",

@@ -18,8 +18,9 @@ is three, with three different fixes:
 Everything is measured against the same match threshold as AP (IoU ≥ 0.5), so the counts add up to
 the AP50 recall exactly.
 
-The pre-NMS detections are obtained by running the cascade with NMS disabled and then applying the
-cascade's own NMS afterwards, so both sets come from one forward pass and differ *only* by NMS.
+The pre-merge detections are obtained by running the cascade with ``merge_rule: none`` and then
+applying the configured Merge rule afterwards, so both sets come from one forward pass and differ
+*only* by that rule.
 
     python -m experiments.miss_diagnostics --config configs/ablation/lvis_dense_a1.yaml --limit 8
 """
@@ -153,24 +154,24 @@ def classify_misses(
 # Runner
 # ---------------------------------------------------------------------------
 def run(config: dict, limit: int = 8, target: str = "intra") -> MissBreakdown:
-    """Run the configured method with NMS off, re-apply NMS, and classify every GT instance."""
+    """Run the configured method with Merge off, re-apply it, and classify every GT instance."""
     import copy
 
     from data import DataConfig
     from experiments.datasets import build_datasets, build_support_index, iter_inter_items, \
         iter_intra_items
     from experiments.methods import build_method
-    from foveate.cascade import _nms
+    from foveate.config import Config
+    from foveate.merge_rule import build_merge_rule
     from foveate.types import Instance
 
     cfg = copy.deepcopy(config)
     cfg.pop("sweep", None)
     cfg["mlflow"] = {"enabled": False}
     fov = cfg.setdefault("foveate", {})
-    nms_iou = float(fov.get("nms_iou", 0.5))
-    nms_containment = float(fov.get("nms_containment", 0.7))
-    fov["nms_iou"] = 1.0                            # disable inside the cascade; re-applied below,
-    fov["nms_containment"] = 1.0                    # so both sets come from ONE forward pass
+    merge_rule = build_merge_rule(Config.from_dict(fov))
+    fov["merge_rule"] = "none"                      # disable inside the cascade; re-applied below,
+                                                    # so both sets come from ONE forward pass
 
     method = build_method(cfg)
     intra, inter = build_datasets(DataConfig.from_dict(cfg["data"]))
@@ -188,12 +189,12 @@ def run(config: dict, limit: int = 8, target: str = "intra") -> MissBreakdown:
         pred = method.predict(item, observer=lambda ev: trace.append(
             {k: v for k, v in ev.items() if k in ("box", "decision")}))
         pre = pred.masks.astype(bool)
-        # Rebuild the (y0, y1, x0, x1) box the NMS expects from the mask itself: ``pred.boxes`` is
-        # the detection box in (x0, y0, x1, y1) order, and feeding that in silently breaks the
-        # cheap box pre-filter, so the re-applied NMS was not the cascade's own.
+        # Rebuild the (y0, y1, x0, x1) box the Merge rule expects from the mask itself:
+        # ``pred.boxes`` is the detection box in (x0, y0, x1, y1) order, and feeding that in would
+        # silently break the rule's cheap box pre-filter.
         leaves = [Instance(m.astype(np.uint8), _mask_box(m) or (0, 0, 0, 0), 0, float(s))
                   for m, s in zip(pre, pred.scores)]
-        kept, _ = _nms(leaves, nms_iou, nms_containment)
+        kept, _, _ = merge_rule.merge(leaves)
         post = np.stack([i.mask.astype(bool) for i in kept]) if kept else np.zeros((0, *pre.shape[1:]), bool)
 
         visited = [ev["box"] for ev in trace if ev.get("box") is not None]

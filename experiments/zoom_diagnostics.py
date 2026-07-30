@@ -53,7 +53,7 @@ import numpy as np
 #: (``reid-stop`` = the peak guard fell back to this crop; ``leaf-cap`` = the size floor stopped it.)
 _TERMINAL = frozenset({"leaf", "leaf-cap", "reid-stop"})
 #: Decisions that enqueue tighter children — where the *cost* of a step is scored.
-_DESCEND = frozenset({"zoom", "split", "clump-split"})
+_DESCEND = frozenset({"zoom", "split"})
 
 #: Crop-size bins, in multiples of the backbone input side (``image_size``). Above 1x a crop is
 #: **downsampled** into the encoder, so zooming still buys pixels; below 1x it is upsampled and

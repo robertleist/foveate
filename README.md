@@ -109,9 +109,11 @@ sample or upload a reference image + mask (free-draw canvas, or a mask PNG fallb
 ## Layout
 
 ```
-foveate/        core package: cascade (the `cascade` entry point), single-pass pipeline (run),
-                features, gate, clustering, individuation, merge, border, prototypes,
-                thresholding, debias, config, types, backbones/{dinov3,mock}
+foveate/        core package: cascade (the `cascade` entry point) driving three swappable slots —
+                extract (which instances are on this crop: composite = foreground x grouping, or a
+                monolithic one), stop (descend/emit/reject), merge_rule (how the leaves combine);
+                single-pass pipeline (run), features, gate, clustering, individuation, merge,
+                border, prototypes, thresholding, debias, config, types, backbones/{dinov3,mock}
 data/           mask-based datasets: DatasetSource (coco/pannuke/synthetic), InstanceDataset,
                 PU instance splitting
 experiments/    eval (metrics), datasets (bridge), run (MLflow runner), ablations (sweeps)

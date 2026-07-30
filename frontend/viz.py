@@ -43,11 +43,10 @@ _PALETTE = np.array(
 # Decision -> short human-readable note, for cascade trace panel titles.
 _DECISIONS = {
     "empty": "gate fired on nothing",
-    "split": ">=2 components -> zoom each",
-    "zoom": "1 component, still shrinking -> zoom",
-    "leaf": "converged, unsplittable / splitting off -> accepted instance",
-    "leaf-cap": "min-crop size floor -> emit components",
-    "clump-split": "converged -> k=2 split, g-gated next level",
+    "split": ">=2 instances extracted -> zoom each",
+    "zoom": "1 instance, still shrinking -> zoom",
+    "leaf": "fixed point / nothing left to frame -> accepted instance",
+    "leaf-cap": "min-crop size floor -> emit every instance",
     "discard": "converged but below the crop similarity floor tau_C -> discarded",
     "reid-stop": "no split/zoom child beat this crop -> emit it",
     "reid-worse": "re-id score g dropped below the parent -> discarded (why the cascade stopped)",

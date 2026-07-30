@@ -21,7 +21,7 @@ from experiments.methods.base import (
     register_method,
 )
 from foveate import Config, cascade
-from foveate.foreground import build_extractor
+from foveate.extract import build_extractor, resolve_extractor_name
 
 
 @register_method("foveate")
@@ -35,11 +35,11 @@ class FoveateMethod(Method):
         # The runner's CLS-trajectory rendering reads the acceptance floor off the method.
         self.crop_sim_floor = self.foveate_config.crop_sim_floor
         # Cross-image (inter) reuses one exemplar bank for every target of a class; cache the
-        # extractor (whose set_reference embeds every exemplar crop) so that cost is paid once.
+        # Extract slot (whose set_reference embeds every exemplar crop) so that cost is paid once.
         self._ref_cache: dict = {}
 
     def _cached_extractor(self, item: EvalItem):
-        """Return a reference-set extractor for ``item``, or ``None`` to build it per-image.
+        """Return a reference-set Extract slot for ``item``, or ``None`` to build it per-image.
 
         Only the cross-image (inter) protocol reuses a bank across target images — its exemplars
         live on a shared support image. Intra exemplars live on the (per-image) target itself, so
@@ -60,13 +60,14 @@ class FoveateMethod(Method):
         self, item: EvalItem, observer: Callable[[dict], None] | None = None
     ) -> MethodPrediction:
         # Oracle ablations: feed the cascade the target's GT class foreground as an instance-label
-        # map (0 = bg, i = the i-th GT instance). The oracle *Where* extractors consume it —
-        # ``oracle`` uses only its union (>0), ``oracle_cc`` also uses the per-instance ids to
-        # pre-separate touching instances — and so does the oracle *Stop* rule (box<->instance
-        # isolation in place of g). For every other slot combination it stays None so the discovery
-        # is honest.
-        oracle = (self.foveate_config.foreground_extractor in ("oracle", "oracle_cc")
-                  or self.foveate_config.stop_rule == "oracle")
+        # map (0 = bg, i = the i-th GT instance). The oracle *Extract* slot consumes it (whether as
+        # the monolithic GT extractor or as a composite whose Where half is oracular), and so does
+        # the oracle *Stop* rule (box<->instance isolation in place of g). For every other slot
+        # combination it stays None so the discovery is honest.
+        cfg = self.foveate_config
+        oracle = (resolve_extractor_name(cfg) == "oracle"
+                  or cfg.foreground_extractor in ("oracle", "oracle_cc")
+                  or cfg.stop_rule == "oracle")
         gt_foreground = None
         if oracle and len(item.gt_masks):
             gt_foreground = np.zeros(item.image.shape[:2], dtype=np.int32)

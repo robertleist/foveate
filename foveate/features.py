@@ -128,6 +128,74 @@ def resize_mask_to_grid(mask: np.ndarray, grid_hw: tuple[int, int], *,
     return resize_labels_to_grid(m.astype(np.uint8), grid_hw).astype(bool)
 
 
+def grid_bbox(comp: np.ndarray):
+    """``(rmin, rmax, cmin, cmax)`` half-open patch bbox of a bool grid."""
+    rows, cols = np.where(comp)
+    return rows.min(), rows.max() + 1, cols.min(), cols.max() + 1
+
+
+def child_box(comp: np.ndarray, box, pad_frac: float, dilate: float = 0.0):
+    """Pixel bbox (in original coords) of a grid component within ``box``, padded.
+
+    The crop the cascade derives from one instance proposal, and therefore also the crop *size* the
+    extractor has to reason about when it asks whether zooming would still gain anything — which is
+    why this lives here, next to the other grid ↔ pixel conversions, rather than in either caller.
+
+    ``dilate`` (``cfg.crop_dilate``, in **patches**) widens the grid bbox before it is converted to
+    pixels — a fixed, scale-independent safety margin on the extractor's outermost patch, which is
+    exactly where its threshold is least certain. ``pad_frac`` cannot play that role: being relative,
+    it shrinks along with the crop just as the quantization error stays constant.
+    """
+    y0, y1, x0, x1 = box
+    ch, cw = y1 - y0, x1 - x0
+    hp, wp = comp.shape
+    rmin, rmax, cmin, cmax = grid_bbox(comp)
+    if dilate:
+        # Fractional: the grid bbox under-states the object by up to half a patch on each side
+        # (a patch is foreground when its *centre* is inside), so 0.5 is the exact correction.
+        rmin = max(0.0, rmin - dilate); rmax = min(float(hp), rmax + dilate)
+        cmin = max(0.0, cmin - dilate); cmax = min(float(wp), cmax + dilate)
+    py0 = y0 + int(np.floor(rmin / hp * ch)); py1 = y0 + int(np.ceil(rmax / hp * ch))
+    px0 = x0 + int(np.floor(cmin / wp * cw)); px1 = x0 + int(np.ceil(cmax / wp * cw))
+    pady, padx = int(round((py1 - py0) * pad_frac)), int(round((px1 - px0) * pad_frac))
+    return (max(y0, py0 - pady), min(y1, py1 + pady),
+            max(x0, px0 - padx), min(x1, px1 + padx))
+
+
+def sample_grid_on_box(grid: np.ndarray, grid_box, box, grid_hw: tuple[int, int]) -> np.ndarray:
+    """Resample a patch ``grid`` defined over ``grid_box`` onto a ``grid_hw`` lattice over ``box``.
+
+    Both rectangles are ``(y0, y1, x0, x1)`` in the **same** (original-image) pixel coordinates, so
+    this is how two crops' answers are put side by side: each destination cell centre is mapped into
+    original coordinates and looked up in the source grid. It is the comparison direction — grid to
+    grid — and it uses the same convention as :func:`resize_labels_to_grid`: a cell stands for the
+    pixel interval it covers and is sampled at that interval's middle.
+    """
+    y0, y1, x0, x1 = box
+    sy0, sy1, sx0, sx1 = grid_box
+    gh, gw = grid.shape
+    rh, rw = grid_hw
+    ys = y0 + (np.arange(rh) + 0.5) * (y1 - y0) / rh              # destination cell centres, px
+    xs = x0 + (np.arange(rw) + 0.5) * (x1 - x0) / rw
+    rows = np.clip(((ys - sy0) / max(sy1 - sy0, 1) * gh).astype(np.intp), 0, gh - 1)
+    cols = np.clip(((xs - sx0) / max(sx1 - sx0, 1) * gw).astype(np.intp), 0, gw - 1)
+    return grid[rows[:, None], cols[None, :]]
+
+
+def grid_iou(a: np.ndarray, a_box, b: np.ndarray, b_box) -> float:
+    """IoU of two patch grids defined over different pixel boxes, in original-image coordinates.
+
+    Compared on ``a``'s own lattice over ``a_box``: ``a`` is then exact and only ``b`` is resampled,
+    which is the right way round when ``a`` is the finer (more zoomed) of the two.
+    """
+    a = np.asarray(a, dtype=bool)
+    b_on_a = sample_grid_on_box(np.asarray(b, dtype=bool), b_box, a_box, a.shape)
+    union = int(np.logical_or(a, b_on_a).sum())
+    if union == 0:
+        return 0.0
+    return int(np.logical_and(a, b_on_a).sum()) / union
+
+
 def upsample_mask(mask: np.ndarray, size_wh: tuple[int, int], *, bilinear: bool = False) -> np.ndarray:
     """Upsample a coarse (patch-grid) binary ``mask`` to pixel resolution ``size_wh`` (W, H).
 

@@ -38,7 +38,7 @@ import numpy as np
 # Decisions the cascade emits for a region that has >= 2 children (a fork). A segment ends
 # at any of these; each child starts a fresh segment. Kept as data so the walk never has to
 # re-derive "is this a fork" from n_components.
-_FORK_DECISIONS = frozenset({"split", "leaf-cap", "clump-split"})
+_FORK_DECISIONS = frozenset({"split", "leaf-cap"})
 
 
 @dataclass
