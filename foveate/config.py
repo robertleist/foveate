@@ -249,9 +249,22 @@ class Config:
                                          # crop is padded by pad_frac/crop_dilate, so scoring it as
                                          # a detection penalises the method for its own padding —
                                          # keep it as a framing DIAGNOSTIC, not as the reported box.
-    mask_upsample: str = "nearest"       # how a leaf's patch-grid mask is upsampled to pixels:
-                                         # nearest (blocky patch staircase) | bilinear (smooth the
-                                         # boundary — resize as float, re-binarize at 0.5)
+    mask_upsample: str = "nearest"       # MASK slot (foveate.upsample): how a leaf's patch-grid mask
+                                         # becomes pixels. nearest (the exact patch staircase) |
+                                         # bilinear (resize as float, re-binarize at 0.5 — a
+                                         # smoothing prior that uses NO image evidence, so it is the
+                                         # floor for this slot, not the answer) | oracle (the upper
+                                         # bound: the GT shape of a detection that ALREADY matches).
+                                         # A guided/joint-bilateral arm and feature upsampling
+                                         # (roadmap A1.3) are the real entries this slot is for.
+    oracle_upsample_iou: float = 0.5     # ORACLE MASK ONLY. Minimum IoU the base mask must already
+                                         # reach before its shape is replaced. Shape-ONLY on purpose:
+                                         # an oracle allowed to snap any mask to its nearest object
+                                         # would do the Merge slot's job (~44 % of dense detections
+                                         # are clipped fragments) and book a search gain as boundary
+                                         # quality. Below this the base mask is returned untouched.
+    oracle_upsample_base: str = "bilinear"  # ORACLE MASK ONLY: which upsample decides what "already
+                                         # matches" means (nearest | bilinear)
     # --- MERGE: how the emitted leaves combine (slot 3 of 3, foveate.merge_rule) ---
     merge_rule: str = "nms"              # nms | soft | none. "nms" (default) is the behaviour of
                                          # record: greedy score-ranked suppression by mask IoU AND

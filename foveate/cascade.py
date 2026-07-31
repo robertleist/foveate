@@ -63,6 +63,7 @@ from foveate.extract import build_extractor, component_label_map
 from foveate.merge_rule import build_merge_rule
 from foveate.reid import build_reid_scorer
 from foveate.stop import build_stop_rule
+from foveate.upsample import build_mask_upsampler
 from foveate.types import Instance, Stats
 
 
@@ -212,12 +213,13 @@ def cascade(
     # image's transient oracle state, if any.
     stop = build_stop_rule(cfg)
     merge_rule = build_merge_rule(cfg)
+    upsampler = build_mask_upsampler(cfg)
 
     # Oracle ablations: hand the target's GT to whichever slot asks for it (transient per-image
     # state, so a cached inter-protocol extractor is simply refreshed each image). Only the oracle
-    # Extract / Stop / Merge implementations expose this hook; every other one never sees the GT.
+    # Extract / Stop / Merge / Mask implementations expose this hook; no other one sees the GT.
     if gt_foreground is not None:
-        for slot in (extractor, stop, merge_rule):
+        for slot in (extractor, stop, merge_rule, upsampler):
             if hasattr(slot, "set_target_instances"):
                 slot.set_target_instances(gt_foreground)
 
@@ -245,8 +247,7 @@ def cascade(
         # (Hp, Wp) matches ``comp_grid`` exactly, so the mask indexes straight into it.
         if confidence_scorer is not None and feat is not None and comp_grid.any():
             score = confidence_scorer.score(feat, None, comp_grid)
-        mask_local = featlib.upsample_mask(comp_grid, (x1 - x0, y1 - y0),
-                                           bilinear=cfg.mask_upsample == "bilinear")
+        mask_local = upsampler.upsample(comp_grid, region.box)
         if int(mask_local.sum()) < cfg.cascade_min_instance_area:
             stats.discarded += 1
             return
