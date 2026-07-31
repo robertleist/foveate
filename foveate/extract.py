@@ -139,6 +139,45 @@ def build_exemplar_bank(backbone, ref_image, ref_masks, cfg):
     return featlib.l2_normalize(cls_stack, dim=1).to(embedded[0][0].device), images, masks
 
 
+def scale_matched_view(image: np.ndarray, mask: np.ndarray, target_hw: tuple[int, int]):
+    """A window of ``image`` around ``mask`` with the same pixel extent as the crop being extracted.
+
+    A promptable segmenter and a feature memory are both built at whatever framing their exemplar
+    was given, and neither is scale-invariant: NTT matches patch features whose statistics depend on
+    how much of the crop the object fills, and SAM 3 is prompted with a visual exemplar it compares
+    against the canvas. Foveating them means the crop's framing changes every level, so an exemplar
+    fixed at one framing stops transferring — the failure shows up as an extractor that answers well
+    at the root and returns nothing two levels down.
+
+    Cutting the exemplar's neighbourhood to the *same pixel extent* as the target crop makes the
+    object occupy the same fraction of both, so the comparison is like for like at every level.
+    Returns ``(view, mask_in_view)``. Clipped at the reference's borders, so the match is
+    approximate when the crop is larger than the reference image itself.
+    """
+    h, w = int(target_hw[0]), int(target_hw[1])
+    m = np.asarray(mask, dtype=bool)
+    ys, xs = np.where(m)
+    if ys.size == 0:
+        return image, m
+    H, W = m.shape[:2]
+    cy, cx = (int(ys.min()) + int(ys.max())) // 2, (int(xs.min()) + int(xs.max())) // 2
+    y0 = int(np.clip(cy - h // 2, 0, max(H - h, 0)))
+    x0 = int(np.clip(cx - w // 2, 0, max(W - w, 0)))
+    y1, x1 = min(H, y0 + h), min(W, x0 + w)
+    return np.asarray(image)[y0:y1, x0:x1], m[y0:y1, x0:x1]
+
+
+def scale_octave(target_hw: tuple[int, int]) -> int:
+    """Coarse scale bucket of a crop, for caching anything rebuilt per zoom level.
+
+    Rebuilding a scale-matched exemplar view for every crop would cost an encoder forward per crop;
+    bucketing by octave means a handful per image, because the recursion halves the crop rather than
+    nudging it.
+    """
+    side = max(1.0, float(target_hw[0]) * float(target_hw[1])) ** 0.5
+    return int(round(float(np.log2(side))))
+
+
 def component_label_map(comps: list[np.ndarray], shape) -> np.ndarray:
     """Fold instance grids back into one ``(Hp, Wp)`` int label image (``0`` = background).
 

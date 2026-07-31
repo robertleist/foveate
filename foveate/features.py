@@ -47,12 +47,29 @@ def l2_normalize(features: torch.Tensor, dim: int = -1, eps: float = 1e-8) -> to
     return features / (features.norm(dim=dim, keepdim=True) + eps)
 
 
-def _standardize_and_norm(grid_chw: torch.Tensor, standardize: bool) -> torch.Tensor:
-    """``(C, Hp, Wp)`` -> ``(Hp, Wp, C)`` standardized (optional) and L2-normalized."""
+def grid_stats(feats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-channel ``(mean, std)`` of a ``(Hp, Wp, C)`` grid, shaped to broadcast over it."""
+    return (feats.mean(dim=(0, 1), keepdim=True), feats.std(dim=(0, 1), keepdim=True))
+
+
+def _standardize_and_norm(grid_chw: torch.Tensor, standardize: bool, stats=None) -> torch.Tensor:
+    """``(C, Hp, Wp)`` -> ``(Hp, Wp, C)`` standardized (optional) and L2-normalized.
+
+    Note what ``standardize`` is and is not. The *pixels* are already normalized with fixed ImageNet
+    statistics inside the backbone's ``preprocess`` — that is scale-invariant and always on. This is
+    a second, **feature**-level z-score, and by default it uses each crop's **own** spatial
+    statistics. That sharpens cosine contrast within a crop, but it means two crops of the same
+    object at different zoom levels land in different feature spaces, so a prototype, memory bank or
+    threshold calibrated at one framing does not transfer to another — which is fatal for a
+    recursive method that compares across scales.
+
+    ``stats`` overrides the per-crop statistics with a fixed ``(mean, std)`` pair, so every crop is
+    mapped into one common space and cross-scale comparisons mean something. See
+    ``cfg.standardize_stats``.
+    """
     feats = grid_chw.permute(1, 2, 0).float()      # (Hp, Wp, C)
     if standardize:
-        mean = feats.mean(dim=(0, 1), keepdim=True)
-        std = feats.std(dim=(0, 1), keepdim=True)
+        mean, std = grid_stats(feats) if stats is None else stats
         feats = (feats - mean) / (std + 1e-8)
     return l2_normalize(feats)
 
@@ -62,11 +79,15 @@ def embed_batch(
     images: list[np.ndarray],
     chunk: int = 8,
     standardize: bool = True,
+    stats=None,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Embed many crops, returning ``[(feat_grid (Hp,Wp,D), cls (D,))]`` per image.
 
     Crops are resized to the backbone's square input, so a heterogeneous list batches into
     one forward per ``chunk``. ``cls`` is L2-normalized for cosine re-identification.
+
+    ``stats`` is an optional fixed ``(mean, std)`` for the feature standardization, shared by every
+    crop so that crops at different zoom levels stay comparable (see :func:`_standardize_and_norm`).
     """
     out: list[tuple[torch.Tensor, torch.Tensor]] = []
     for start in range(0, len(images), chunk):
@@ -74,7 +95,7 @@ def embed_batch(
         pixel_values = backbone.preprocess(batch)              # (B, 3, H, W)
         grids, cls = backbone(pixel_values, return_cls=True)   # (B,C,Hp,Wp), (B,C)
         for i in range(grids.shape[0]):
-            feat = _standardize_and_norm(grids[i], standardize)
+            feat = _standardize_and_norm(grids[i], standardize, stats)
             out.append((feat, l2_normalize(cls[i].float(), dim=0)))
     return out
 

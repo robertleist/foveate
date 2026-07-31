@@ -94,3 +94,76 @@ def test_grid_points_map_to_patch_centres():
 
     pts = grid_points_to_pixels(np.array([[0, 0], [1, 3]]), (2, 4), (20, 40))
     assert pts.tolist() == [[5.0, 5.0], [35.0, 15.0]]
+
+
+# --------------------------------------------------------------------------- scale matching
+def test_scale_matched_view_gives_the_exemplar_the_same_extent_as_the_crop():
+    """The point of the whole thing: the object fills the same fraction of both views."""
+    from foveate.extract import scale_matched_view
+
+    img = np.zeros((200, 200, 3), np.uint8)
+    m = np.zeros((200, 200), bool); m[90:110, 90:110] = True     # a 20x20 object at the centre
+    for target in ((40, 40), (80, 60), (200, 200)):
+        view, view_mask = scale_matched_view(img, m, target)
+        assert view.shape[:2] == target
+        assert view_mask.shape == target
+        assert view_mask.any()                                    # the object is still in view
+
+
+def test_scale_matched_view_clips_at_the_reference_border():
+    from foveate.extract import scale_matched_view
+
+    img = np.zeros((50, 50, 3), np.uint8)
+    m = np.zeros((50, 50), bool); m[0:10, 0:10] = True            # object in the corner
+    view, view_mask = scale_matched_view(img, m, (40, 40))
+    assert view.shape[:2] == (40, 40) and view_mask.any()
+    # A target larger than the reference cannot be matched exactly; it clips rather than failing.
+    view, view_mask = scale_matched_view(img, m, (400, 400))
+    assert view.shape[:2] == (50, 50) and view_mask.any()
+
+
+def test_scale_octave_buckets_halvings_not_nudges():
+    """Views are cached per octave because the recursion halves a crop rather than nudging it."""
+    from foveate.extract import scale_octave
+
+    assert scale_octave((256, 256)) == scale_octave((250, 260))   # a nudge is the same bucket
+    assert scale_octave((256, 256)) != scale_octave((128, 128))   # a halving is not
+
+
+def test_empty_exemplar_mask_returns_the_reference_unchanged():
+    from foveate.extract import scale_matched_view
+
+    img = np.zeros((30, 30, 3), np.uint8)
+    view, view_mask = scale_matched_view(img, np.zeros((30, 30), bool), (10, 10))
+    assert view.shape[:2] == (30, 30) and not view_mask.any()
+
+
+# --------------------------------------------------------------------------- fixed feature stats
+def test_fixed_statistics_put_two_framings_in_one_feature_space():
+    """The defect behind the NTT collapse: per-crop z-scoring makes scales incomparable."""
+    from foveate.features import _standardize_and_norm, grid_stats
+
+    torch.manual_seed(0)
+    a = torch.randn(3, 6, 6) * 2.0 + 1.0          # same content, different per-crop statistics
+    b = a * 5.0 + 3.0
+
+    per_crop_a = _standardize_and_norm(a, True)
+    per_crop_b = _standardize_and_norm(b, True)
+    stats = grid_stats(a.permute(1, 2, 0).float())
+    fixed_a = _standardize_and_norm(a, True, stats)
+    fixed_b = _standardize_and_norm(b, True, stats)
+
+    # An affine rescale is invisible to per-crop standardization — it "helpfully" removes the very
+    # difference a cross-scale comparison needs to see, and both land in their own space.
+    assert torch.allclose(per_crop_a, per_crop_b, atol=1e-5)
+    # Under fixed statistics the two framings stay in ONE space, so a cosine between them is real.
+    assert not torch.allclose(fixed_a, fixed_b, atol=1e-3)
+    assert torch.allclose(fixed_a, per_crop_a, atol=1e-5)          # the source crop is unchanged
+
+
+def test_standardize_off_leaves_features_untouched_but_normalized():
+    from foveate.features import _standardize_and_norm
+
+    g = torch.randn(4, 3, 3)
+    out = _standardize_and_norm(g, False)
+    assert torch.allclose(out.norm(dim=-1), torch.ones(3, 3), atol=1e-5)

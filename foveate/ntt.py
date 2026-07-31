@@ -38,7 +38,12 @@ import numpy as np
 import torch
 
 from foveate import features as featlib
-from foveate.extract import ExtractResult, build_exemplar_bank
+from foveate.extract import (
+    ExtractResult,
+    build_exemplar_bank,
+    scale_matched_view,
+    scale_octave,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -184,40 +189,77 @@ class NTTExtractor:
         self.cfg = cfg
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.exemplar_cls: torch.Tensor | None = None
-        self._centers: torch.Tensor | None = None
+        self._centers: torch.Tensor | None = None      # memory at the reference's own framing
+        self._backbone = None                          # kept to re-embed scale-matched views
+        self._ref: list = []                           # (image, mask) pairs the memory is built from
+        self.feature_stats = None                      # fixed (mean, std); read by the cascade
+        self._by_octave: dict[int, torch.Tensor] = {}  # scale-matched memories, cached per octave
         self.n_segment_calls = 0
         self.processor = Sam2Processor.from_pretrained(cfg.sam2_model)
         self.model = Sam2Model.from_pretrained(cfg.sam2_model).to(self.device).eval()
 
     # ------------------------------------------------------------------ reference
     def set_reference(self, backbone, ref_image, ref_masks, negative_masks, cfg) -> None:
-        """Build the memory centers from the exemplars' patches, and the CLS bank for ``g``.
+        """Build the memory centers from the exemplars, and the CLS bank for ``g``.
 
-        The memory is built from a **padded crop around each exemplar**, not from the whole
-        reference frame (``ntt_crop_reference``, mirroring ``insid3_crop_reference``). This is not a
-        detail: ``standardize`` z-scores a patch grid over *its own* crop, so features are only
-        comparable between crops that frame their content at a similar scale. Matching a tight child
-        crop against a memory built on a full frame collapses the similarity — measured, the root
-        crop proposed 5 instances and every child proposed none. Cropping the reference also gives
-        the object many patches instead of the one or two it owns at full-frame scale, so
-        ``ntt_kmeans_k`` centers become meaningful rather than collapsing to k=1.
+        Keeps the backbone and the reference pairs so the memory can be rebuilt at the framing of
+        whatever crop is being extracted (:meth:`_memory_for`) — a memory is only comparable to a
+        crop that frames its content at a similar scale.
         """
+        self.exemplar_cls, images, masks = build_exemplar_bank(backbone, ref_image, ref_masks, cfg)
+        self._backbone = backbone
+        self._ref = list(zip(images, masks))
+        if cfg.standardize and cfg.standardize_stats == "reference":
+            # One fixed feature space for the whole run, taken from the first exemplar crop, so every
+            # crop's features live in the same coordinates regardless of how it is framed.
+            from foveate.oracle import mask_bbox
+
+            img, m = self._ref[0]
+            y0, y1, x0, x1 = mask_bbox(m, cfg.pad_frac)
+            raw = backbone(backbone.preprocess(img[y0:y1, x0:x1]))[0]
+            self.feature_stats = featlib.grid_stats(raw.permute(1, 2, 0).float())
+        self._centers = self._build_memory(None)
+
+    def _build_memory(self, target_hw) -> torch.Tensor:
+        """Cluster the exemplar patches, optionally seen at ``target_hw``'s framing."""
         from foveate.oracle import mask_bbox
 
-        self.exemplar_cls, images, masks = build_exemplar_bank(backbone, ref_image, ref_masks, cfg)
+        cfg = self.cfg
         chunks = []
-        for img, m in zip(images, masks):
-            if cfg.ntt_crop_reference:
+        for img, m in self._ref:
+            if target_hw is not None:
+                view, view_mask = scale_matched_view(img, m, target_hw)
+            elif cfg.ntt_crop_reference:
                 y0, y1, x0, x1 = mask_bbox(m, cfg.pad_frac)
-                img, m = img[y0:y1, x0:x1], m[y0:y1, x0:x1]
-            grid = featlib.embed_image(backbone, img, standardize=cfg.standardize)
-            patches = featlib.stack_exemplar_patches(grid, [m])
+                view, view_mask = img[y0:y1, x0:x1], m[y0:y1, x0:x1]
+            else:
+                view, view_mask = img, m
+            if not view_mask.any():
+                continue
+            grid = featlib._standardize_and_norm(
+                self._backbone(self._backbone.preprocess(view))[0], cfg.standardize,
+                self.feature_stats)
+            patches = featlib.stack_exemplar_patches(grid, [view_mask])
             if patches.shape[0]:
                 chunks.append(patches)
         if not chunks:
-            self._centers = self.exemplar_cls.new_zeros((0, self.exemplar_cls.shape[-1]))
-            return
-        self._centers = spherical_kmeans(torch.cat(chunks, dim=0), cfg.ntt_kmeans_k)
+            return self.exemplar_cls.new_zeros((0, self.exemplar_cls.shape[-1]))
+        return spherical_kmeans(torch.cat(chunks, dim=0), cfg.ntt_kmeans_k)
+
+    def _memory_for(self, target_hw) -> torch.Tensor:
+        """The memory to match this crop against — scale-matched when ``ntt_scale_matched``.
+
+        Rebuilding a view per crop would cost an encoder forward per crop, so views are bucketed by
+        octave: the recursion halves a crop rather than nudging it, so a handful of buckets covers a
+        whole image.
+        """
+        if not self.cfg.ntt_scale_matched:
+            return self._centers
+        key = scale_octave(target_hw)
+        mem = self._by_octave.get(key)
+        if mem is None:
+            mem = self._by_octave[key] = self._build_memory(target_hw)
+        return mem
 
     # ------------------------------------------------------------------- segment
     def _segment_points(self, image: np.ndarray, points_xy: np.ndarray) -> np.ndarray:
@@ -278,7 +320,8 @@ class NTTExtractor:
                 "NTTExtractor.extract needs the crop pixels; the cascade must pass image=."
             )
 
-        heat = similarity_heatmap(feat, self._centers)
+        centers = self._memory_for(image.shape[:2])
+        heat = similarity_heatmap(feat, centers)
         score_map = ((heat + 1.0) * 0.5).clamp(0.0, 1.0).cpu().numpy().astype(np.float32)
         pts = grid_points_to_pixels(
             grid_topk_points(heat, cfg.ntt_num_points, cfg.ntt_point_thr),
@@ -289,7 +332,7 @@ class NTTExtractor:
             return ExtractResult([], empty, score_map, {"heat": score_map} if return_internals else {})
 
         grids = np.stack([featlib.resize_mask_to_grid(m, (hp, wp), mode="any") for m in masks])
-        scores = score_masks(feat, torch.from_numpy(grids).to(feat.device), self._centers)
+        scores = score_masks(feat, torch.from_numpy(grids).to(feat.device), centers)
         scores = scores.cpu().numpy()
         areas = masks.reshape(masks.shape[0], -1).sum(axis=1)
         ok = np.where((scores >= cfg.ntt_score_thr) & (areas >= cfg.ntt_min_area))[0]

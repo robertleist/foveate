@@ -78,7 +78,7 @@ class FoveateMethod(Method):
         instances, stats = cascade(
             self.backbone, item.image, item.exemplar_masks, config=self.foveate_config,
             exemplar_image=item.exemplar_image, extractor=self._cached_extractor(item),
-            gt_foreground=gt_foreground, observer=observer,
+            gt_foreground=gt_foreground, concept=item.class_name, observer=observer,
         )
         h, w = item.image.shape[:2]
         if instances:

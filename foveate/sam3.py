@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 from foveate import features as featlib
-from foveate.extract import ExtractResult, build_exemplar_bank
+from foveate.extract import ExtractResult, build_exemplar_bank, scale_matched_view
 
 
 # ---------------------------------------------------------------------------
@@ -93,40 +93,45 @@ class SAM3Extractor:
         self.cfg = cfg
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.exemplar_cls: torch.Tensor | None = None
-        self._exemplar: np.ndarray | None = None          # the exemplar crop pasted on every canvas
-        self._boxes: list[list[int]] = []                 # its prompt boxes, in canvas coords
+        self._ref_image: np.ndarray | None = None         # the reference frame the exemplars live on
+        self._ref_mask: np.ndarray | None = None          # their union on it
+        self._concept: str = "visual"                     # the class name, when the protocol has one
         self.n_segment_calls = 0
         self.processor = Sam3Processor.from_pretrained(cfg.sam3_model)
         self.model = Sam3Model.from_pretrained(cfg.sam3_model).to(self.device).eval()
 
     # ------------------------------------------------------------------ reference
-    def set_reference(self, backbone, ref_image, ref_masks, negative_masks, cfg) -> None:
-        """Cache one exemplar canvas half and its prompt boxes, plus the CLS bank for ``g``.
+    def set_concept(self, name: str | None) -> None:
+        """Set the class name SAM 3 is prompted with alongside the visual exemplars.
 
-        The exemplars are cropped to their joint bounding box so the canvas carries the concept at a
-        comparable scale to the target crop rather than a whole frame around it — the same reason
-        the reference crops are padded by ``pad_frac`` everywhere else.
+        SAM 3 is a *promptable concept* model: it takes a text concept plus visual prompts, and it
+        is measurably weaker on the visual prompts alone. Our protocol always knows the class name,
+        so withholding it would handicap the baseline for no reason.
+        """
+        self._concept = str(name) if name else "visual"
+
+    def set_reference(self, backbone, ref_image, ref_masks, negative_masks, cfg) -> None:
+        """Cache the reference frame and the exemplar union, plus the CLS bank for ``g``.
+
+        The exemplar *view* is not fixed here: it is re-cut per crop to match that crop's pixel
+        extent (see :func:`foveate.extract.scale_matched_view`), because SAM 3 compares the visual
+        prompt against the canvas and a prompt framed at one zoom level does not transfer to
+        another.
         """
         self.exemplar_cls, images, masks = build_exemplar_bank(backbone, ref_image, ref_masks, cfg)
-        # One shared support half: the first reference image, cropped to cover every exemplar on it.
-        img = images[0]
-        on_first = [m for i, m in zip(images, masks) if i is img]
-        union = np.logical_or.reduce(on_first)
-        ys, xs = np.where(union)
-        h, w = union.shape
-        py, px = int((ys.max() - ys.min()) * cfg.pad_frac), int((xs.max() - xs.min()) * cfg.pad_frac)
-        y0, y1 = max(0, int(ys.min()) - py), min(h, int(ys.max()) + 1 + py)
-        x0, x1 = max(0, int(xs.min()) - px), min(w, int(xs.max()) + 1 + px)
-        self._exemplar = np.asarray(img)[y0:y1, x0:x1]
-        self._boxes = masks_to_boxes([m[y0:y1, x0:x1] for m in on_first])
+        img = images[0]                       # one shared support half: the first reference image
+        self._ref_image = np.asarray(img)
+        self._ref_mask = np.logical_or.reduce([m for i, m in zip(images, masks) if i is img])
 
     # ------------------------------------------------------------------- segment
-    def _segment(self, canvas: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """One SAM 3 forward on ``canvas`` with the cached exemplar boxes as positive prompts."""
-        kwargs: dict[str, Any] = {"images": [canvas], "text": "visual", "return_tensors": "pt"}
-        if self._boxes:
-            kwargs["input_boxes"] = [self._boxes]
-            kwargs["input_boxes_labels"] = torch.tensor([[1] * len(self._boxes)], dtype=torch.int64)
+    def _segment(self, canvas: np.ndarray, boxes: list[list[int]]) -> tuple[np.ndarray, np.ndarray]:
+        """One SAM 3 forward on ``canvas``: the class name as the text concept, ``boxes`` as
+        positive visual exemplars."""
+        kwargs: dict[str, Any] = {"images": [canvas], "text": self._concept,
+                                  "return_tensors": "pt"}
+        if boxes:
+            kwargs["input_boxes"] = [boxes]
+            kwargs["input_boxes_labels"] = torch.tensor([[1] * len(boxes)], dtype=torch.int64)
         inputs = self.processor(**kwargs).to(self.device)
         with torch.inference_mode():
             outputs = self.model(**inputs)
@@ -143,15 +148,17 @@ class SAM3Extractor:
                 return_internals=False) -> ExtractResult:
         hp, wp = feat.shape[:2]
         empty = np.zeros((hp, wp), dtype=bool)
-        if self._exemplar is None:
+        if self._ref_image is None:
             raise RuntimeError("SAM3Extractor used before set_reference.")
         if image is None:
             raise RuntimeError(
                 "SAM3Extractor.extract needs the crop pixels; the cascade must pass image=."
             )
 
-        canvas, x_offset = build_concat_canvas(self._exemplar, image)
-        canvas_masks, canvas_scores = self._segment(canvas)
+        # Re-cut the exemplar to this crop's extent so the object fills the same fraction of both.
+        view, view_mask = scale_matched_view(self._ref_image, self._ref_mask, image.shape[:2])
+        canvas, x_offset = build_concat_canvas(view, image)
+        canvas_masks, canvas_scores = self._segment(canvas, masks_to_boxes([view_mask]))
         masks, scores = crop_canvas_masks_to_target(canvas_masks, canvas_scores, x_offset,
                                                     image.shape[:2])
         if masks.shape[0] == 0:

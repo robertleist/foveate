@@ -18,7 +18,21 @@ from typing import Any
 @dataclass
 class Config:
     # --- features ---
-    standardize: bool = True              # z-score feature dims before L2-norm
+    standardize: bool = True              # z-score FEATURE dims before L2-norm. Note this is NOT
+                                          # the ImageNet pixel normalization (that lives in the
+                                          # backbone's preprocess and is always on): it is a second,
+                                          # feature-level z-score, and see standardize_stats for
+                                          # why its statistics matter for a recursive method.
+    standardize_stats: str = "crop"       # where the standardization statistics come from:
+                                          # "crop" (default, the behaviour of record) uses each
+                                          # crop's OWN spatial mean/std — which sharpens cosine
+                                          # contrast within a crop but puts two framings of the same
+                                          # object in different feature spaces, so a prototype,
+                                          # memory bank or threshold calibrated at one zoom level
+                                          # does not transfer to another. "reference" computes the
+                                          # statistics ONCE from the exemplar crop and applies them
+                                          # to every crop, so cross-scale comparisons mean something.
+                                          # Only consulted by extractors that match across scales.
 
     # --- EXTRACT: which instances of the concept are on this crop? (slot 1 of 4, foveate.extract) ---
     extractor: str | None = None          # composite | oracle | sam3 | ntt. None (default) DERIVES
@@ -112,6 +126,14 @@ class Config:
     ntt_containment_thr: float = 0.9     # nested-fragment suppression inside the extractor
     ntt_min_area: int = 4                # drop returned masks smaller than this (pixels)
     ntt_point_batch: int = 128           # point prompts per SAM 2 forward
+    ntt_scale_matched: bool = True       # rebuild the memory from an exemplar view cut to the same
+                                         # pixel extent as the crop being extracted, so the object
+                                         # fills the same fraction of both. NTT is not scale
+                                         # invariant: a memory built at one framing stops matching a
+                                         # crop at another, which is why the un-matched arm answered
+                                         # at the root and returned nothing two levels down. Views
+                                         # are cached per octave, so this costs a handful of encoder
+                                         # forwards per image, not one per crop.
     ntt_min_crop_side: int = 16          # refuse to segment a crop thinner than this (px). The
                                          # recursion can derive a child box a few pixels on a side
                                          # from a sliver of an instance grid; SAM 2 on a 3-px-tall

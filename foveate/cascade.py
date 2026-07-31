@@ -152,6 +152,7 @@ def cascade(
     reid_scorer=None,
     confidence_scorer=None,
     gt_foreground: np.ndarray | None = None,
+    concept: str | None = None,
     observer=None,
 ) -> tuple[list[Instance], Stats]:
     """Discover instances of the exemplar class by recursive, batched zoom-in.
@@ -221,6 +222,12 @@ def cascade(
     # Oracle ablations: hand the target's GT to whichever slot asks for it (transient per-image
     # state, so a cached inter-protocol extractor is simply refreshed each image). Only the oracle
     # Extract / Stop / Merge / Mask implementations expose this hook; no other one sees the GT.
+    # The class name, when the protocol has one. A promptable concept model (SAM 3) is measurably
+    # weaker on visual prompts alone, and our protocol always knows the name — withholding it would
+    # handicap the arm for no reason. Extractors that have no use for it never expose the hook.
+    if hasattr(extractor, "set_concept"):
+        extractor.set_concept(concept)
+
     if gt_foreground is not None:
         for slot in (extractor, stop, merge_rule, upsampler):
             if hasattr(slot, "set_target_instances"):
@@ -311,6 +318,7 @@ def cascade(
         embedded = featlib.embed_batch(
             backbone, [_crop(r.box) for r in frontier],
             chunk=cfg.embed_batch_size, standardize=cfg.standardize,
+            stats=getattr(extractor, 'feature_stats', None),
         )
         stats.n_embeds += len(frontier)
         # g scores the crop's EXTRACTED foreground, so when the scorer needs it (masked modes) run
