@@ -154,17 +154,30 @@ def scale_matched_view(image: np.ndarray, mask: np.ndarray, target_hw: tuple[int
     Returns ``(view, mask_in_view)``. Clipped at the reference's borders, so the match is
     approximate when the crop is larger than the reference image itself.
     """
+    win = scale_matched_window(mask, target_hw)
+    if win is None:
+        return image, np.asarray(mask, dtype=bool)
+    y0, y1, x0, x1 = win
+    return np.asarray(image)[y0:y1, x0:x1], np.asarray(mask, dtype=bool)[y0:y1, x0:x1]
+
+
+def scale_matched_window(mask: np.ndarray, target_hw: tuple[int, int]):
+    """The ``(y0, y1, x0, x1)`` window :func:`scale_matched_view` cuts, or ``None`` for an empty mask.
+
+    Exposed separately so a caller with *several* exemplar masks can slice them all with one window
+    — a promptable segmenter wants one prompt box per exemplar, and collapsing them into a box
+    around their union is a prompt covering mostly background.
+    """
     h, w = int(target_hw[0]), int(target_hw[1])
     m = np.asarray(mask, dtype=bool)
     ys, xs = np.where(m)
     if ys.size == 0:
-        return image, m
+        return None
     H, W = m.shape[:2]
     cy, cx = (int(ys.min()) + int(ys.max())) // 2, (int(xs.min()) + int(xs.max())) // 2
     y0 = int(np.clip(cy - h // 2, 0, max(H - h, 0)))
     x0 = int(np.clip(cx - w // 2, 0, max(W - w, 0)))
-    y1, x1 = min(H, y0 + h), min(W, x0 + w)
-    return np.asarray(image)[y0:y1, x0:x1], m[y0:y1, x0:x1]
+    return y0, min(H, y0 + h), x0, min(W, x0 + w)
 
 
 def scale_octave(target_hw: tuple[int, int]) -> int:

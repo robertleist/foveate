@@ -30,7 +30,11 @@ import numpy as np
 import torch
 
 from foveate import features as featlib
-from foveate.extract import ExtractResult, build_exemplar_bank, scale_matched_view
+from foveate.extract import (
+    ExtractResult,
+    build_exemplar_bank,
+    scale_matched_window,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +98,7 @@ class SAM3Extractor:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.exemplar_cls: torch.Tensor | None = None
         self._ref_image: np.ndarray | None = None         # the reference frame the exemplars live on
-        self._ref_mask: np.ndarray | None = None          # their union on it
+        self._ref_masks: list = []                        # one per exemplar, for one box each
         self._concept: str = "visual"                     # the class name, when the protocol has one
         self.n_segment_calls = 0
         self.processor = Sam3Processor.from_pretrained(cfg.sam3_model)
@@ -120,13 +124,13 @@ class SAM3Extractor:
         """
         self.exemplar_cls, images, masks = build_exemplar_bank(backbone, ref_image, ref_masks, cfg)
         img = images[0]                       # one shared support half: the first reference image
-        self._ref_image = np.asarray(img)
-        self._ref_mask = np.logical_or.reduce([m for i, m in zip(images, masks) if i is img])
-        # The fixed-framing fallback: one padded crop around the exemplars, as before scale matching.
         from foveate.oracle import mask_bbox
 
-        y0, y1, x0, x1 = mask_bbox(self._ref_mask, cfg.pad_frac)
-        self._tight_view = (self._ref_image[y0:y1, x0:x1], self._ref_mask[y0:y1, x0:x1])
+        self._ref_image = np.asarray(img)
+        self._ref_masks = [m for i, m in zip(images, masks) if i is img]
+        union = np.logical_or.reduce(self._ref_masks)
+        # The fixed-framing fallback: one padded crop around the exemplars, as before scale matching.
+        self._tight_window = mask_bbox(union, cfg.pad_frac)
 
     # ------------------------------------------------------------------- segment
     def _segment(self, canvas: np.ndarray, boxes: list[list[int]]) -> tuple[np.ndarray, np.ndarray]:
@@ -163,12 +167,16 @@ class SAM3Extractor:
         # Re-cut the exemplar to this crop's extent so the object fills the same fraction of both.
         # Ablatable: scale matching and the text concept are two separate interventions and have to
         # be attributable separately (measured together, they moved mask AP and box AP opposite ways).
-        if self.cfg.sam3_scale_matched:
-            view, view_mask = scale_matched_view(self._ref_image, self._ref_mask, image.shape[:2])
-        else:
-            view, view_mask = self._tight_view
+        union = np.logical_or.reduce(self._ref_masks)
+        win = (scale_matched_window(union, image.shape[:2]) if self.cfg.sam3_scale_matched
+               else self._tight_window)
+        y0, y1, x0, x1 = win
+        view = self._ref_image[y0:y1, x0:x1]
+        # ONE PROMPT BOX PER EXEMPLAR. A single box around their union spans mostly background when
+        # the exemplars are scattered, which is a materially weaker visual prompt.
+        boxes = masks_to_boxes([m[y0:y1, x0:x1] for m in self._ref_masks])
         canvas, x_offset = build_concat_canvas(view, image)
-        canvas_masks, canvas_scores = self._segment(canvas, masks_to_boxes([view_mask]))
+        canvas_masks, canvas_scores = self._segment(canvas, boxes)
         masks, scores = crop_canvas_masks_to_target(canvas_masks, canvas_scores, x_offset,
                                                     image.shape[:2])
         if masks.shape[0] == 0:
