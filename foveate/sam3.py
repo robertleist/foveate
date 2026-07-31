@@ -108,7 +108,7 @@ class SAM3Extractor:
         is measurably weaker on the visual prompts alone. Our protocol always knows the class name,
         so withholding it would handicap the baseline for no reason.
         """
-        self._concept = str(name) if name else "visual"
+        self._concept = str(name) if (name and self.cfg.sam3_use_concept) else "visual"
 
     def set_reference(self, backbone, ref_image, ref_masks, negative_masks, cfg) -> None:
         """Cache the reference frame and the exemplar union, plus the CLS bank for ``g``.
@@ -122,6 +122,11 @@ class SAM3Extractor:
         img = images[0]                       # one shared support half: the first reference image
         self._ref_image = np.asarray(img)
         self._ref_mask = np.logical_or.reduce([m for i, m in zip(images, masks) if i is img])
+        # The fixed-framing fallback: one padded crop around the exemplars, as before scale matching.
+        from foveate.oracle import mask_bbox
+
+        y0, y1, x0, x1 = mask_bbox(self._ref_mask, cfg.pad_frac)
+        self._tight_view = (self._ref_image[y0:y1, x0:x1], self._ref_mask[y0:y1, x0:x1])
 
     # ------------------------------------------------------------------- segment
     def _segment(self, canvas: np.ndarray, boxes: list[list[int]]) -> tuple[np.ndarray, np.ndarray]:
@@ -156,7 +161,12 @@ class SAM3Extractor:
             )
 
         # Re-cut the exemplar to this crop's extent so the object fills the same fraction of both.
-        view, view_mask = scale_matched_view(self._ref_image, self._ref_mask, image.shape[:2])
+        # Ablatable: scale matching and the text concept are two separate interventions and have to
+        # be attributable separately (measured together, they moved mask AP and box AP opposite ways).
+        if self.cfg.sam3_scale_matched:
+            view, view_mask = scale_matched_view(self._ref_image, self._ref_mask, image.shape[:2])
+        else:
+            view, view_mask = self._tight_view
         canvas, x_offset = build_concat_canvas(view, image)
         canvas_masks, canvas_scores = self._segment(canvas, masks_to_boxes([view_mask]))
         masks, scores = crop_canvas_masks_to_target(canvas_masks, canvas_scores, x_offset,
