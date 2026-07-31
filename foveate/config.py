@@ -105,6 +105,12 @@ class Config:
                                          # sit low; 0.3 is the HF-calibrated value and 0.5 finds
                                          # almost nothing
     sam3_mask_threshold: float = 0.5     # binarizes each kept instance's mask
+    sam3_top_k_exemplars: int = 0        # per crop, paste only the K exemplars whose CLS is most
+                                         # similar to it (0 = all, the behaviour of record). Mirrors
+                                         # insid3_top_k_exemplars / otsu_top_k. Pasting the whole
+                                         # bank on every canvas at every level grows the canvas and
+                                         # can give SAM 3 contradictory visual evidence when the
+                                         # exemplars span several poses or scales.
     sam3_use_concept: bool = True        # prompt with the class NAME as the text concept alongside
                                          # the visual exemplars. SAM 3 is a promptable *concept*
                                          # model and is weaker on visual prompts alone, and the

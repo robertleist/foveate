@@ -35,6 +35,7 @@ from foveate.extract import (
     build_exemplar_bank,
     scale_matched_window,
 )
+from foveate.oracle import mask_bbox
 
 
 # ---------------------------------------------------------------------------
@@ -124,13 +125,23 @@ class SAM3Extractor:
         """
         self.exemplar_cls, images, masks = build_exemplar_bank(backbone, ref_image, ref_masks, cfg)
         img = images[0]                       # one shared support half: the first reference image
-        from foveate.oracle import mask_bbox
-
         self._ref_image = np.asarray(img)
         self._ref_masks = [m for i, m in zip(images, masks) if i is img]
-        union = np.logical_or.reduce(self._ref_masks)
-        # The fixed-framing fallback: one padded crop around the exemplars, as before scale matching.
-        self._tight_window = mask_bbox(union, cfg.pad_frac)
+
+    def _select_exemplars(self, cls) -> list:
+        """The ``sam3_top_k_exemplars`` exemplars most similar to this crop (all of them if 0).
+
+        Every exemplar was being pasted onto every canvas, at every level. That is wasteful — the
+        canvas grows with the number of prompts — and it is not obviously better: a bank spanning
+        several poses or scales gives SAM 3 contradictory visual evidence for a crop that matches
+        only one of them. Selecting per crop by CLS cosine mirrors what the INSID3 and Otsu Where
+        stages already do (``insid3_top_k_exemplars``, ``otsu_top_k``).
+        """
+        k = int(self.cfg.sam3_top_k_exemplars)
+        if k <= 0 or k >= len(self._ref_masks) or cls is None or self.exemplar_cls is None:
+            return list(self._ref_masks)
+        sims = (self.exemplar_cls @ cls.to(self.exemplar_cls.device).float()).detach().cpu().numpy()
+        return [self._ref_masks[i] for i in np.argsort(-sims)[:k]]
 
     # ------------------------------------------------------------------- segment
     def _segment(self, canvas: np.ndarray, boxes: list[list[int]]) -> tuple[np.ndarray, np.ndarray]:
@@ -167,14 +178,15 @@ class SAM3Extractor:
         # Re-cut the exemplar to this crop's extent so the object fills the same fraction of both.
         # Ablatable: scale matching and the text concept are two separate interventions and have to
         # be attributable separately (measured together, they moved mask AP and box AP opposite ways).
-        union = np.logical_or.reduce(self._ref_masks)
+        chosen = self._select_exemplars(cls)
+        union = np.logical_or.reduce(chosen)
         win = (scale_matched_window(union, image.shape[:2]) if self.cfg.sam3_scale_matched
-               else self._tight_window)
+               else mask_bbox(union, self.cfg.pad_frac))
         y0, y1, x0, x1 = win
         view = self._ref_image[y0:y1, x0:x1]
         # ONE PROMPT BOX PER EXEMPLAR. A single box around their union spans mostly background when
         # the exemplars are scattered, which is a materially weaker visual prompt.
-        boxes = masks_to_boxes([m[y0:y1, x0:x1] for m in self._ref_masks])
+        boxes = masks_to_boxes([m[y0:y1, x0:x1] for m in chosen])
         canvas, x_offset = build_concat_canvas(view, image)
         canvas_masks, canvas_scores = self._segment(canvas, boxes)
         masks, scores = crop_canvas_masks_to_target(canvas_masks, canvas_scores, x_offset,
