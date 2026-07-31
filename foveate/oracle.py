@@ -31,13 +31,17 @@ def cfg_mode(cfg) -> str:
     return str(getattr(cfg, "oracle_coverage", "any"))
 
 
-def _mask_bbox(mask: np.ndarray, pad_frac: float) -> tuple[int, int, int, int]:
+def mask_bbox(mask: np.ndarray, pad_frac: float) -> tuple[int, int, int, int]:
     """Padded bbox of a binary mask (patch-scale framing shared with the cascade's crops)."""
     ys, xs = np.where(mask)
     h, w = mask.shape
     y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
     py, px = int((y1 - y0) * pad_frac), int((x1 - x0) * pad_frac)
     return max(0, y0 - py), min(h, y1 + py), max(0, x0 - px), min(w, x1 + px)
+
+
+#: Pre-rename alias (this used to be private to this module).
+_mask_bbox = mask_bbox
 
 
 class OracleExtractor:
@@ -68,7 +72,7 @@ class OracleExtractor:
         Only the CLS tokens are needed (the foreground is oracled, so no foreground prototypes are
         built). ``negative_masks`` is accepted for interface parity and ignored."""
         images, valid = normalize_reference(ref_image, ref_masks)
-        boxes = [_mask_bbox(m, cfg.pad_frac) for m in valid]
+        boxes = [mask_bbox(m, cfg.pad_frac) for m in valid]
         crops = [img[y0:y1, x0:x1] for img, (y0, y1, x0, x1) in zip(images, boxes)]
         embedded = featlib.embed_batch(backbone, crops, chunk=8, standardize=cfg.standardize)
         cls_stack = torch.stack([cls for _, cls in embedded])

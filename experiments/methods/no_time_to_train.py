@@ -58,150 +58,19 @@ from foveate import features as featlib
 
 
 # ---------------------------------------------------------------------------
-# Pure matching logic (no model needed — unit-tested in isolation)
+# Pure matching logic — now owned by :mod:`foveate.ntt`, which is also the Extract-slot arm.
+# Re-exported here so the single-pass baseline and the foveated arm are provably the same
+# algorithm rather than two implementations that drift.
 # ---------------------------------------------------------------------------
-def spherical_kmeans(feats: torch.Tensor, k: int, *, n_iter: int = 25, seed: int = 0) -> torch.Tensor:
-    """Cosine (spherical) k-means over ``feats`` ``(M, D)`` → ``(k', D)`` L2-normalized centers.
-
-    ``feats`` are assumed L2-normalized (patch features from :func:`foveate.features.embed_image`),
-    so a dot product is cosine similarity. ``k`` is clamped to ``M`` (can't have more centers than
-    points); empty clusters keep their previous center rather than collapsing to zero. Mirrors the
-    upstream ``kmeans`` (argmax-cosine assignment, mean-then-renormalize update).
-    """
-    m, d = feats.shape
-    k = int(min(k, m))
-    if k <= 0:
-        return feats.new_zeros((0, d))
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    init = torch.randperm(m, generator=g)[:k].to(feats.device)
-    centers = F.normalize(feats[init], p=2, dim=-1)
-    for _ in range(n_iter):
-        assign = (feats @ centers.t()).argmax(dim=1)          # [M] nearest center per patch
-        new = centers.clone()
-        for j in range(k):
-            sel = feats[assign == j]
-            if sel.shape[0] > 0:
-                new[j] = sel.mean(dim=0)
-        centers = F.normalize(new, p=2, dim=-1)
-    return centers
-
-
-def build_memory(
-    ref_grid: torch.Tensor, exemplar_masks: list[np.ndarray], *, kmeans_k: int
-) -> torch.Tensor:
-    """Reduce the reference foreground patches to ``kmeans_k`` cluster centers.
-
-    ``ref_grid`` is the ``(Hp, Wp, D)`` L2-normalized patch grid of the reference image; each mask
-    in ``exemplar_masks`` is a full-resolution boolean mask on that image. Returns ``(k', D)``
-    normalized centers (``k' == 0`` if no mask covers any patch — the caller then predicts nothing).
-    """
-    patches = featlib.stack_exemplar_patches(ref_grid, exemplar_masks)   # (M, D), normalized
-    if patches.shape[0] == 0:
-        return ref_grid.new_zeros((0, ref_grid.shape[-1]))
-    return spherical_kmeans(patches, kmeans_k)
-
-
-def similarity_heatmap(tar_grid: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
-    """Per-patch max cosine similarity of the target grid to the memory centers → ``(Hp, Wp)``.
-
-    Both inputs are L2-normalized, so ``tar @ centers.T`` is cosine similarity in ``[-1, 1]``; we
-    take the max over centers (best-matching modal sub-part) per patch. Empty memory → all ``-1``.
-    """
-    hp, wp, d = tar_grid.shape
-    if centers.shape[0] == 0:
-        return tar_grid.new_full((hp, wp), -1.0)
-    sim = tar_grid.reshape(-1, d) @ centers.t()          # (Hp*Wp, k)
-    return sim.max(dim=1).values.reshape(hp, wp)
-
-
-def grid_topk_points(heat: torch.Tensor, num_points: int, thr: float) -> np.ndarray:
-    """Top-``num_points`` grid cells of ``heat`` with similarity ``>= thr`` → ``(N, 2)`` ``[row, col]``.
-
-    Fewer than ``num_points`` rows come back if the threshold prunes them (``N`` may be 0). Ordered
-    by descending similarity so downstream suppression sees the strongest matches first.
-    """
-    hp, wp = heat.shape
-    flat = heat.reshape(-1)
-    n = int(min(num_points, flat.numel()))
-    vals, idx = torch.topk(flat, k=n)
-    keep = vals >= thr
-    idx = idx[keep]
-    rows = (idx // wp).cpu().numpy()
-    cols = (idx % wp).cpu().numpy()
-    return np.stack([rows, cols], axis=1).astype(np.int64) if idx.numel() else np.zeros((0, 2), np.int64)
-
-
-def grid_points_to_pixels(
-    rc: np.ndarray, grid_hw: tuple[int, int], img_hw: tuple[int, int]
-) -> np.ndarray:
-    """Map ``[row, col]`` patch-grid cells to ``[x, y]`` pixel coordinates at each cell center.
-
-    ``grid_hw`` is ``(Hp, Wp)``; ``img_hw`` is the target image ``(H, W)``. A patch cell ``(r, c)``
-    maps to the pixel at its center: ``x = (c + 0.5) / Wp * W``, ``y = (r + 0.5) / Hp * H``.
-    """
-    hp, wp = grid_hw
-    h, w = img_hw
-    if rc.shape[0] == 0:
-        return np.zeros((0, 2), dtype=np.float32)
-    xs = (rc[:, 1].astype(np.float32) + 0.5) / wp * w
-    ys = (rc[:, 0].astype(np.float32) + 0.5) / hp * h
-    return np.stack([xs, ys], axis=1).astype(np.float32)
-
-
-def score_masks(
-    tar_grid: torch.Tensor, mask_grids: torch.Tensor, centers: torch.Tensor
-) -> torch.Tensor:
-    """Semantic score in ``[0, 1]`` for each candidate mask against the memory centers.
-
-    ``mask_grids`` is ``(N, Hp, Wp)`` boolean (candidate masks resized to the patch grid). Each
-    mask's score is the mean over its foreground patches of the max center cosine similarity,
-    mapped from ``[-1, 1]`` to ``[0, 1]``. A mask with no foreground patch scores 0.
-    """
-    n = mask_grids.shape[0]
-    if n == 0 or centers.shape[0] == 0:
-        return tar_grid.new_zeros((n,))
-    hp, wp, d = tar_grid.shape
-    patch_sim = (tar_grid.reshape(-1, d) @ centers.t()).max(dim=1).values  # (Hp*Wp,) in [-1,1]
-    flat_masks = mask_grids.reshape(n, -1).to(patch_sim.dtype)             # (N, Hp*Wp)
-    counts = flat_masks.sum(dim=1)
-    summed = flat_masks @ patch_sim                                        # (N,)
-    mean_sim = torch.where(counts > 0, summed / counts.clamp(min=1), counts.new_full((n,), -1.0))
-    return ((mean_sim + 1.0) * 0.5).clamp(0.0, 1.0)
-
-
-def suppress_masks(
-    masks: np.ndarray, scores: np.ndarray, *, iou_thr: float, containment_thr: float
-) -> np.ndarray:
-    """Greedy score-ranked suppression of duplicate/nested masks → indices to keep (desc. score).
-
-    Walking masks from highest score down, a candidate is dropped if, against any already-kept
-    mask, its IoU exceeds ``iou_thr`` (near-duplicate) or its intersection-over-self exceeds
-    ``containment_thr`` (it is mostly contained inside a stronger mask — a fragment/part). Pure
-    geometry, vectorized over pixels; ``masks`` is ``(N, H, W)`` bool.
-    """
-    n = masks.shape[0]
-    if n == 0:
-        return np.zeros((0,), dtype=np.int64)
-    flat = masks.reshape(n, -1).astype(np.float32)
-    areas = flat.sum(axis=1)                          # (N,)
-    inter = flat @ flat.T                             # (N, N) pairwise intersection
-    order = np.argsort(-scores)                       # strongest first
-    kept: list[int] = []
-    for i in order:
-        if areas[i] <= 0:
-            continue
-        drop = False
-        for j in kept:
-            ai, aj, ij = areas[i], areas[j], inter[i, j]
-            iou = ij / (ai + aj - ij + 1e-6)
-            containment = ij / (ai + 1e-6)            # fraction of i inside the kept mask j
-            if iou > iou_thr or containment > containment_thr:
-                drop = True
-                break
-        if not drop:
-            kept.append(int(i))
-    return np.asarray(kept, dtype=np.int64)
-
+from foveate.ntt import (  # noqa: E402
+    build_memory,
+    grid_points_to_pixels,
+    grid_topk_points,
+    score_masks,
+    similarity_heatmap,
+    spherical_kmeans,
+    suppress_masks,
+)
 
 # ---------------------------------------------------------------------------
 # Method

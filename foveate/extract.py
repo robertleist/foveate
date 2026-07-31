@@ -73,6 +73,13 @@ class ExtractResult:
     foreground: np.ndarray
     score_map: np.ndarray
     internals: dict = field(default_factory=dict)
+    #: Optional crop-local **pixel** masks, parallel to :attr:`instances`. A monolithic segmenter
+    #: (SAM, NTT) produces masks at pixel resolution; the patch grid above is what the *recursion*
+    #: needs (child boxes, the fixed point, the foreground for ``g``), but re-quantizing a
+    #: pixel-perfect mask onto a 48x48 grid and upsampling it again on emit would throw away the
+    #: one thing a segmenter is good at. When set, the cascade emits these directly and the Mask
+    #: slot is bypassed. ``None`` for grid-native extractors, which is most of them.
+    masks: list[np.ndarray] | None = None
 
 
 @runtime_checkable
@@ -102,12 +109,34 @@ class Extractor(Protocol):
 
     def extract(
         self, feat: torch.Tensor, *, cls: torch.Tensor | None = None,
-        box: tuple[int, int, int, int] | None = None, return_internals: bool = False,
+        box: tuple[int, int, int, int] | None = None, image: np.ndarray | None = None,
+        return_internals: bool = False,
     ) -> ExtractResult:
         """``feat`` is the crop's ``(Hp, Wp, D)`` patch grid, ``cls`` its CLS token, ``box`` its
         ``(y0, y1, x0, x1)`` in original-image coordinates (needed by extractors that consult
-        something defined on the whole image, i.e. the oracle)."""
+        something defined on the whole image, i.e. the oracle), and ``image`` the crop's **pixels**
+        — which an image-based segmenter needs and a feature-based extractor ignores."""
         ...
+
+
+def build_exemplar_bank(backbone, ref_image, ref_masks, cfg):
+    """The ``(S, D)`` L2-normalized per-exemplar CLS stack, plus the normalized ``(images, masks)``.
+
+    Every extractor must expose this: the re-identification score ``g`` is independent of the Extract
+    slot and has to be computed identically across arms, or a headroom comparison is measuring two
+    things at once. Shared here so a monolithic extractor gets it without re-deriving the framing —
+    the exemplar crops are padded by ``pad_frac`` exactly like the cascade's crops, because a CLS
+    comparison must be apples to apples.
+    """
+    from foveate.foreground import normalize_reference
+    from foveate.oracle import mask_bbox
+
+    images, masks = normalize_reference(ref_image, ref_masks)
+    boxes = [mask_bbox(m, cfg.pad_frac) for m in masks]
+    crops = [img[y0:y1, x0:x1] for img, (y0, y1, x0, x1) in zip(images, boxes)]
+    embedded = featlib.embed_batch(backbone, crops, chunk=8, standardize=cfg.standardize)
+    cls_stack = torch.stack([c for _, c in embedded])
+    return featlib.l2_normalize(cls_stack, dim=1).to(embedded[0][0].device), images, masks
 
 
 def component_label_map(comps: list[np.ndarray], shape) -> np.ndarray:
@@ -149,7 +178,8 @@ class CompositeExtractor:
         if hasattr(self.where, "set_target_foreground"):
             self.where.set_target_foreground(gt)
 
-    def extract(self, feat, *, cls=None, box=None, return_internals=False) -> ExtractResult:
+    def extract(self, feat, *, cls=None, box=None, image=None,
+                return_internals=False) -> ExtractResult:
         gr = self.where.predict(feat, cls=cls, box=box, return_internals=return_internals)
         return ExtractResult(
             instances=self.grouping.group(feat, gr.foreground, box=box),
@@ -204,7 +234,8 @@ class OracleExtractor:
         """
         self._where.set_target_foreground(gt)
 
-    def extract(self, feat, *, cls=None, box=None, return_internals=False) -> ExtractResult:
+    def extract(self, feat, *, cls=None, box=None, image=None,
+                return_internals=False) -> ExtractResult:
         gr = self._where.predict(feat, cls=cls, box=box, return_internals=return_internals)
         instances = self._by_instance(gr.foreground, box)
         if return_internals:
@@ -247,10 +278,25 @@ class OracleExtractor:
         return out or [region]
 
 
-#: ``cfg.extractor`` → implementation.
+def _sam3_extractor(cfg):
+    from foveate.sam3 import SAM3Extractor          # deferred: pulls transformers' SAM 3
+
+    return SAM3Extractor(cfg)
+
+
+def _ntt_extractor(cfg):
+    from foveate.ntt import NTTExtractor            # deferred: pulls transformers' SAM 2
+
+    return NTTExtractor(cfg)
+
+
+#: ``cfg.extractor`` → implementation. The segmenter arms are built lazily so selecting one
+#: strategy never pulls the others' heavy dependencies (the same rule the Where registry follows).
 _EXTRACTORS = {
     "composite": CompositeExtractor,
     "oracle": OracleExtractor,
+    "sam3": _sam3_extractor,
+    "ntt": _ntt_extractor,
 }
 
 

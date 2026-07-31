@@ -81,6 +81,9 @@ class _Parent:
     box: tuple[int, int, int, int]
     depth: int
     instances: list
+    # Native crop-local pixel masks parallel to ``instances``, when the extractor produced
+    # them (a segmenter arm); ``None`` falls back to upsampling the grid (ExtractResult.masks).
+    masks: list | None = None
     # The parent's own observer event, held back until its children's fate is known: a zoom/split
     # region is only labelled ``zoom``/``split`` if a child improved on it, else ``reid-stop``. So
     # the observer sees each region once, with its FINAL decision (the trajectory tooling rebuilds
@@ -239,7 +242,7 @@ def cascade(
         confidence_scorer = build_reid_scorer(cfg, backbone, ref_image, exemplar_masks,
                                               mode=cfg.confidence_reid_mode)
 
-    def emit(region, comp_grid, score, feat=None):
+    def emit(region, comp_grid, score, feat=None, mask=None):
         y0, y1, x0, x1 = region.box
         comp_grid = np.asarray(comp_grid, dtype=bool)
         # Score this instance on its own foreground patches (masked confidence) rather than letting
@@ -247,7 +250,11 @@ def cascade(
         # (Hp, Wp) matches ``comp_grid`` exactly, so the mask indexes straight into it.
         if confidence_scorer is not None and feat is not None and comp_grid.any():
             score = confidence_scorer.score(feat, None, comp_grid)
-        mask_local = upsampler.upsample(comp_grid, region.box)
+        # A segmenter arm already produced this instance at pixel resolution; re-quantizing it
+        # onto the patch grid and upsampling it back is exactly the loss the two-slot contract
+        # exists to avoid, so the Mask slot is bypassed when a native mask is available.
+        mask_local = (np.asarray(mask, dtype=np.uint8) if mask is not None
+                      else upsampler.upsample(comp_grid, region.box))
         if int(mask_local.sum()) < cfg.cascade_min_instance_area:
             stats.discarded += 1
             return
@@ -281,20 +288,28 @@ def cascade(
             stats.discarded += 1
             return
         pr = _Region(parent.box, parent.depth)
+        pmasks = parent.masks or [None] * len(parent.instances)
         if cfg.emit_components:
             shape = parent.instances[0].shape
             scores = _component_scores(parent.instances, parent.reid, shape)
-            for c, score in zip(parent.instances, scores):
-                emit(pr, c, score, feat=parent.feat)
+            for c, score, pm in zip(parent.instances, scores, pmasks):
+                emit(pr, c, score, feat=parent.feat, mask=pm)
         else:
-            emit(pr, np.logical_or.reduce(parent.instances), parent.reid, feat=parent.feat)
+            union = (np.logical_or.reduce(pmasks)
+                     if all(m is not None for m in pmasks) else None)
+            emit(pr, np.logical_or.reduce(parent.instances), parent.reid,
+                 feat=parent.feat, mask=union)
+
+    def _crop(box):
+        y0, y1, x0, x1 = box
+        return image[y0:y1, x0:x1]
 
     frontier = [_Region((0, H, 0, W), 0)]
     level_idx = 0
     while frontier and stats.n_embeds < cfg.max_total_embeds:
         stats.level_sizes.append(len(frontier))
         embedded = featlib.embed_batch(
-            backbone, [image[r.box[0]:r.box[1], r.box[2]:r.box[3]] for r in frontier],
+            backbone, [_crop(r.box) for r in frontier],
             chunk=cfg.embed_batch_size, standardize=cfg.standardize,
         )
         stats.n_embeds += len(frontier)
@@ -305,6 +320,7 @@ def cascade(
         results: list = [None] * len(frontier)
         if reid_scorer.needs_foreground:
             results = [extractor.extract(feat, cls=cls, box=frontier[i].box,
+                                         image=_crop(frontier[i].box),
                                          return_internals=observer is not None)
                        for i, (feat, cls) in enumerate(embedded)]
         reid_scores = [reid_scorer.score(feat, cls, results[i].foreground if results[i] else None)
@@ -363,21 +379,31 @@ def cascade(
             stats.max_depth = max(stats.max_depth, r.depth)
 
             res = results[i] if results[i] is not None else extractor.extract(
-                feat, cls=cls, box=r.box, return_internals=observer is not None)
+                feat, cls=cls, box=r.box, image=_crop(r.box),
+                return_internals=observer is not None)
             fg = res.foreground
             instances = res.instances                     # Extract: the candidates on this crop
+            pmasks = res.masks or [None] * len(instances)
             n = len(instances)
 
             floor = (r.box[1] - r.box[0]) <= cfg.min_crop or (r.box[3] - r.box[2]) <= cfg.min_crop
             decision, children = "empty", []
             child_instances: list = []                    # the instance grids behind the children
+            child_masks: list = []                        # their native pixel masks, if any
 
             if n == 0:
-                pass
+                # The extractor says there is nothing here — but its parent said there was, and this
+                # crop exists only because of that proposal. Falling back to the seed keeps the
+                # instance instead of losing it to a disagreement between two scales. A composite
+                # extractor almost never returns empty, so this never mattered before; a segmenter
+                # legitimately does, and without the fallback every such branch dies silently.
+                if cfg.emit_empty_seed and r.seed is not None:
+                    emit(_Region(r.parent.box, r.parent.depth), r.seed, reid_score,
+                         feat=r.parent.feat)
             elif floor:                                   # SIZE floor (px) — the termination invariant
                 decision = "leaf-cap"
-                for c in instances:
-                    emit(r, c, reid_score, feat=feat)
+                for c, pm in zip(instances, pmasks):
+                    emit(r, c, reid_score, feat=feat, mask=pm)
             else:
                 # An instance whose padded bbox clips back to THIS crop's box makes no geometric
                 # progress: re-enqueuing it re-embeds the identical crop, extracts the identical
@@ -400,18 +426,20 @@ def cascade(
                         stats.discarded += 1
                     else:
                         decision = "leaf"
-                        emit(r, instances[0], reid_score, feat=feat)
+                        emit(r, instances[0], reid_score, feat=feat, mask=pmasks[0])
                 elif not tight:                           # several instances, none tightenable
                     decision = "leaf-cap"
-                    for c in instances:
-                        emit(r, c, reid_score, feat=feat)
+                    for c, pm in zip(instances, pmasks):
+                        emit(r, c, reid_score, feat=feat, mask=pm)
                 else:
-                    for c, b in zip(instances, boxes_all):
+                    keep = [j for j, b in enumerate(boxes_all) if b != r.box]
+                    for j, (c, b, pm) in enumerate(zip(instances, boxes_all, pmasks)):
                         if b == r.box:                    # this one is stuck, its siblings are not
-                            emit(r, c, reid_score, feat=feat)
+                            emit(r, c, reid_score, feat=feat, mask=pm)
                     decision = "zoom" if len(tight) == 1 else "split"
-                    child_instances = [c for c, _ in tight]
-                    children = [b for _, b in tight]
+                    child_instances = [instances[j] for j in keep]
+                    child_masks = [pmasks[j] for j in keep]
+                    children = [boxes_all[j] for j in keep]
 
             if decision == "leaf-cap":
                 instance_grids = instances
@@ -435,7 +463,9 @@ def cascade(
                 # Defer this region's event: it becomes ``reid-stop`` if no child beats it (decided
                 # next level, in the group loop above), so it is fired there with the final label.
                 par = _Parent(reid=reid_score, box=r.box, depth=r.depth,
-                              instances=child_instances, event=ev, feat=feat)
+                              instances=child_instances, event=ev, feat=feat,
+                              masks=(child_masks if any(m is not None for m in child_masks)
+                                     else None))
                 nxt += [_Region(cb, r.depth + 1, parent=par, seed=ci)
                         for cb, ci in zip(children, child_instances)]
             elif observer is not None:                    # terminal (leaf / discard / cap / empty)

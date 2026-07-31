@@ -20,8 +20,9 @@ class Config:
     # --- features ---
     standardize: bool = True              # z-score feature dims before L2-norm
 
-    # --- EXTRACT: which instances of the concept are on this crop? (slot 1 of 3, foveate.extract) ---
-    extractor: str | None = None          # composite | oracle. None (default) DERIVES it from the
+    # --- EXTRACT: which instances of the concept are on this crop? (slot 1 of 4, foveate.extract) ---
+    extractor: str | None = None          # composite | oracle | sam3 | ntt. None (default) DERIVES
+                                          # it from the
                                           # pre-two-slot key pair below, so every existing YAML keeps
                                           # working: "oracle" when the DECOMPOSITION was oracular
                                           # (instance_extractor: oracle, or foreground_extractor:
@@ -80,6 +81,41 @@ class Config:
                                           # controlled, geometric waist) | cc (never cut).
     extract_connectivity: int = 8         # 4 | 8 pixel/patch connectivity for the CC on the
                                           # foreground grid (8 = don't over-split single instances)
+
+    # --- EXTRACT / monolithic segmenter arms (foveate.sam3, foveate.ntt) ---
+    # These answer "which instances are here" in one step, with no per-patch foreground in between,
+    # and they return masks at PIXEL resolution (ExtractResult.masks) so the Mask slot is bypassed.
+    # Each costs one segmenter forward per visited crop — report n_segment_calls next to n_embeds.
+    sam3_model: str = "facebook/sam3"
+    sam3_threshold: float = 0.3          # SAM 3 scores are sigmoid(class)*sigmoid(presence), so they
+                                         # sit low; 0.3 is the HF-calibrated value and 0.5 finds
+                                         # almost nothing
+    sam3_mask_threshold: float = 0.5     # binarizes each kept instance's mask
+    sam2_model: str = "facebook/sam2-hiera-large"   # the promptable segmenter NTT prompts
+    ntt_crop_reference: bool = True      # build the memory from a PADDED CROP around each exemplar
+                                         # rather than the whole reference frame (mirrors
+                                         # insid3_crop_reference). Not a detail: `standardize`
+                                         # z-scores a patch grid over its OWN crop, so a memory
+                                         # built on a full frame does not match a tight child crop —
+                                         # measured, the root proposed 5 instances and every child
+                                         # proposed none. Cropping also gives the exemplar many
+                                         # patches instead of one, so ntt_kmeans_k stops collapsing.
+    ntt_kmeans_k: int = 8                # memory centers over the exemplar patches (one per modal
+                                         # visual sub-part; k=1 is the plain-mean special case)
+    ntt_num_points: int = 32             # top-k matched patches turned into point prompts PER CROP.
+                                         # Lower than the single-pass baseline's 100 on purpose: a
+                                         # crop holds fewer objects than a full frame, which is the
+                                         # whole point of foveating it.
+    ntt_point_thr: float = 0.5           # min cosine to the memory for a patch to become a prompt
+    ntt_score_thr: float = 0.5           # min semantic score to keep a returned mask
+    ntt_iou_thr: float = 0.8             # duplicate suppression inside the extractor
+    ntt_containment_thr: float = 0.9     # nested-fragment suppression inside the extractor
+    ntt_min_area: int = 4                # drop returned masks smaller than this (pixels)
+    ntt_point_batch: int = 128           # point prompts per SAM 2 forward
+    ntt_min_crop_side: int = 16          # refuse to segment a crop thinner than this (px). The
+                                         # recursion can derive a child box a few pixels on a side
+                                         # from a sliver of an instance grid; SAM 2 on a 3-px-tall
+                                         # image means nothing and returns its axes swapped.
 
     # --- INSID3 foreground extractor (official algorithm; paper Sec. 3, Tab. 1) ---
     insid3_tau_fg: float = 0.6            # tau_fg: INSID3 foreground-granularity threshold (paper
@@ -331,6 +367,14 @@ class Config:
     # --- leaf classification / acceptance ---
     # crop_sim_floor (above, recursion bounds) is the sole acceptance test: mean cosine of the
     # target CLS to all exemplar CLS must clear it for a converged crop to be kept.
+    emit_empty_seed: bool = False        # when a surviving child extracts NOTHING, emit the
+                                         # instance its parent proposed (the seed) instead of losing
+                                         # it. The crop exists only because of that proposal, so a
+                                         # disagreement between two scales should not delete the
+                                         # instance. Off by default because it changes every recorded
+                                         # number; REQUIRED for the segmenter arms (foveate.sam3,
+                                         # foveate.ntt), which legitimately return an empty answer,
+                                         # unlike a composite extractor.
     discard_rejected: bool = False       # drop (vs keep) converged crops that fail acceptance
     emit_components: bool = False         # when a parent is emitted (reid-stop fallback), split its
                                          # OR-merged foreground into connected components and emit
