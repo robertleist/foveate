@@ -110,10 +110,15 @@ class Config:
                                          # model and is weaker on visual prompts alone, and the
                                          # protocol always knows the name. Ablatable because it is a
                                          # separate intervention from sam3_scale_matched below.
-    sam3_scale_matched: bool = True      # re-cut the exemplar half of the canvas to the crop's
+    sam3_scale_matched: bool = False     # re-cut the exemplar half of the canvas to the crop's
                                          # pixel extent each level (vs one fixed padded crop).
-                                         # Ablatable because it and the text concept are two
-                                         # separate interventions.
+                                         # OFF by measurement: it hurts SAM 3 on both concept
+                                         # settings (AP 0.335 -> 0.140 and 0.202 -> 0.156) at 2-5x
+                                         # the compute. The opposite of NTT, where it is the
+                                         # difference between AP 0.000 and 0.219 — SAM 3 has its own
+                                         # detector and a larger exemplar view mostly makes it
+                                         # propose more, while NTT matches patch features and a
+                                         # scale-mismatched memory silently returns nothing.
     sam2_model: str = "facebook/sam2-hiera-large"   # the promptable segmenter NTT prompts
     ntt_crop_reference: bool = True      # build the memory from a PADDED CROP around each exemplar
                                          # rather than the whole reference frame (mirrors
