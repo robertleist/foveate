@@ -114,6 +114,89 @@ class MissBreakdown:
         return "\n".join(out)
 
 
+@dataclass
+class PredBreakdown:
+    """Per-*prediction* outcome — the mirror of :class:`MissBreakdown`, pooled over images.
+
+    The miss breakdown answers "which objects did we lose?". With an oracle Extract and an oracle
+    Stop that number is already small, and what limits AP is the opposite question: **what are all
+    the masks we emit that are not true positives?** Precision, not recall.
+
+    ``matched``
+        Claimed a GT instance at IoU >= 0.5 under the same greedy score-ranked matching AP uses.
+    ``duplicate``
+        Would have matched at IoU >= 0.5, but a higher-scoring detection already claimed that
+        instance. A second, redundant detection of an object we already found — the Merge slot's
+        job, and the one an overlap rule can miss when the two masks barely overlap each other.
+    ``partial``
+        Best IoU with any instance is in ``(0, 0.5)``: it lands *on* an object but not well enough
+        to count — a fragment, a straddler covering two neighbours, or an over-zoomed piece. No
+        suppression rule can repair these; only a union or a better emission point can.
+    ``background``
+        Overlaps no instance at all. With an oracle extractor this should be ~0; anything else
+        means masks are being emitted from regions the ground truth calls empty.
+    """
+
+    n_pred: int = 0
+    matched: int = 0
+    duplicate: int = 0
+    partial: int = 0
+    background: int = 0
+
+    def merge(self, other: "PredBreakdown") -> "PredBreakdown":
+        for f in ("n_pred", "matched", "duplicate", "partial", "background"):
+            setattr(self, f, getattr(self, f) + getattr(other, f))
+        return self
+
+    def to_metrics(self, prefix: str = "") -> dict[str, float]:
+        p = f"{prefix}_" if prefix else ""
+        n = max(self.n_pred, 1)
+        return {f"{p}fp_n_pred": float(self.n_pred),
+                f"{p}fp_matched_frac": self.matched / n,
+                f"{p}fp_duplicate_frac": self.duplicate / n,
+                f"{p}fp_partial_frac": self.partial / n,
+                f"{p}fp_background_frac": self.background / n}
+
+    def report(self) -> str:
+        n = max(self.n_pred, 1)
+        rows = [("matched a GT instance", self.matched), ("duplicate of one", self.duplicate),
+                ("partial (0 < IoU < 0.5)", self.partial), ("background (IoU 0)", self.background)]
+        out = [f"prediction breakdown — {self.n_pred} detections",
+               f"  precision {self.matched / n:.1%}"]
+        for name, v in rows:
+            out.append(f"  {name:<24s} {v:5d}  {v / n:6.1%}")
+        return "\n".join(out)
+
+
+def classify_predictions(gt_masks, pred_masks, scores, *, iou_match: float = 0.5) -> PredBreakdown:
+    """Classify every prediction into matched / duplicate / partial / background.
+
+    Matching is greedy in descending score order against unclaimed GT, which is exactly what
+    :func:`experiments.eval._match` does, so ``matched`` is the TP count AP50 sees.
+    """
+    gt = [np.asarray(m, dtype=bool) for m in gt_masks]
+    pred = [np.asarray(m, dtype=bool) for m in pred_masks]
+    out = PredBreakdown(n_pred=len(pred))
+    taken = [False] * len(gt)
+
+    for i in np.argsort(-np.asarray(scores, dtype=np.float64)) if len(pred) else []:
+        ious = [_iou(pred[i], g) for g in gt]
+        best = float(max(ious)) if ious else 0.0
+        if best <= 0.0:
+            out.background += 1
+            continue
+        free = [j for j, t in enumerate(taken) if not t and ious[j] >= iou_match]
+        if free:
+            j = max(free, key=lambda j: ious[j])
+            taken[j] = True
+            out.matched += 1
+        elif best >= iou_match:
+            out.duplicate += 1                      # good enough, but the instance is already taken
+        else:
+            out.partial += 1
+    return out
+
+
 def classify_misses(
     gt_masks, pre_masks, post_masks, visited_boxes, *,
     iou_match: float = 0.5, frame_iou: float = 0.5, contain_frac: float = 0.9,
@@ -153,8 +236,13 @@ def classify_misses(
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
-def run(config: dict, limit: int = 8, target: str = "intra") -> MissBreakdown:
-    """Run the configured method with Merge off, re-apply it, and classify every GT instance."""
+def run(config: dict, limit: int = 8, target: str = "intra"
+        ) -> tuple[MissBreakdown, PredBreakdown]:
+    """Run with Merge off, re-apply it, and classify every GT instance AND every prediction.
+
+    Both breakdowns come from the same forward pass, so the recall side (what did we lose?) and the
+    precision side (what did we emit that is not a true positive?) describe one run.
+    """
     import copy
 
     from data import DataConfig
@@ -172,6 +260,10 @@ def run(config: dict, limit: int = 8, target: str = "intra") -> MissBreakdown:
     merge_rule = build_merge_rule(Config.from_dict(fov))
     fov["merge_rule"] = "none"                      # disable inside the cascade; re-applied below,
                                                     # so both sets come from ONE forward pass
+    # A Merge rule reasons about the CROP a mask was found in — ``merge_drop_clipped`` asks whether
+    # the mask reaches that crop's border. Ask the method for crop boxes so the rule sees what it
+    # would see inside the cascade; nothing here scores boxes, so this cannot affect the breakdown.
+    fov["report_boxes"] = "crop"
 
     method = build_method(cfg)
     intra, inter = build_datasets(DataConfig.from_dict(cfg["data"]))
@@ -183,23 +275,27 @@ def run(config: dict, limit: int = 8, target: str = "intra") -> MissBreakdown:
         items = iter_intra_items(intra, max_exemplars=cfg.get("eval", {}).get("max_exemplars", 5),
                                  limit=limit)
 
-    total = MissBreakdown()
+    total, preds = MissBreakdown(), PredBreakdown()
     for item in items:
         trace: list[dict] = []
         pred = method.predict(item, observer=lambda ev: trace.append(
             {k: v for k, v in ev.items() if k in ("box", "decision")}))
         pre = pred.masks.astype(bool)
-        # Rebuild the (y0, y1, x0, x1) box the Merge rule expects from the mask itself:
-        # ``pred.boxes`` is the detection box in (x0, y0, x1, y1) order, and feeding that in would
-        # silently break the rule's cheap box pre-filter.
-        leaves = [Instance(m.astype(np.uint8), _mask_box(m) or (0, 0, 0, 0), 0, float(s))
-                  for m, s in zip(pre, pred.scores)]
+        # ``pred.boxes`` is (x0, y0, x1, y1); Instance.box is (y0, y1, x0, x1). Transpose rather
+        # than substituting the mask's own tight box — a mask always touches its tight box, so the
+        # clipped-fragment rule would delete every detection.
+        boxes = pred.boxes if pred.boxes is not None else np.zeros((pre.shape[0], 4))
+        leaves = [Instance(m.astype(np.uint8),
+                           (int(b[1]), int(b[3]), int(b[0]), int(b[2])), 0, float(s))
+                  for m, b, s in zip(pre, boxes, pred.scores)]
         kept, _, _ = merge_rule.merge(leaves)
         post = np.stack([i.mask.astype(bool) for i in kept]) if kept else np.zeros((0, *pre.shape[1:]), bool)
 
         visited = [ev["box"] for ev in trace if ev.get("box") is not None]
         total.merge(classify_misses(item.gt_masks, pre, post, visited))
-    return total
+        preds.merge(classify_predictions(item.gt_masks, post,
+                                         [i.score for i in kept]))
+    return total, preds
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -222,7 +318,10 @@ def main(argv: list[str] | None = None) -> None:
             node = node.setdefault(p, {})
         node[parts[-1]] = yaml.safe_load(raw)
 
-    print(run(config, limit=args.limit, target=args.target).report())
+    misses, preds = run(config, limit=args.limit, target=args.target)
+    print(misses.report())
+    print()
+    print(preds.report())
 
 
 if __name__ == "__main__":

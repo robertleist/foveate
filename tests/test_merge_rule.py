@@ -151,3 +151,89 @@ def test_every_merge_rule_drives_the_cascade(backbone, two_squares, name):
                                              cascade_min_instance_area=4))
     assert stats.n_embeds > 0
     assert all(inst.mask.shape == img.shape[:2] for inst in instances)
+
+
+# --------------------------------------------------------------------------- oracle
+def test_oracle_merge_keeps_one_best_detection_per_instance():
+    """The ceiling of any merge rule: duplicates, fragments and background masks all go."""
+    from foveate.merge_rule import OracleMerge
+
+    H = W = 40
+    labels = np.zeros((H, W), np.int32)
+    labels[2:18, 2:18] = 1
+    labels[22:38, 22:38] = 2
+
+    exact1 = labels == 1
+    loose1 = np.zeros((H, W), bool); loose1[0:20, 0:20] = True    # same object, worse IoU
+    exact2 = labels == 2
+    bg = np.zeros((H, W), bool); bg[0:3, 36:40] = True            # touches no instance
+
+    rule = build_merge_rule(Config(merge_rule="oracle"))
+    assert isinstance(rule, OracleMerge)
+    rule.set_target_instances(labels)
+    kept, _, suppressed = rule.merge(
+        [_inst(loose1, 0.9), _inst(exact1, 0.2), _inst(exact2, 0.5), _inst(bg, 0.99)])
+
+    assert suppressed == 2                                        # the loose duplicate and the bg one
+    sums = {int(k.mask.sum()) for k in kept}
+    assert sums == {int(exact1.sum()), int(exact2.sum())}         # best per instance, score ignored
+
+
+def test_oracle_merge_without_gt_is_an_error_not_silent_nonsense():
+    rule = build_merge_rule(Config(merge_rule="oracle"))
+    a = np.zeros((8, 8), bool); a[1:4, 1:4] = True
+    with pytest.raises(RuntimeError, match="set_target_instances"):
+        rule.merge([_inst(a, 0.5)])
+
+
+def test_oracle_merge_drives_the_cascade(backbone, two_squares):
+    img, ex = two_squares
+    labels = np.zeros(img.shape[:2], dtype=np.int32)
+    labels[20:40, 20:40] = 1
+    labels[80:100, 80:100] = 2
+    instances, stats = cascade(backbone, img, ex, gt_foreground=labels,
+                               config=Config(merge_rule="oracle", min_crop=24,
+                                             cascade_min_instance_area=4))
+    assert stats.n_embeds > 0
+    assert len(instances) <= 2                                    # at most one per GT instance
+
+
+# --------------------------------------------------------------------------- clipped fragments
+def _crop_inst(mask, box, score):
+    """An Instance carrying the CROP box it was found in (not its own tight box)."""
+    return Instance(mask.astype(np.uint8), box, 0, score)
+
+
+def test_clipped_detection_is_recognised_by_its_crop_border():
+    from foveate.merge_rule import is_clipped
+
+    H = W = 40
+    whole = np.zeros((H, W), bool); whole[12:18, 12:18] = True     # interior to the crop
+    piece = np.zeros((H, W), bool); piece[10:18, 12:18] = True     # reaches the crop's top edge
+    crop = (10, 30, 10, 30)
+    assert not is_clipped(_crop_inst(whole, crop, 0.9))
+    assert is_clipped(_crop_inst(piece, crop, 0.9))
+
+
+def test_an_image_border_is_not_a_clip():
+    """A crop edge that IS an image edge is where the object genuinely ends."""
+    from foveate.merge_rule import is_clipped
+
+    H = W = 40
+    at_edge = np.zeros((H, W), bool); at_edge[0:8, 12:18] = True
+    assert not is_clipped(_crop_inst(at_edge, (0, 30, 10, 30), 0.9))   # top edge == image edge
+    assert is_clipped(_crop_inst(at_edge, (0, 30, 10, 18), 0.9))       # ...but the right edge is not
+
+
+def test_drop_clipped_runs_before_suppression_and_is_counted():
+    H = W = 40
+    whole = np.zeros((H, W), bool); whole[20:26, 12:18] = True      # interior to the crop
+    piece = np.zeros((H, W), bool); piece[10:14, 12:18] = True      # reaches the crop's top edge
+    crop = (10, 30, 10, 30)                                         # disjoint, so NMS never fires
+    given = [_crop_inst(whole, crop, 0.9), _crop_inst(piece, crop, 0.8)]
+
+    off, merged_off, _ = build_merge_rule(Config()).merge(given)
+    on, merged_on, _ = build_merge_rule(Config(merge_drop_clipped=True)).merge(given)
+    assert len(off) == 2 and merged_off == 0
+    assert len(on) == 1 and merged_on == 1
+    assert int(on[0].mask.sum()) == int(whole.sum())

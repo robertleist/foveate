@@ -22,6 +22,12 @@ Rules (``cfg.merge_rule``):
     Soft suppression: an overlapping detection has its score *decayed* rather than deleted, and is
     dropped only when the score falls below a floor. Keeps the second-best detection of a crowded
     region alive, which is where hard NMS costs recall.
+``oracle``
+    The upper bound on *this slot*: keep the single best-matching detection per ground-truth
+    instance and drop everything else. Not a usable rule — it is the ceiling every real rule is
+    measured against, and the slot needs one for the same reason Extract and Stop do. Without it
+    "all slots oracular" is two slots out of three, and the emission-side error has nowhere to show
+    up except as an unexplained AP deficit.
 ``none``
     No deduplication. The diagnostic arm — also what :mod:`experiments.miss_diagnostics` needs to
     obtain the pre-merge leaves from the same forward pass as the post-merge ones.
@@ -74,6 +80,40 @@ def touches_border(mask: np.ndarray, box) -> bool:
     if sub.size == 0:
         return False
     return bool(sub[0].any() or sub[-1].any() or sub[:, 0].any() or sub[:, -1].any())
+
+
+def is_clipped(inst: Instance) -> bool:
+    """Is this detection provably only part of its object — cut off by its own crop border?
+
+    A mask reaching the edge of the crop it was found in continues outside that crop, so what was
+    emitted is a piece. The exception is a crop edge that *is* an image edge: there the object
+    genuinely ends, and the mask is whole.
+    """
+    y0, y1, x0, x1 = inst.box
+    h, w = inst.mask.shape[:2]
+    sub = np.asarray(inst.mask[y0:y1, x0:x1], dtype=bool)
+    if sub.size == 0:
+        return False
+    return bool((y0 > 0 and sub[0].any()) or (y1 < h and sub[-1].any())
+                or (x0 > 0 and sub[:, 0].any()) or (x1 < w and sub[:, -1].any()))
+
+
+def drop_clipped(instances: list[Instance]) -> tuple[list[Instance], int]:
+    """Remove detections cut off by their own crop border.
+
+    A recursive segmenter emits from many overlapping crops, so a crop framed for object A also
+    holds a slice of neighbour B, and the extractor correctly reports B — the part of it that is in
+    frame. That slice is emitted as an instance even though B is framed properly by its own branch,
+    and it lands at IoU well below 0.5 with B. Suppression cannot see the problem: the slice barely
+    overlaps B's real detection, so no IoU or containment test relates them.
+
+    The signal is provenance, not overlap: the mask touches its crop border, so it is *known* to be
+    partial before anything is compared. Measured on the all-oracle runs, these fragments are ~44 %
+    of all detections on the dense slice and ~32 % on general, at a median 0.21 of their object's
+    area — the dominant false positive once Extract and Stop are perfect.
+    """
+    kept = [inst for inst in instances if not is_clipped(inst)]
+    return kept, len(instances) - len(kept)
 
 
 def merge_fragments(instances: list[Instance], gap: int) -> tuple[list[Instance], int]:
@@ -251,9 +291,19 @@ class _FragmentMerging:
         self.cfg = cfg
 
     def _fragments(self, instances):
+        """The pre-suppression stage: drop provably-partial detections, then union what is left.
+
+        Both steps address the same failure — one object split across crops — and neither is
+        reachable by suppression. Dropping comes first because a piece that is *known* partial
+        should not be a candidate for anything, including a union.
+        """
+        n_dropped = 0
+        if self.cfg.merge_drop_clipped:
+            instances, n_dropped = drop_clipped(instances)
         if not self.cfg.merge_fragments:
-            return instances, 0
-        return merge_fragments(instances, self.cfg.merge_fragment_gap)
+            return instances, n_dropped
+        instances, n_merged = merge_fragments(instances, self.cfg.merge_fragment_gap)
+        return instances, n_dropped + n_merged
 
 
 class NmsMerge(_FragmentMerging):
@@ -281,10 +331,55 @@ class SoftMerge(_FragmentMerging):
         return kept, n_merged, n_suppressed
 
 
+class OracleMerge(_FragmentMerging):
+    """``oracle`` — one detection per ground-truth instance; the ceiling of any merge rule.
+
+    Assigns every emitted leaf to the GT instance it overlaps most and keeps, per instance, the
+    single detection with the highest IoU. Everything else goes: duplicates of an object found down
+    several branches, fragments, and detections that land on no object at all.
+
+    What the comparison isolates: recall is untouched (a GT that had a matching detection still has
+    its best one), so a ``nms`` → ``oracle`` gap is **entirely precision** — the surplus masks the
+    recursion emits and no overlap-based rule removes. A small gap would say the emission side is
+    already near its limit and the remaining error is in Extract or Stop.
+
+    The GT is injected per image by the cascade (``cascade(..., gt_foreground=...)``, the same
+    payload the other oracle slots consume) via :meth:`set_target_instances`.
+    """
+
+    def __init__(self, cfg) -> None:
+        super().__init__(cfg)
+        self._labels: np.ndarray | None = None
+
+    def set_target_instances(self, gt: np.ndarray) -> None:
+        self._labels = np.asarray(gt).astype(np.int32)
+
+    def merge(self, instances):
+        instances, n_merged = self._fragments(instances)
+        if self._labels is None:
+            raise RuntimeError(
+                "OracleMerge used before set_target_instances — the cascade must receive "
+                "gt_foreground for the oracle Merge slot."
+            )
+        gt_masks = [self._labels == i for i in range(1, int(self._labels.max()) + 1)]
+        best: dict[int, tuple[float, int]] = {}                  # gt index → (IoU, detection index)
+        for i, inst in enumerate(instances):
+            m = inst.mask.astype(bool)
+            ious = [mask_overlap(m, g)[0] for g in gt_masks]
+            if not ious or max(ious) <= 0.0:
+                continue                                         # touches no object → never kept
+            j = int(np.argmax(ious))
+            if j not in best or ious[j] > best[j][0]:
+                best[j] = (ious[j], i)
+        kept = sorted(idx for _, idx in best.values())
+        return [instances[i] for i in kept], n_merged, len(instances) - len(kept)
+
+
 #: ``cfg.merge_rule`` → implementation.
 _MERGE_RULES = {
     "nms": NmsMerge,
     "soft": SoftMerge,
+    "oracle": OracleMerge,
     "none": NoMerge,
 }
 
