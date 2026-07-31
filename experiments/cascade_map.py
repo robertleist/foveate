@@ -88,16 +88,25 @@ def run(config: dict, limit: int, out: Path, target: str = "intra") -> list[Path
     import copy
 
     from data import DataConfig
-    from experiments.datasets import build_datasets, iter_intra_items
+    from experiments.datasets import (
+        build_datasets,
+        build_support_index,
+        iter_inter_items,
+        iter_intra_items,
+    )
     from experiments.methods import build_method
 
     cfg = copy.deepcopy(config)
     cfg.pop("sweep", None)
     cfg["mlflow"] = {"enabled": False}
     method = build_method(cfg)
-    intra, _ = build_datasets(DataConfig.from_dict(cfg["data"]))
-    items = iter_intra_items(intra, max_exemplars=cfg.get("eval", {}).get("max_exemplars", 5),
-                             limit=limit)
+    intra, inter = build_datasets(DataConfig.from_dict(cfg["data"]))
+    max_ex = cfg.get("eval", {}).get("max_exemplars", 5)
+    # Some venues are cross-image by construction (``known_ratio: 0`` leaves no intra prompts), so
+    # the map has to follow whichever protocol the config is written for.
+    items = (iter_inter_items(inter, build_support_index(intra), max_exemplars=max_ex, limit=limit)
+             if target == "inter"
+             else iter_intra_items(intra, max_exemplars=max_ex, limit=limit))
 
     name = str(cfg.get("foveate", {}).get("extractor")
                or cfg.get("foveate", {}).get("foreground_extractor", "composite"))
@@ -108,7 +117,7 @@ def run(config: dict, limit: int, out: Path, target: str = "intra") -> list[Path
             {k: v for k, v in ev.items() if k in ("box", "decision", "depth")}))
         written.append(save_cascade_map(
             item.image, trace, item.gt_masks, pred.masks,
-            out / f"{item.image_id}_{name}.png",
+            out / f"{cfg['data'].get('label', 'data')}_{item.image_id}_{name}.png",
             title=f"{name} — image {item.image_id} — {pred.n_embeds} encoder passes",
         ))
         print(f"[map] {written[-1]}")
@@ -122,6 +131,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--config", required=True, type=Path)
     ap.add_argument("--limit", type=int, default=2)
     ap.add_argument("--out", type=Path, default=Path("runs/maps"))
+    ap.add_argument("--target", default="intra", choices=("intra", "inter"))
     ap.add_argument("--set", dest="overrides", action="append", default=[])
     args = ap.parse_args(argv)
 
@@ -133,7 +143,7 @@ def main(argv: list[str] | None = None) -> None:
         for p in parts[:-1]:
             node = node.setdefault(p, {})
         node[parts[-1]] = yaml.safe_load(raw)
-    run(config, args.limit, args.out)
+    run(config, args.limit, args.out, args.target)
 
 
 if __name__ == "__main__":
