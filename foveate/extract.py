@@ -1,9 +1,13 @@
-"""EXTRACT — propose the instances of the concept on this crop (slot 1 of 3).
+"""EXTRACT — propose the instances of the concept on this crop (slot 1).
 
-The cascade is three swappable slots (see :mod:`foveate.cascade`):
+The cascade's swappable slots (see :mod:`foveate.cascade`):
 
 * **Extract** (*this module*) — which instances of the concept are on this crop?
 * **Stop** (:mod:`foveate.stop`) — descend, emit or reject?
+* **Leaf** (*this module*, ``cfg.leaf_extractor``) — the same interface, run **only on terminal
+  crops**: the descent needs a region and a stop signal, not a decomposition, so the expensive
+  extractor is asked once per leaf rather than once per visited crop. See
+  :func:`build_leaf_extractor`.
 * **Merge** (:mod:`foveate.merge_rule`) — combine everything the recursion emitted.
 
 One question, one call::
@@ -379,3 +383,36 @@ def build_extractor(cfg) -> Extractor:
         raise ValueError(
             f"Unknown extractor {name!r}; expected one of {sorted(_EXTRACTORS)}."
         ) from None
+
+
+def leaf_config(cfg):
+    """``cfg`` as the LEAF extractor sees it: ``leaf_*`` overrides folded into the real keys.
+
+    The leaf slot is the same Extract interface with a different budget, so it is configured by the
+    same keys — ``leaf_where`` / ``leaf_grouping`` simply name what the composite's two halves become
+    when it runs at a leaf. Unset ones inherit the descent's, so ``leaf_extractor: oracle`` alone is
+    a complete specification.
+    """
+    from dataclasses import replace
+
+    return replace(
+        cfg,
+        extractor=str(cfg.leaf_extractor),
+        foreground_extractor=(cfg.leaf_where or cfg.foreground_extractor),
+        instance_extractor=(cfg.leaf_grouping or cfg.instance_extractor),
+    )
+
+
+def build_leaf_extractor(cfg) -> "Extractor | None":
+    """The Extract slot the cascade runs **only at the leaves**, or ``None`` when unset.
+
+    ``cfg.leaf_extractor`` splits the one question the cascade used to ask everywhere into the two
+    it actually has: the descent needs a *region* (cheap — Where + connected components, plus the
+    re-id peak guard to know when to stop), and only the terminal crop needs an *instance
+    decomposition* (expensive — a segmenter, or an expensive grouping). See
+    :attr:`foveate.config.Config.leaf_extractor` for why a segmenter belongs at the leaves and
+    nowhere else.
+    """
+    if not getattr(cfg, "leaf_extractor", None):
+        return None
+    return build_extractor(leaf_config(cfg))

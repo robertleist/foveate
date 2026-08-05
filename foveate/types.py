@@ -54,6 +54,9 @@ class Stats:
     """Cost + structure accounting for one :func:`cascade` call."""
 
     n_embeds: int = 0
+    n_leaf_calls: int = 0          # LEAF Extract slot invocations (cfg.leaf_extractor). The whole
+                                   # point of that slot is that this is O(leaves), not O(crops
+                                   # visited) — report it next to n_embeds whenever it is non-zero.
     max_depth: int = 0
     leaves: int = 0                                        # instances emitted (before NMS)
     discarded: int = 0

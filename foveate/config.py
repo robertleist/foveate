@@ -45,6 +45,61 @@ class Config:
                                           # stays a composite with a perfect Where, so the
                                           # Where-headroom ablation keeps its meaning.
 
+    # --- EXTRACT at the LEAVES ONLY: the expensive question, asked once per emitted region ---
+    leaf_extractor: str | None = None     # composite | oracle | sam3 | ntt. None (default) = the
+                                          # descent extractor's own instances are what gets emitted
+                                          # (the behaviour of record). When SET, the cascade runs a
+                                          # SECOND Extract slot on every terminal crop and emits ITS
+                                          # instances instead.
+                                          #
+                                          # WHY: the descent only needs to answer two cheap
+                                          # questions — *where* is the concept (a region, which CC
+                                          # turns into child crops) and *is this still more than one
+                                          # thing* (the re-id peak guard, Eq. 2). Neither needs an
+                                          # instance decomposition, and asking a segmenter for one at
+                                          # every visited crop is both expensive and actively wrong
+                                          # for the models worth plugging in: SAM 3 and NTT predict
+                                          # INSTANCES, not similarity regions, so they never propose
+                                          # to foveate onto a hard-to-decipher area — only onto what
+                                          # they can already segment, which is exactly the region a
+                                          # zoom would have helped least. Confining them to the
+                                          # leaves restores the division of labour: DINO CLS
+                                          # similarity decides WHERE to look and WHEN to stop, the
+                                          # segmenter decides WHAT is there, once, on the best crop
+                                          # the recursion could produce. Cost drops from
+                                          # O(visited crops) to O(leaves) (see Stats.n_leaf_calls),
+                                          # and the leaf crop is the framing the segmenter is
+                                          # strongest on.
+                                          #
+                                          # The leaf crop's patch grid is reused, so a FEATURE-based
+                                          # leaf extractor costs no extra backbone forward. An empty
+                                          # leaf answer falls back to the descent's own instances,
+                                          # so foveating a segmenter can only add detail, never
+                                          # delete a region the recursion committed to.
+    leaf_where: str | None = None         # the leaf composite's Where half; None = inherit
+                                          # foreground_extractor (the descent's). Set it to run a
+                                          # cheap Where during the descent and an expensive one at
+                                          # the leaves.
+    leaf_grouping: str | None = None      # the leaf composite's grouping half; None = inherit
+                                          # instance_extractor. The natural pairing for the
+                                          # WHERE x STOP x EXTRACT algorithm is
+                                          # instance_extractor: cc (descent proposes REGIONS, never
+                                          # cuts) + a leaf grouping that does the individuation.
+                                          #
+                                          # DO NOT use "kmeans" here. Measured on corals (real Where
+                                          # + real Merge): AP 0.792 with NO leaf pass -> 0.102 with
+                                          # a kmeans leaf, count error 0.4 -> 4.4. The reason is
+                                          # structural, not a threshold: k=2 KMeans ALWAYS cuts, and
+                                          # a leaf's component fills its crop BY DEFINITION (that is
+                                          # why the descent stopped there), so every single leaf is
+                                          # split in two. During the descent that was safe — the
+                                          # peak guard (foveate.stop.survivors) refused to confirm a
+                                          # split whose best child did not beat its parent — but a
+                                          # leaf has no children and nothing confirms it. Use a
+                                          # grouping that can DECIDE an instance count of one
+                                          # (watershed | agglomerative | cc), or a segmenter
+                                          # (leaf_extractor: sam3 | ntt).
+
     # --- EXTRACT / composite: the Where half — which patches are the concept? ---
     foreground_extractor: str = "insid3"  # insid3 | otsu | bank | oracle | oracle_cc (alias key:
                                           # `where`). Only consulted by the composite extractor.
@@ -409,6 +464,20 @@ class Config:
     # --- leaf classification / acceptance ---
     # crop_sim_floor (above, recursion bounds) is the sole acceptance test: mean cosine of the
     # target CLS to all exemplar CLS must clear it for a converged crop to be kept.
+    emit_every_level: bool = False       # emit what a crop found even when it descends, instead of
+                                         # only at the terminals, and let the Merge slot deduplicate.
+                                         # WHY IT MATTERS: the root crop IS the base extractor run
+                                         # once on the whole image, so with a strong extractor the
+                                         # cascade starts from that answer — and the peak guard then
+                                         # DISCARDS it the moment any child survives, replacing it
+                                         # with whatever the children found from less context.
+                                         # Measured on NTT that costs about two thirds of its
+                                         # accuracy. Emitting at every level makes foveation
+                                         # monotone: it can only ADD detections to the base
+                                         # extractor's output, never remove them, so
+                                         # ``foveate(E) >= E`` holds by construction rather than by
+                                         # hope. Costs a larger emitted set, so the Merge slot does
+                                         # more work and its choice matters more.
     emit_empty_seed: bool = False        # when a surviving child extracts NOTHING, emit the
                                          # instance its parent proposed (the seed) instead of losing
                                          # it. The crop exists only because of that proposal, so a

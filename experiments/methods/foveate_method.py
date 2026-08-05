@@ -21,7 +21,12 @@ from experiments.methods.base import (
     register_method,
 )
 from foveate import Config, cascade
-from foveate.extract import build_extractor, resolve_extractor_name
+from foveate.extract import (
+    build_extractor,
+    build_leaf_extractor,
+    leaf_config,
+    resolve_extractor_name,
+)
 
 
 @register_method("foveate")
@@ -37,6 +42,7 @@ class FoveateMethod(Method):
         # Cross-image (inter) reuses one exemplar bank for every target of a class; cache the
         # Extract slot (whose set_reference embeds every exemplar crop) so that cost is paid once.
         self._ref_cache: dict = {}
+        self._leaf_cache: dict = {}
 
     def _cached_extractor(self, item: EvalItem):
         """Return a reference-set Extract slot for ``item``, or ``None`` to build it per-image.
@@ -45,15 +51,24 @@ class FoveateMethod(Method):
         live on a shared support image. Intra exemplars live on the (per-image) target itself, so
         there is nothing to cache and we let the cascade build the reference as before.
         """
+        return self._cached_slot(item, self._ref_cache, build_extractor)
+
+    def _cached_leaf_extractor(self, item: EvalItem):
+        """The same caching for the LEAF Extract slot; ``None`` when ``leaf_extractor`` is unset."""
+        if not self.foveate_config.leaf_extractor:
+            return None
+        return self._cached_slot(item, self._leaf_cache, build_leaf_extractor)
+
+    def _cached_slot(self, item: EvalItem, cache: dict, build):
         if item.exemplar_image is None:
             return None                                 # intra: exemplars are image-specific
         key = (id(item.exemplar_image), item.class_id)
-        ext = self._ref_cache.get(key)
+        ext = cache.get(key)
         if ext is None:
-            ext = build_extractor(self.foveate_config)
+            ext = build(self.foveate_config)
             ext.set_reference(self.backbone, item.exemplar_image, item.exemplar_masks,
                               None, self.foveate_config)
-            self._ref_cache[key] = ext
+            cache[key] = ext
         return ext
 
     def predict(
@@ -65,11 +80,16 @@ class FoveateMethod(Method):
         # the oracle *Stop* rule (box<->instance isolation in place of g). For every other slot
         # combination it stays None so the discovery is honest.
         cfg = self.foveate_config
+        leaf_cfg = leaf_config(cfg) if cfg.leaf_extractor else None
         oracle = (resolve_extractor_name(cfg) == "oracle"
                   or cfg.foreground_extractor in ("oracle", "oracle_cc")
                   or cfg.stop_rule == "oracle"
                   or cfg.merge_rule == "oracle"
-                  or cfg.mask_upsample == "oracle")
+                  or cfg.mask_upsample == "oracle"
+                  # ...and the same two questions asked of the LEAF slot's own resolved config.
+                  or (leaf_cfg is not None
+                      and (resolve_extractor_name(leaf_cfg) == "oracle"
+                           or leaf_cfg.foreground_extractor in ("oracle", "oracle_cc"))))
         gt_foreground = None
         if oracle and len(item.gt_masks):
             gt_foreground = np.zeros(item.image.shape[:2], dtype=np.int32)
@@ -78,6 +98,7 @@ class FoveateMethod(Method):
         instances, stats = cascade(
             self.backbone, item.image, item.exemplar_masks, config=self.foveate_config,
             exemplar_image=item.exemplar_image, extractor=self._cached_extractor(item),
+            leaf_extractor=self._cached_leaf_extractor(item),
             gt_foreground=gt_foreground, concept=item.class_name, observer=observer,
         )
         h, w = item.image.shape[:2]
@@ -101,7 +122,8 @@ class FoveateMethod(Method):
             masks = np.zeros((0, h, w), dtype=bool)
             scores = np.zeros((0,), dtype=np.float64)
             boxes = np.zeros((0, 4), dtype=np.float64)
-        return MethodPrediction(masks=masks, scores=scores, n_embeds=stats.n_embeds, boxes=boxes)
+        return MethodPrediction(masks=masks, scores=scores, n_embeds=stats.n_embeds, boxes=boxes,
+                                n_leaf_calls=stats.n_leaf_calls)
 
     def param_blocks(self) -> dict[str, dict[str, Any]]:
         # Log the *resolved* foveate Config (defaults included), matching the pre-abstraction

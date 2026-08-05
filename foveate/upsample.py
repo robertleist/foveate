@@ -47,11 +47,16 @@ _Box = tuple[int, int, int, int]
 class MaskUpsampler(Protocol):
     """Strategy interface for the Mask stage."""
 
-    def upsample(self, grid: np.ndarray, box: _Box) -> np.ndarray:
+    def upsample(self, grid: np.ndarray, box: _Box, mask=None) -> np.ndarray:
         """A ``(Hp, Wp)`` bool instance grid over crop ``box`` → a ``uint8`` mask of the crop's size.
 
         ``box`` is ``(y0, y1, x0, x1)`` in original-image coordinates; the returned mask is
         crop-local, which is what the cascade pastes into the full-image mask.
+
+        ``mask`` is the extractor's own crop-local **pixel** mask when it produced one (a segmenter
+        arm). The real rules hand it straight back — there is nothing a grid upsample can add to a
+        mask that was already made at pixel resolution — but the slot still sees it, so an oracle can
+        bound this stage even for an extractor that bypasses the interpolation.
         """
         ...
 
@@ -62,7 +67,9 @@ class NearestUpsampler:
     def __init__(self, cfg) -> None:
         self.cfg = cfg
 
-    def upsample(self, grid: np.ndarray, box: _Box) -> np.ndarray:
+    def upsample(self, grid: np.ndarray, box: _Box, mask=None) -> np.ndarray:
+        if mask is not None:
+            return np.asarray(mask, dtype=np.uint8)
         y0, y1, x0, x1 = box
         return featlib.upsample_mask(grid, (x1 - x0, y1 - y0), bilinear=False)
 
@@ -70,7 +77,9 @@ class NearestUpsampler:
 class BilinearUpsampler(NearestUpsampler):
     """``bilinear`` — resize as float, re-binarise at 0.5. A smoothing prior, not image evidence."""
 
-    def upsample(self, grid: np.ndarray, box: _Box) -> np.ndarray:
+    def upsample(self, grid: np.ndarray, box: _Box, mask=None) -> np.ndarray:
+        if mask is not None:
+            return np.asarray(mask, dtype=np.uint8)
         y0, y1, x0, x1 = box
         return featlib.upsample_mask(grid, (x1 - x0, y1 - y0), bilinear=True)
 
@@ -97,8 +106,8 @@ class OracleUpsampler(NearestUpsampler):
     def set_target_instances(self, gt: np.ndarray) -> None:
         self._labels = np.asarray(gt).astype(np.int32)
 
-    def upsample(self, grid: np.ndarray, box: _Box) -> np.ndarray:
-        base = self._base.upsample(grid, box)
+    def upsample(self, grid: np.ndarray, box: _Box, mask=None) -> np.ndarray:
+        base = self._base.upsample(grid, box, mask)
         if self._labels is None:
             raise RuntimeError(
                 "OracleUpsampler used before set_target_instances — the cascade must receive "

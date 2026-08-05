@@ -1,0 +1,175 @@
+# KNOB COST — what does each stage of WHERE x STOP x EXTRACT actually cost us?
+#
+#   python -m experiments.ablations --config configs/ablation/knob_cost_corals.yaml \
+#       --out runs/knob_cost/corals.csv
+#
+# The algorithm this measures (the Where x Stop x Extract factorization):
+#
+#   WHERE    where is the concept? -> a region, split by connected components into child crops.
+#            CHEAP: one Where call per crop, no individuation. `grouping: cc` on purpose — the
+#            descent proposes REGIONS and never cuts one, because a cut it makes is a decision the
+#            zoom has not earned yet.
+#   STOP     is this still more than one thing? CHEAP: the CLS re-identification score g. Descend
+#            while g rises; when it peaks, this crop is the object.
+#   EXTRACT  once the zoom has bottomed out, what is actually in this crop? EXPENSIVE, and paid
+#            once per LEAF (`leaf_extractor`), not once per visited crop.
+#
+# Why the table is 1 + K rows and not a grid: with every slot at its oracle, the run is the ceiling
+# this decomposition can reach, and knocking out ONE knob attributes the drop to that knob and
+# nothing else. A cross-product would confound them. Read each row as "AP lost by making this one
+# stage real", and the cost columns (`mean_embeds`, `mean_leaf_calls`, `median_runtime_s`) as what
+# the stage costs to run.
+#
+# Venue: the HIFMB corals dataset — the OUT-OF-DOMAIN venue. One class ("Coral Fragment"), many
+# touching instances of near-identical appearance on a cluttered reef, i.e. exactly the case where a
+# similarity region says "coral is here" and cannot say how many. LVIS says whether the knob costs
+# generalise; corals says whether they survive a domain a frozen encoder never saw at this scale.
+run_name: knob_cost_corals
+
+backbone:
+  type: dino
+  model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+  image_size: 768
+
+data:
+  name: coco                      # the corals dataset is COCO-format
+  label: corals
+  root: datasets/corals_coco      # the local HIFMB corals copy (55 images)
+  annotation_file: annotations.json
+  images_dir: images
+  categories: [Coral Fragment]
+  min_instances: 2
+  # --- FROZEN (mirrors the cv4e@eccv26 corals protocol so the numbers stay comparable) ---
+  train_images: 10                # intra pool + cross-image support pool
+  interval_images: 40             # inter targets
+  known_ratio: 0.3
+  seed: 42
+
+foveate:
+  # --- WHERE (descent): region only, never cut. The `cc` grouping IS the algorithm change. ---
+  extractor: composite
+  foreground_extractor: oracle    # swept: the knob's naive arm is `otsu`
+  instance_extractor: cc
+  extract_connectivity: 8
+  # the naive Where's own knobs (inert while the oracle is selected)
+  otsu_top_k: 1
+  otsu_reduce: mean
+  insid3_crop_reference: true
+  insid3_top_k_exemplars: 1
+  debias: true                    # cross-image matching carries a DINOv3 positional bias
+  debias_subspace_dim: 8
+
+  # --- STOP: descend while g rises; emit at the peak. ---
+  stop_rule: oracle               # swept: naive arm is `reid`
+  crop_sim_floor: 0.3
+  stop_fixed_point_iou: 0.9
+  reid_mode: cls                  # the CHEAP signal: one CLS cosine per crop, no mask needed
+  confidence_reid_mode: full      # leaf CONFIDENCE is separate from the stop signal (AP ranks by it)
+
+  # --- EXTRACT (leaves only): the expensive question. ---
+  leaf_extractor: oracle          # swept: naive arm is `null` (no leaf pass — the region IS the
+                                  # instance, i.e. no individuation at all)
+  leaf_grouping: kmeans           # only consulted when the leaf arm is a composite
+
+  # --- MERGE / MASK: the two downstream slots, also oracle-able ---
+  merge_rule: oracle              # swept: naive arm is `nms`
+  nms_iou: 0.5
+  nms_containment: 0.7
+  mask_upsample: oracle           # swept: naive arm is `nearest`
+  oracle_upsample_iou: 0.5
+
+  # --- recursion / cost ---
+  min_crop: 16
+  pad_frac: 0.08
+  shrink_stop: 0.9
+  cascade_min_instance_area: 16
+  max_total_embeds: 512
+  emit_empty_seed: false          # the DESCENT extractor is always a composite here, which
+                                  # essentially never answers empty; the LEAF slot's own empty
+                                  # answer is handled by the cascade's fallback, not by this knob
+
+eval:
+  targets: [inter]                # the paper protocol: exemplars from a support image, novel target
+  max_exemplars: 5                # FROZEN
+  limit: 40
+  visualize: 4
+  cascade_trace: 2
+
+mlflow:
+  enabled: true
+  experiment_name: foveate-knob-cost
+  tracking_uri: null
+
+# 1 ceiling + one knocked-out knob at a time. `set:` omitted = the base config = all oracle.
+#
+# Each knob gets its NAIVE arm (the cheapest thing that could work — what the knob costs if we do
+# nothing) and, where one exists, its TUNED arm (the implementation we would actually ship). Both
+# are needed to act on the table: the naive arm alone measures the floor we picked, not the stage.
+# A Where gap of 0.7 AP says nothing about Where if the naive Where is a deliberately weak baseline
+# and the tuned one recovers most of it.
+arms:
+  - name: all-oracle              # the ceiling of this decomposition
+
+  # --- WHERE -------------------------------------------------------------------------------
+  - name: naive-where             # Otsu on the exemplar similarity map: one threshold, no model
+    set:
+      foveate.foreground_extractor: otsu
+  - name: tuned-where             # INSID3 with the knobs tuned on the a1 harness
+    set:
+      foveate.foreground_extractor: insid3
+      foveate.insid3_tau_fg: 0.0
+      foveate.insid3_aggt: 0.1
+      foveate.insid3_dynamic_tau_fg: true
+      foveate.insid3_dynamic_aggt: true
+      foveate.insid3_tau_fg_scale: 0.3
+      foveate.insid3_aggt_scale: 0.3
+
+  # --- STOP --------------------------------------------------------------------------------
+  - name: naive-stop              # descend/emit on the CLS re-id peak instead of GT isolation
+    set:
+      foveate.stop_rule: reid
+
+  # --- EXTRACT (leaves) --------------------------------------------------------------------
+  - name: naive-extract           # no leaf pass: the converged REGION is emitted as one instance
+    set:
+      foveate.leaf_extractor: null
+  - name: tuned-extract           # a real leaf decomposition: k=2 feature split on the leaf crop
+    set:
+      foveate.leaf_extractor: composite
+      foveate.leaf_grouping: kmeans
+
+  # --- MERGE -------------------------------------------------------------------------------
+  - name: naive-merge             # score-ranked NMS instead of one detection per GT instance
+    set:
+      foveate.merge_rule: nms
+
+  # --- MASK --------------------------------------------------------------------------------
+  - name: naive-mask              # the raw patch staircase instead of the GT shape
+    set:
+      foveate.mask_upsample: nearest
+  - name: tuned-mask              # the smoothing prior — no image evidence, but no staircase either
+    set:
+      foveate.mask_upsample: bilinear
+
+  # --- the floor this table brackets -------------------------------------------------------
+  - name: all-naive               # every knob naive at once
+    set:
+      foveate.foreground_extractor: otsu
+      foveate.stop_rule: reid
+      foveate.leaf_extractor: null
+      foveate.merge_rule: nms
+      foveate.mask_upsample: nearest
+  - name: all-tuned               # every knob at its shippable implementation
+    set:
+      foveate.foreground_extractor: insid3
+      foveate.insid3_tau_fg: 0.0
+      foveate.insid3_aggt: 0.1
+      foveate.insid3_dynamic_tau_fg: true
+      foveate.insid3_dynamic_aggt: true
+      foveate.insid3_tau_fg_scale: 0.3
+      foveate.insid3_aggt_scale: 0.3
+      foveate.stop_rule: reid
+      foveate.leaf_extractor: composite
+      foveate.leaf_grouping: kmeans
+      foveate.merge_rule: nms
+      foveate.mask_upsample: bilinear

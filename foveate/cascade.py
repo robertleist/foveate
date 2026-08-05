@@ -5,8 +5,8 @@ one question (paper Sec. 3): *which instances of the concept are on this crop?* 
 guided by the exemplar bank, and the descent is guided by the re-identification score ``g`` (mean
 crop similarity to the bank, Eq. 2), where crop similarity is the cosine of two CLS tokens (Eq. 1).
 
-**Three swappable slots.** This module owns the *loop* — batching, geometry, budget, termination —
-and delegates every *policy* to one of three strategy interfaces, each with its own registry:
+**Swappable slots.** This module owns the *loop* — batching, geometry, budget, termination — and
+delegates every *policy* to a strategy interface with its own registry:
 
 ===============  ==========================  =========================================
 Slot             Module / config key         Question
@@ -15,6 +15,8 @@ Slot             Module / config key         Question
                  ``extractor``
 **Stop**         :mod:`foveate.stop`         descend, emit or reject?
                  ``stop_rule``
+**Leaf**         :mod:`foveate.extract`      what is *actually* in this terminal crop?
+                 ``leaf_extractor``          (optional; the expensive question)
 **Merge**        :mod:`foveate.merge_rule`   how do the emitted leaves combine?
                  ``merge_rule``
 ===============  ==========================  =========================================
@@ -24,6 +26,26 @@ that cut it into instances. Collapsing them is what lets a segmenter (SAM, NTT, 
 plugged in whole instead of being flattened into a foreground and re-split; the factorizable case is
 preserved inside :class:`~foveate.extract.CompositeExtractor` (``where`` × ``group``), so the
 Where-vs-grouping ablation and every existing config survive. See roadmap §1.5.
+
+**Where × Stop × Extract: the expensive question belongs at the leaves.** Collapsing the two stages
+was right for *what the recursion needs*, but it also made every visited crop pay for an instance
+decomposition it never used: the descent only reads the components' *boxes* (where to zoom) and the
+re-id score (whether to keep zooming). Worse, it forced instance-first models into a role they
+cannot play — SAM 3 and NTT predict instances rather than a similarity region, so they only ever
+propose to foveate onto what they can *already* segment, never onto the ambiguous region a zoom
+would resolve, and foveating them measurably hurt. ``cfg.leaf_extractor`` restores the division of
+labour without giving up the one-question contract:
+
+* **Where** — the concept's region, split into components; each becomes a child crop. Cheap
+  (``extractor: composite``, ``grouping: cc`` — propose regions, never cut).
+* **Stop** — is this still more than one thing? Cheap: the CLS re-identification score ``g``.
+* **Extract** — only once the zoom has bottomed out, ask the expensive extractor what is in the
+  crop and emit *its* instances (:attr:`~foveate.config.Config.leaf_extractor`).
+
+The leaf crop's patch grid is already embedded, so a feature-based leaf extractor costs no extra
+forward; a segmenter costs one call per *leaf* (``Stats.n_leaf_calls``) instead of one per visited
+crop. An empty leaf answer falls back to the descent's own instances, so the leaf slot can only
+refine a region the recursion committed to, never delete it.
 
 Two things stay here on purpose: the **size floor** ρ (``min_crop``) and the strict box shrink
 (``shrink_stop``, plus the no-progress guard on a child box equal to its parent's). Together they are
@@ -59,7 +81,7 @@ import numpy as np
 
 from foveate import features as featlib, mask_refine
 from foveate.config import Config
-from foveate.extract import build_extractor, component_label_map
+from foveate.extract import build_extractor, build_leaf_extractor, component_label_map
 from foveate.merge_rule import build_merge_rule
 from foveate.reid import build_reid_scorer
 from foveate.stop import build_stop_rule
@@ -92,6 +114,9 @@ class _Parent:
     # The parent's patch feature grid ``(Hp, Wp, D)``, so each emitted instance can be scored on its
     # OWN foreground for the masked confidence (see ``confidence_reid_mode``). Always set.
     feat: object | None = None
+    # The parent's CLS token, kept for the same reason as ``feat``: a reid-stop emits THIS crop, so
+    # the Leaf extractor runs on it and some extractors condition on the CLS.
+    cls: object | None = None
 
 
 @dataclass
@@ -149,6 +174,7 @@ def cascade(
     exemplar_image: np.ndarray | None = None,
     exemplar_images: list[np.ndarray] | None = None,
     extractor=None,
+    leaf_extractor=None,
     reid_scorer=None,
     confidence_scorer=None,
     gt_foreground: np.ndarray | None = None,
@@ -180,6 +206,12 @@ def cascade(
         skips re-embedding every exemplar crop per image. ``None`` (default) builds and sets the
         reference here. The caller is responsible for passing an extractor whose reference matches
         ``exemplar_image`` / ``exemplar_images``.
+    leaf_extractor:
+        Optional pre-built **Leaf** Extract slot (:func:`foveate.extract.build_leaf_extractor`),
+        reference already set. Same caching rationale as ``extractor``: one bank per class across
+        the inter protocol's targets. ``None`` (default) builds it from ``cfg.leaf_extractor``,
+        which may itself be unset — then there is no leaf slot and the descent extractor's own
+        instances are emitted, as before.
     reid_scorer:
         Optional pre-built re-identification scorer (see :func:`foveate.reid.build_reid_scorer`),
         the standalone ``g`` over the exemplar bank. Like ``extractor`` it can be built once and
@@ -213,6 +245,14 @@ def cascade(
         extractor = build_extractor(cfg)
         extractor.set_reference(backbone, ref_image, exemplar_masks, negative_masks, cfg)
         stats.n_embeds += 1
+    # Leaf slot (optional): the expensive extractor, run only on terminal crops. Its reference is
+    # the same exemplar bank, built the same way — an arm that answers a different question, not a
+    # different prompt. Like ``extractor`` it may be handed in pre-built (inter protocol).
+    if leaf_extractor is None:
+        leaf_extractor = build_leaf_extractor(cfg)
+        if leaf_extractor is not None:
+            leaf_extractor.set_reference(backbone, ref_image, exemplar_masks, negative_masks, cfg)
+            stats.n_embeds += 1
     # Stop and Merge are built per call (cheap, config-only objects); Stop additionally holds this
     # image's transient oracle state, if any.
     stop = build_stop_rule(cfg)
@@ -225,12 +265,13 @@ def cascade(
     # The class name, when the protocol has one. A promptable concept model (SAM 3) is measurably
     # weaker on visual prompts alone, and our protocol always knows the name — withholding it would
     # handicap the arm for no reason. Extractors that have no use for it never expose the hook.
-    if hasattr(extractor, "set_concept"):
-        extractor.set_concept(concept)
+    for slot in (extractor, leaf_extractor):
+        if slot is not None and hasattr(slot, "set_concept"):
+            slot.set_concept(concept)
 
     if gt_foreground is not None:
-        for slot in (extractor, stop, merge_rule, upsampler):
-            if hasattr(slot, "set_target_instances"):
+        for slot in (extractor, leaf_extractor, stop, merge_rule, upsampler):
+            if slot is not None and hasattr(slot, "set_target_instances"):
                 slot.set_target_instances(gt_foreground)
 
     # Re-identification score g: a standalone scorer over the exemplar bank, independent of the
@@ -257,11 +298,11 @@ def cascade(
         # (Hp, Wp) matches ``comp_grid`` exactly, so the mask indexes straight into it.
         if confidence_scorer is not None and feat is not None and comp_grid.any():
             score = confidence_scorer.score(feat, None, comp_grid)
-        # A segmenter arm already produced this instance at pixel resolution; re-quantizing it
-        # onto the patch grid and upsampling it back is exactly the loss the two-slot contract
-        # exists to avoid, so the Mask slot is bypassed when a native mask is available.
-        mask_local = (np.asarray(mask, dtype=np.uint8) if mask is not None
-                      else upsampler.upsample(comp_grid, region.box))
+        # A segmenter arm already produced this instance at pixel resolution. The Mask slot is still
+        # asked — the real rules hand a native mask straight back, since there is nothing an
+        # interpolation can add to it, but routing it through the slot means an oracle can bound this
+        # stage for a segmenter arm too instead of being silently inert.
+        mask_local = upsampler.upsample(comp_grid, region.box, mask)
         if int(mask_local.sum()) < cfg.cascade_min_instance_area:
             stats.discarded += 1
             return
@@ -276,6 +317,29 @@ def cascade(
             full[y0:y1, x0:x1] = refined.astype(np.uint8)
         leaves.append(Instance(full, region.box, region.depth, score))
         stats.leaves += 1
+
+    def emit_leaf(region, instances, score, *, feat=None, cls=None, masks=None):
+        """Emit a TERMINAL crop — the one place the expensive Extract question is asked.
+
+        With no Leaf slot configured this is just ``emit`` per instance: the descent extractor's
+        answer is the answer. With one, the leaf crop is handed to that extractor and *its*
+        instances are emitted instead — the crop is already embedded, so a feature-based leaf costs
+        nothing extra and a segmenter costs one call per leaf.
+
+        An empty leaf answer falls back to the descent's instances. The recursion zoomed here
+        precisely because it believed the concept is in this crop; a segmenter that returns nothing
+        on it is a disagreement between two models, not evidence of absence, and deleting the
+        region would make ``foveate(E)`` able to score *below* the region proposal it started from.
+        """
+        masks = list(masks) if masks else [None] * len(instances)
+        if leaf_extractor is not None and feat is not None:
+            res = leaf_extractor.extract(feat, cls=cls, box=region.box, image=_crop(region.box))
+            stats.n_leaf_calls += 1
+            if res.instances:
+                instances = res.instances
+                masks = list(res.masks) if res.masks else [None] * len(res.instances)
+        for c, m in zip(instances, masks):
+            emit(region, c, score, feat=feat, mask=m)
 
     def emit_parent(parent: _Parent) -> None:
         """Fall back to the crop the (now worse) children were zoomed out of.
@@ -294,8 +358,17 @@ def cascade(
         if not stop.accept(parent.reid, parent.box):
             stats.discarded += 1
             return
+        if cfg.emit_every_level:
+            return          # already emitted, instance by instance, when this crop descended
         pr = _Region(parent.box, parent.depth)
         pmasks = parent.masks or [None] * len(parent.instances)
+        if leaf_extractor is not None:
+            # This crop is where the zoom bottomed out (``g`` peaked here), so it is exactly the
+            # terminal the Leaf slot exists for. Its decomposition supersedes ``emit_components`` /
+            # the OR-merge, both of which are guesses about a decomposition the descent never made.
+            emit_leaf(pr, parent.instances, parent.reid,
+                      feat=parent.feat, cls=parent.cls, masks=pmasks)
+            return
         if cfg.emit_components:
             shape = parent.instances[0].shape
             scores = _component_scores(parent.instances, parent.reid, shape)
@@ -410,8 +483,7 @@ def cascade(
                          feat=r.parent.feat)
             elif floor:                                   # SIZE floor (px) — the termination invariant
                 decision = "leaf-cap"
-                for c, pm in zip(instances, pmasks):
-                    emit(r, c, reid_score, feat=feat, mask=pm)
+                emit_leaf(r, instances, reid_score, feat=feat, cls=cls, masks=pmasks)
             else:
                 # An instance whose padded bbox clips back to THIS crop's box makes no geometric
                 # progress: re-enqueuing it re-embeds the identical crop, extracts the identical
@@ -434,15 +506,21 @@ def cascade(
                         stats.discarded += 1
                     else:
                         decision = "leaf"
-                        emit(r, instances[0], reid_score, feat=feat, mask=pmasks[0])
+                        emit_leaf(r, [instances[0]], reid_score, feat=feat, cls=cls,
+                                  masks=[pmasks[0]])
                 elif not tight:                           # several instances, none tightenable
                     decision = "leaf-cap"
-                    for c, pm in zip(instances, pmasks):
-                        emit(r, c, reid_score, feat=feat, mask=pm)
+                    emit_leaf(r, instances, reid_score, feat=feat, cls=cls, masks=pmasks)
                 else:
                     keep = [j for j, b in enumerate(boxes_all) if b != r.box]
                     for j, (c, b, pm) in enumerate(zip(instances, boxes_all, pmasks)):
-                        if b == r.box:                    # this one is stuck, its siblings are not
+                        # A stuck instance is emitted here because nothing deeper will look at it.
+                        # ``emit_every_level`` additionally emits the ones that DO descend, so the
+                        # answer this crop already had survives whatever its children turn out to be.
+                        # NOT routed through the Leaf slot: siblings are still descending, so the
+                        # terminal here is this one *instance*, not the crop — asking the leaf
+                        # extractor about the whole crop would re-answer for the siblings too.
+                        if b == r.box or cfg.emit_every_level:
                             emit(r, c, reid_score, feat=feat, mask=pm)
                     decision = "zoom" if len(tight) == 1 else "split"
                     child_instances = [instances[j] for j in keep]
@@ -471,7 +549,7 @@ def cascade(
                 # Defer this region's event: it becomes ``reid-stop`` if no child beats it (decided
                 # next level, in the group loop above), so it is fired there with the final label.
                 par = _Parent(reid=reid_score, box=r.box, depth=r.depth,
-                              instances=child_instances, event=ev, feat=feat,
+                              instances=child_instances, event=ev, feat=feat, cls=cls,
                               masks=(child_masks if any(m is not None for m in child_masks)
                                      else None))
                 nxt += [_Region(cb, r.depth + 1, parent=par, seed=ci)

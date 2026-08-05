@@ -201,6 +201,10 @@ def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
             params: dict[str, Any] = {"model": method_kind, "dataset": dataset}
             mlflow.set_tag("model", method_kind)
             mlflow.set_tag("dataset", dataset)
+            # Free-form ``tags:`` block — the ablation harness uses it to stamp the arm name, so a
+            # results table groups by arm instead of re-deriving it from the swept knobs.
+            for tag_key, tag_value in (config.get("tags") or {}).items():
+                mlflow.set_tag(str(tag_key), str(tag_value))
             params.update(_flatten_params("backbone", config.get("backbone", {})))
             params.update(_flatten_params("data", config["data"]))
             # Resolved per-method blocks (e.g. the full foveate Config, defaults included)
@@ -331,6 +335,7 @@ def _evaluate(method: Method, items, output_dir: Path, prefix: str,
     recoveries: list[float] = []
     times: list[float] = []
     total_embeds, total_time, n_items = 0, 0.0, 0
+    total_leaf_calls = 0
     total_pred = 0
     _reset_peak_gpu_mem(method)
 
@@ -361,12 +366,13 @@ def _evaluate(method: Method, items, output_dir: Path, prefix: str,
         # Collect an observer trace whenever we render the contact sheet OR harvest gate stats OR
         # score the zoom against the GT; a stats-only trace is reduced and dropped right after.
         trace: list | None = [] if (want_trace or want_hist or want_diag) else None
-        pred, n_embeds, elapsed = _discover_one(method, item, trace=trace)
+        pred, n_embeds, elapsed, n_leaf_calls = _discover_one(method, item, trace=trace)
         predictions.append(pred)
         gts.append(item.gt_masks)
         if item.exemplar_image is None:           # recovery only meaningful for same-image prompts
             recoveries.append(evallib.exemplar_recovery_iou(pred, item.exemplar_masks))
         total_embeds += n_embeds
+        total_leaf_calls += n_leaf_calls
         total_time += elapsed
         times.append(elapsed)
         total_pred += pred.masks.shape[0]
@@ -411,6 +417,9 @@ def _evaluate(method: Method, items, output_dir: Path, prefix: str,
         float(np.nanmean(recoveries)) if recoveries else float("nan")
     )
     out[f"{prefix}_mean_embeds"] = total_embeds / max(n_items, 1)
+    # Calls to the LEAF Extract slot per image — the cost that scales with the expensive extractor.
+    # 0 for every method/config without one, which is what makes it comparable across the ablation.
+    out[f"{prefix}_mean_leaf_calls"] = total_leaf_calls / max(n_items, 1)
     out[f"{prefix}_n_images"] = n_items
 
     # insid3 aggregate-score distribution: histogram artifact + summary stats. The percentiles
@@ -456,6 +465,8 @@ def _evaluate(method: Method, items, output_dir: Path, prefix: str,
     out[f"{prefix}_peak_gpu_mem_mb"] = peak_mem_mb
 
     mem_str = f" {peak_mem_mb:.0f}MB peak" if not np.isnan(peak_mem_mb) else ""
+    if total_leaf_calls:
+        mem_str = f" {total_leaf_calls / max(n_items, 1):.1f} leaf-calls/img" + mem_str
     print(f"[run] {prefix}: {n_items} imgs | AP={metrics.ap:.3f} AP50={metrics.ap50:.3f} "
           f"boxAP={metrics.box_ap:.3f} boxAP50={metrics.box_ap50:.3f} "
           f"PQ={metrics.pq:.3f} mIoU={metrics.mean_iou:.3f} "
@@ -479,7 +490,7 @@ def _discover_one(method: Method, item: EvalItem, trace: list | None = None):
     image_pred = evallib.ImagePrediction(
         masks=pred.masks, scores=pred.scores, boxes=getattr(pred, "boxes", None),
     )
-    return image_pred, pred.n_embeds, elapsed
+    return image_pred, pred.n_embeds, elapsed, getattr(pred, "n_leaf_calls", 0)
 
 
 # ---------------------------------------------------------------------------
@@ -514,20 +525,36 @@ def _run_config_file(config_path: Path, overrides: list[str]) -> None:
         config = yaml.safe_load(f)
     config = _apply_overrides(config, overrides)
 
-    # A `sweep:` block expands to a grid of runs. Dispatch here so the single runner does the
-    # right thing too — otherwise the block is silently ignored and only the base config runs.
-    if config.get("sweep"):
-        from experiments.ablations import run_sweep
+    # A `sweep:` / `arms:` block expands to several runs. Dispatch here so the single runner does
+    # the right thing too — otherwise the block is silently ignored and only the base config runs.
+    if config.get("sweep") or config.get("arms"):
+        from experiments.ablations import expand_sweep, run_sweep
 
-        n = len(config["sweep"])
-        print(f"[run] '{config_path}' has a sweep block ({n} swept key(s)); expanding the grid.")
+        n = len(expand_sweep(config))
+        print(f"[run] '{config_path}' expands to {n} run(s) (sweep/arms block); running them.")
         run_sweep(config)
         return
 
     run_experiment(config)
 
 
+def use_utf8_stdio() -> None:
+    """Make stdout/stderr UTF-8, replacing anything unencodable.
+
+    On Windows a redirected stream defaults to the ANSI code page (cp1252), and MLflow prints a
+    non-ASCII run link — so piping an experiment to a file or another process killed the run with a
+    ``UnicodeEncodeError`` *after* the eval, losing the whole arm. A batch must not be able to die
+    on a log line. Called from the CLI entry points only, so importing this module changes nothing.
+    """
+    import sys
+
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main(argv: list[str] | None = None) -> None:
+    use_utf8_stdio()
     parser = argparse.ArgumentParser(description="Run a foveate experiment.")
     parser.add_argument("--config", required=True,
                         help="Path to a YAML config file, or a directory of them "

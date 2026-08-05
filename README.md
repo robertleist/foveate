@@ -15,6 +15,32 @@ images.
 > Lineage: inspired by **INSID3**, which produces a single cross-image mask in one forward pass.
 > Foveate adds the recursive cascade + splitting to turn that into instance discovery.
 
+### The algorithm: Where × Stop × Extract
+
+Three questions, and only the last one is allowed to be expensive:
+
+| Stage | Question | Cost | Config |
+|---|---|---|---|
+| **Where** | Where is the concept? A *region*, split by connected components; each becomes a child crop. | cheap, per crop | `foreground_extractor` × `instance_extractor: cc` |
+| **Stop** | Is this still more than one thing? Descend while the CLS re-identification score `g` rises; emit at its peak. | cheap, per crop | `stop_rule: reid` |
+| **Extract** | Once the zoom has bottomed out, *what is in this crop?* | expensive, **per leaf** | `leaf_extractor` |
+
+The descent never asks for an instance decomposition, because it never uses one — it reads the
+components' boxes (where to zoom) and `g` (whether to keep zooming). That is also why forcing an
+instance-first model into the descent backfires: **SAM 3** and **NTT** predict instances rather
+than a similarity region, so they only ever propose to foveate onto what they can already segment,
+never onto the ambiguous region a zoom would resolve. Confining them to `leaf_extractor` puts them
+where they are strongest — one call, on the best crop the recursion could produce — and drops their
+cost from `O(crops visited)` to `O(leaves)` (`Stats.n_leaf_calls`). An empty leaf answer falls back
+to the descent's region, so the leaf slot can only refine what the recursion committed to.
+
+Every stage has an **oracle** arm, so the headroom table is one run per knock-out:
+
+```bash
+python -m experiments.ablations --config configs/ablation/knob_cost_lvis_dense.yaml \
+    --out runs/knob_cost/lvis_dense.csv
+```
+
 ## Install
 
 **With uv (recommended):**
@@ -109,9 +135,10 @@ sample or upload a reference image + mask (free-draw canvas, or a mask PNG fallb
 ## Layout
 
 ```
-foveate/        core package: cascade (the `cascade` entry point) driving three swappable slots —
+foveate/        core package: cascade (the `cascade` entry point) driving the swappable slots —
                 extract (which instances are on this crop: composite = foreground x grouping, or a
-                monolithic one), stop (descend/emit/reject), merge_rule (how the leaves combine);
+                monolithic one; `leaf_extractor` runs a second, expensive one at the leaves only),
+                stop (descend/emit/reject), merge_rule (how the leaves combine);
                 single-pass pipeline (run), features, gate, clustering, individuation, merge,
                 border, prototypes, thresholding, debias, config, types, backbones/{dinov3,mock}
 data/           mask-based datasets: DatasetSource (coco/pannuke/synthetic), InstanceDataset,

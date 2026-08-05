@@ -43,6 +43,10 @@ class MethodPrediction:
     n_embeds: int = 0            # backbone forwards spent (0 when the method doesn't track it)
     boxes: np.ndarray | None = None   # (N, 4) [x0,y0,x1,y1] detection boxes for box AP; None →
     #                                   the runner scores the tight mask box instead
+    n_leaf_calls: int = 0        # LEAF Extract slot invocations (foveate's cfg.leaf_extractor).
+    #                              Tracked separately from n_embeds because it is the cost that
+    #                              scales with the EXPENSIVE extractor, and the whole claim of the
+    #                              leaf slot is that it is O(leaves) rather than O(crops visited).
 
 
 class Method(ABC):

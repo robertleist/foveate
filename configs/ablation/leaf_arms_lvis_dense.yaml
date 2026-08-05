@@ -1,0 +1,138 @@
+# LEAF ARMS — does an instance-first segmenter belong in the descent or at the leaves?
+#
+#   python -m experiments.ablations --config configs/ablation/leaf_arms_lvis_dense.yaml \
+#       --out runs/leaf_arms/lvis_dense.csv
+#
+# The observation this table exists to settle: foveating SAM 3 and NTT made them WORSE than running
+# them once on the full frame. That is not a tuning failure, it is the wrong job. Those models
+# predict INSTANCES, not a similarity region — so when the cascade asked them "what should I zoom
+# into?", they could only point at things they had already segmented, never at the ambiguous clump a
+# zoom would actually resolve. The descent then spent its budget re-confirming easy detections while
+# the hard ones stayed unresolved, and the peak guard threw away the strong root answer on the way.
+#
+# The fix is not to tune them into the descent, it is to stop asking them the descent's question:
+#
+#   descent  = DINOv3 similarity region (Where) + connected components + the CLS re-id stop signal
+#   leaves   = the segmenter, once, on the crop the recursion converged to
+#
+# So this sweep holds the descent FIXED and moves only who answers at the leaf. `leaf-none` is the
+# floor (the converged region is emitted whole, no individuation at all), `leaf-oracle` the ceiling,
+# and `descent-sam3` / `descent-ntt` reproduce the old arrangement — the segmenter driving every
+# crop — so the two placements are compared under one protocol rather than across two papers.
+#
+# Read `mean_leaf_calls` next to `mean_embeds`: it is the number of SEGMENTER forwards, and the
+# placement claim is as much about that ratio as about AP.
+run_name: leaf_arms_lvis_dense
+
+backbone:
+  type: dino
+  model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+  image_size: 768
+
+data:
+  name: coco
+  label: lvis-dense
+  root: datasets/lvis
+  annotation_file: slices/lvis_dense.json
+  images_dir: images
+  categories: []
+  min_instances: 2
+  # --- FROZEN (shared with lvis_dense_a1.yaml / knob_cost_lvis_dense.yaml) ---
+  train_images: 10
+  interval_images: 40
+  known_ratio: 0.3
+  seed: 42
+
+foveate:
+  # --- WHERE (descent): the real Where, tuned as in lvis_dense_a1.yaml. FIXED across arms. ---
+  extractor: composite
+  foreground_extractor: insid3
+  instance_extractor: cc          # the descent proposes REGIONS and never cuts one
+  insid3_tau_fg: 0.0
+  insid3_aggt: 0.1
+  insid3_crop_reference: true
+  insid3_top_k_exemplars: 1
+  insid3_dynamic_tau_fg: true
+  insid3_dynamic_aggt: true
+  insid3_tau_fg_scale: 0.3
+  insid3_aggt_scale: 0.3
+  extract_connectivity: 8
+  debias: true
+  debias_subspace_dim: 8
+
+  # --- STOP: the CLS re-identification peak guard. FIXED across arms. ---
+  stop_rule: reid
+  reid_mode: cls
+  crop_sim_floor: 0.3
+  stop_fixed_point_iou: 0.9
+  confidence_reid_mode: full
+
+  # --- EXTRACT: THE SWEPT SLOT. null = emit the converged region as one instance. ---
+  leaf_extractor: null
+  leaf_grouping: kmeans
+  cluster_tau: 0.18               # agglomerative / watershed leaf arms
+  boundary_smooth_sigma: 0.0
+
+  # --- the segmenter arms' own knobs (inert unless that arm is selected) ---
+  sam3_threshold: 0.3
+  sam3_mask_threshold: 0.5
+  sam3_use_concept: true
+  sam3_scale_matched: false       # OFF by measurement (hurts SAM 3 at 2-5x the compute)
+  ntt_crop_reference: true
+  ntt_scale_matched: true         # ON by measurement (AP 0.000 -> 0.219 for NTT)
+  ntt_kmeans_k: 8
+  ntt_num_points: 32
+
+  # --- MERGE / MASK: real, so the arms are compared as deployable methods ---
+  merge_rule: nms
+  nms_iou: 0.5
+  nms_containment: 0.7
+  mask_upsample: nearest
+  mask_refine: none
+
+  # --- recursion / cost ---
+  min_crop: 16
+  pad_frac: 0.08
+  shrink_stop: 0.9
+  cascade_min_instance_area: 16
+  max_total_embeds: 512
+  emit_empty_seed: false          # overridden to true for the descent-segmenter arms below, which
+                                  # legitimately answer empty (a composite descent never does)
+
+eval:
+  targets: [inter]
+  max_exemplars: 5
+  limit: 40
+  visualize: 4
+  cascade_trace: 2
+
+mlflow:
+  enabled: true
+  experiment_name: foveate-leaf-arms
+  tracking_uri: null
+
+arms:
+  # ---- the segmenter AT THE LEAVES (the proposed arrangement) ----
+  - name: leaf-none               # floor: the converged region, un-individuated
+  - name: leaf-kmeans             # NEGATIVE CONTROL, not a candidate. k=2 KMeans always cuts, and a
+                                  # leaf's component fills its crop by definition, so this splits
+                                  # EVERY leaf with nothing to confirm it (the descent's peak guard
+                                  # has no children to work with at a leaf). Measured on corals with
+                                  # a real Where and Merge: AP 0.792 -> 0.102, count error 0.4 -> 4.4.
+                                  # Kept in the table because "the leaf slot needs a grouping that
+                                  # can decide an instance count of ONE" is a result, not a caveat.
+    set: {foveate.leaf_extractor: composite, foveate.leaf_grouping: kmeans}
+  - name: leaf-watershed
+    set: {foveate.leaf_extractor: composite, foveate.leaf_grouping: watershed}
+  - name: leaf-sam3
+    set: {foveate.leaf_extractor: sam3}
+  - name: leaf-ntt
+    set: {foveate.leaf_extractor: ntt}
+  - name: leaf-oracle             # ceiling: the GT decomposition of each converged crop
+    set: {foveate.leaf_extractor: oracle}
+
+  # ---- the segmenter IN THE DESCENT (the arrangement being replaced) ----
+  - name: descent-sam3
+    set: {foveate.extractor: sam3, foveate.emit_empty_seed: true}
+  - name: descent-ntt
+    set: {foveate.extractor: ntt, foveate.emit_empty_seed: true}
